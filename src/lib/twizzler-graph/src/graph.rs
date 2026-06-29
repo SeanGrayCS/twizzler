@@ -19,7 +19,7 @@ use twizzler::{
 use twizzler_rt_abi::error::ArgumentError;
 
 use crate::error::{GraphError, Result};
-use crate::edge::{Edge, EdgeId, EdgeRef};
+use crate::edge::{Edge, EdgeId, EdgeInfo, EdgeRef};
 use crate::name::NameKey;
 use crate::vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView};
 
@@ -338,6 +338,31 @@ impl Graph {
             .unwrap_or_default()
     }
 
+    /// All vertex ids in the graph. Linear scan.
+    pub fn vertices(&self) -> Vec<VertexId> {
+        let mut out = Vec::new();
+        for i in 0..self.verts.len() {
+            if let Some(r) = self.verts.get_ref(i) {
+                out.push(VertexId(r.id));
+            }
+        }
+        out
+    }
+
+    /// An edge's label and endpoints by id. O(1): ids are append indices, so the
+    /// record is at position `id`.
+    pub fn edge_info(&self, id: EdgeId) -> Option<EdgeInfo> {
+        let r = self.edges.get_ref(id.0 as usize)?;
+        if r.id != id.0 {
+            return None;
+        }
+        Some(EdgeInfo {
+            label: self.label_name(r.label).unwrap_or_default(),
+            from: VertexId(r.from_id),
+            to: VertexId(r.to_id),
+        })
+    }
+
     /// All vertices with the given label. Linear scan.
     pub fn vertices_by_label(&self, label: &str) -> Vec<VertexId> {
         let Some(lbl) = self.find_label(label) else {
@@ -354,19 +379,18 @@ impl Graph {
         out
     }
 
-    /// Read back a vertex's data from the registry.
+    /// Read back a vertex's data from the registry. O(1): ids are append
+    /// indices, so the record is at position `id`.
     pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
-        for i in 0..self.verts.len() {
-            let r = self.verts.get_ref(i)?;
-            if r.id == id.0 {
-                return Some(VertexInfo {
-                    label: self.label_name(r.label).unwrap_or_default(),
-                    name: r.name.as_str().to_string(),
-                    target: ObjID::new(r.target_raw),
-                });
-            }
+        let r = self.verts.get_ref(id.0 as usize)?;
+        if r.id != id.0 {
+            return None;
         }
-        None
+        Some(VertexInfo {
+            label: self.label_name(r.label).unwrap_or_default(),
+            name: r.name.as_str().to_string(),
+            target: ObjID::new(r.target_raw),
+        })
     }
 
     /// Resolve a [`Labels`] filter to label ids. `None` means "any".
@@ -385,17 +409,20 @@ impl Graph {
         }
     }
 
-    // --- private key-lookup helpers (where a hachage index would later go) ---
+    // --- private lookup helpers ---
 
+    /// O(1): ids are append indices, so the record is at position `id`.
     fn vertex_locs(&self, v: VertexId) -> Option<(u128, u128, u128)> {
-        for i in 0..self.verts.len() {
-            let r = self.verts.get_ref(i)?;
-            if r.id == v.0 {
-                return Some((r.vobj_raw, r.out_raw, r.in_raw));
-            }
+        let r = self.verts.get_ref(v.0 as usize)?;
+        if r.id != v.0 {
+            return None;
         }
-        None
+        Some((r.vobj_raw, r.out_raw, r.in_raw))
     }
+
+    // The content-keyed lookups below are linear scans (where a hachage index
+    // would later go): find_label by name, find_vertex by (label, name), and
+    // vertices_by_label.
 
     fn find_label(&self, name: &str) -> Option<u32> {
         for i in 0..self.labels.len() {
