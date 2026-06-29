@@ -5800,6 +5800,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rns"
+version = "0.1.0"
+dependencies = [
+ "twizzler",
+ "twizzler-abi",
+ "twizzler-graph",
+ "twizzler-rt-abi",
+]
+
+[[package]]
 name = "roff"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7373,6 +7383,16 @@ dependencies = [
 name = "twizzler-futures"
 version = "0.1.0"
 dependencies = [
+ "twizzler-abi",
+ "twizzler-rt-abi",
+]
+
+[[package]]
+name = "twizzler-graph"
+version = "0.1.0"
+dependencies = [
+ "naming",
+ "twizzler",
  "twizzler-abi",
  "twizzler-rt-abi",
 ]

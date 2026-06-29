@@ -1,0 +1,10 @@
+[package]
+name = "rns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+twizzler = { path = "../../lib/twizzler" }
+twizzler-abi = "*"
+twizzler-rt-abi = "*"
+twizzler-graph = { path = "../../lib/twizzler-graph" }
