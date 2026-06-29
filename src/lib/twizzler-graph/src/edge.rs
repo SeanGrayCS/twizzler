@@ -47,6 +47,14 @@ pub(crate) struct EdgeRef {
 }
 unsafe impl Invariant for EdgeRef {}
 
+/// An edge's label and endpoints, returned by `Graph::edge_info`.
+#[derive(Clone)]
+pub struct EdgeInfo {
+    pub label: String,
+    pub from: VertexId,
+    pub to: VertexId,
+}
+
 /// Edge element passed to user filter predicates.
 #[derive(Clone, Copy)]
 pub struct EdgeHandle {

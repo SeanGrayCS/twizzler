@@ -200,6 +200,54 @@ fn recursive_traversal_with_visited_set() {
 }
 
 #[test]
+fn dsl_multi_hop_and_filter() {
+    let mut g = fresh("t-dsl");
+    let a = g.add_vertex("file", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("file", "b", ObjID::new(0)).unwrap();
+    let t = g.add_vertex("tag", "thesis", ObjID::new(0)).unwrap();
+    let proj = g.add_vertex("project", "p", ObjID::new(0)).unwrap();
+    g.add_edge(a, "tagged", t).unwrap();
+    g.add_edge(b, "tagged", t).unwrap();
+    g.add_edge(t, "in_project", proj).unwrap();
+
+    // Files tagged thesis: incoming `tagged` edges into the tag.
+    let files = g.traversal().v(t).in_(Labels::these(&["tagged"])).to_ids();
+    assert_eq!(files.len(), 2);
+
+    // Two hops: file -> tag -> project.
+    let projects = g
+        .traversal()
+        .v(a)
+        .out(Labels::these(&["tagged"]))
+        .out(Labels::these(&["in_project"]))
+        .to_ids();
+    assert_eq!(projects, vec![proj]);
+
+    // Both files reach the same tag; dedup collapses, has_label confirms kind.
+    let tags = g
+        .traversal()
+        .vs(&[a, b])
+        .out(Labels::these(&["tagged"]))
+        .dedup()
+        .has_label("tag")
+        .to_ids();
+    assert_eq!(tags, vec![t]);
+
+    assert_eq!(g.traversal().with_label("file").count(), 2);
+}
+
+#[test]
+fn dsl_edge_steps() {
+    let mut g = fresh("t-dsl-e");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    g.add_edge(a, "e", b).unwrap();
+
+    let vs = g.traversal().v(a).out_e(Labels::any()).in_v().to_ids();
+    assert_eq!(vs, vec![b]);
+}
+
+#[test]
 fn add_edge_to_missing_vertex_errors() {
     let mut g = fresh("t-bad");
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
