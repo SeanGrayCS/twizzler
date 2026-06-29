@@ -1,0 +1,431 @@
+//! The `Graph` engine: open/create a graph and run vertex/edge operations.
+//!
+//! `Graph` owns the cross-cutting orchestration and the registries (vertices,
+//! edges, labels). Vertex-centric traversal lives on [`VertexView`] in
+//! `vertex.rs`; edge/vertex record types live in their own modules.
+//!
+//! The registries are `VecObject`s with linear-scan key lookup; those scans (the
+//! private helpers at the bottom) are where a `hachage` index would later go.
+//! Adjacency is held per-vertex (see `vertex.rs`), not in the registries.
+
+use naming::{static_naming_factory, GetFlags};
+use twizzler::{
+    collections::vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
+    error::TwzError,
+    marker::{BaseType, Invariant},
+    object::{MapFlags, ObjID, Object, ObjectBuilder, TypedObject},
+    ptr::InvPtr,
+};
+use twizzler_rt_abi::error::ArgumentError;
+
+use crate::error::{GraphError, Result};
+use crate::edge::{Edge, EdgeId, EdgeRef};
+use crate::name::NameKey;
+use crate::vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView};
+
+const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
+const VERSION: u32 = 1; // on-disk format version
+
+/// Read/write/persist map flags for reopening mutable registries.
+fn rw() -> MapFlags {
+    MapFlags::READ | MapFlags::WRITE | MapFlags::PERSIST
+}
+
+/// Base of the graph root object: format guard + the registry ObjIDs (raw, so
+/// the on-disk format is backend-agnostic and relocatable).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct GraphRoot {
+    pub(crate) magic: u64,
+    pub(crate) version: u32,
+    pub(crate) verts_raw: u128,
+    pub(crate) edges_raw: u128,
+    pub(crate) labels_raw: u128,
+}
+unsafe impl Invariant for GraphRoot {}
+impl BaseType for GraphRoot {}
+
+/// An interned label (string ↔ small id).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct LabelEntry {
+    pub(crate) id: u32,
+    pub(crate) name: NameKey,
+}
+unsafe impl Invariant for LabelEntry {}
+
+/// An open graph: the root id plus mapped, mutable registries.
+pub struct Graph {
+    root_id: ObjID,
+    verts: VecObject<VertexRef, VecObjectAlloc>,
+    edges: VecObject<EdgeRef, VecObjectAlloc>,
+    labels: VecObject<LabelEntry, VecObjectAlloc>,
+}
+
+impl Graph {
+    /// Open the graph registered at `data/<name>`, or create and register a
+    /// fresh one. If an existing graph has an incompatible format
+    /// (magic/version mismatch), this returns [`GraphError::StaleVersion`] and
+    /// leaves the existing graph intact; use [`Graph::reset`] to discard it.
+    pub fn open_or_create(name: &str) -> Result<Graph> {
+        let mut namer = static_naming_factory().expect("naming service available");
+        let path = format!("data/{name}");
+
+        if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
+            let root = Object::<GraphRoot>::map(node.id.into(), MapFlags::READ | MapFlags::PERSIST)?;
+            let (magic, version, verts_raw, edges_raw, labels_raw) = {
+                let r = root.base();
+                (r.magic, r.version, r.verts_raw, r.edges_raw, r.labels_raw)
+            };
+            if magic == MAGIC && version == VERSION {
+                return Ok(Graph {
+                    root_id: node.id.into(),
+                    verts: VecObject::from(Object::<TwzVec<VertexRef, VecObjectAlloc>>::map(
+                        ObjID::new(verts_raw),
+                        rw(),
+                    )?),
+                    edges: VecObject::from(Object::<TwzVec<EdgeRef, VecObjectAlloc>>::map(
+                        ObjID::new(edges_raw),
+                        rw(),
+                    )?),
+                    labels: VecObject::from(Object::<TwzVec<LabelEntry, VecObjectAlloc>>::map(
+                        ObjID::new(labels_raw),
+                        rw(),
+                    )?),
+                });
+            }
+            // Incompatible/stale format: do NOT touch the existing graph.
+            return Err(GraphError::StaleVersion {
+                found: version,
+                expected: VERSION,
+            });
+        }
+
+        let verts: VecObject<VertexRef, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let edges: VecObject<EdgeRef, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let labels: VecObject<LabelEntry, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+
+        let root = ObjectBuilder::<GraphRoot>::default()
+            .persist(true)
+            .build(GraphRoot {
+                magic: MAGIC,
+                version: VERSION,
+                verts_raw: verts.object().id().raw(),
+                edges_raw: edges.object().id().raw(),
+                labels_raw: labels.object().id().raw(),
+            })?;
+
+        let _ = namer.remove(&path);
+        namer.put(&path, root.id())?;
+
+        Ok(Graph {
+            root_id: root.id(),
+            verts,
+            edges,
+            labels,
+        })
+    }
+
+    /// The graph root's ObjID.
+    pub fn root_id(&self) -> ObjID {
+        self.root_id
+    }
+
+    /// Reset a graph to empty, reusing its registration. No-op if no such graph
+    /// is registered.
+    ///
+    /// This does not remove the `data/<name>` entry: removing a name under the
+    /// persistent `data/` namespace is unsupported on the current Twizzler build
+    /// (the pager's external unlink is unimplemented). Instead it rewrites the
+    /// existing root object in place to point at fresh, empty registries. Old
+    /// registry objects are orphaned; reclamation and true unregistration are
+    /// future work.
+    pub fn reset(name: &str) -> Result<()> {
+        let mut namer = static_naming_factory().expect("naming service available");
+        let path = format!("data/{name}");
+        let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
+            return Ok(()); // nothing registered
+        };
+
+        let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
+        // Only clobber something that is actually one of our graphs.
+        let is_graph = root.base().magic == MAGIC;
+        if !is_graph {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+
+        // Fresh, empty registries.
+        let verts: VecObject<VertexRef, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let edges: VecObject<EdgeRef, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let labels: VecObject<LabelEntry, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let (verts_raw, edges_raw, labels_raw) = (
+            verts.object().id().raw(),
+            edges.object().id().raw(),
+            labels.object().id().raw(),
+        );
+
+        // Rewrite the root transactionally so the change is synced to the
+        // backing store; a raw write would be lost on reboot.
+        root.with_tx(|tx| {
+            let mut b = tx.base_mut();
+            b.magic = MAGIC;
+            b.version = VERSION;
+            b.verts_raw = verts_raw;
+            b.edges_raw = edges_raw;
+            b.labels_raw = labels_raw;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
+        let lbl = self.intern_label(label)?;
+        let id = self.verts.len() as u64;
+
+        // Per-vertex adjacency lists, split by direction.
+        let out_adj: VecObject<AdjEntry, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let in_adj: VecObject<AdjEntry, VecObjectAlloc> =
+            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let out_raw = out_adj.object().id().raw();
+        let in_raw = in_adj.object().id().raw();
+
+        let vobj = ObjectBuilder::<Vertex>::default()
+            .persist(true)
+            .build(Vertex {
+                id,
+                label: lbl,
+                name: NameKey::new(name),
+                target_raw: target.raw(),
+                props_raw: 0,
+                flags: 0,
+                out_raw,
+                in_raw,
+            })?;
+
+        self.verts.push(VertexRef {
+            id,
+            label: lbl,
+            name: NameKey::new(name),
+            target_raw: target.raw(),
+            props_raw: 0,
+            flags: 0,
+            vobj_raw: vobj.id().raw(),
+            out_raw,
+            in_raw,
+        })?;
+        Ok(VertexId(id))
+    }
+
+    /// Add a typed edge `from -> to`: create the edge object (endpoints as
+    /// invariant pointers), append to `from`'s outgoing list and `to`'s incoming
+    /// list.
+    pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
+        let lbl = self.intern_label(label)?;
+        let (from_vobj, from_out, _from_in) = self
+            .vertex_locs(from)
+            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
+        let (to_vobj, _to_out, to_in) = self
+            .vertex_locs(to)
+            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
+
+        let fobj = Object::<Vertex>::map(ObjID::new(from_vobj), MapFlags::READ | MapFlags::PERSIST)?;
+        let tobj = Object::<Vertex>::map(ObjID::new(to_vobj), MapFlags::READ | MapFlags::PERSIST)?;
+
+        let id = self.edges.len() as u64;
+
+        // The edge object: both endpoints are invariant pointers.
+        let eobj = ObjectBuilder::<Edge>::default()
+            .persist(true)
+            .build_inplace(|tx| {
+                let e = Edge {
+                    id,
+                    label: lbl,
+                    from_id: from.0,
+                    to_id: to.0,
+                    from: InvPtr::new(&tx, fobj.base_ref())?,
+                    to: InvPtr::new(&tx, tobj.base_ref())?,
+                    props_raw: 0,
+                    flags: 0,
+                };
+                tx.write(e)
+            })?;
+
+        // `from` outgoing list: neighbor is `to`.
+        {
+            let mut adj = VecObject::<AdjEntry, VecObjectAlloc>::from(
+                Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(ObjID::new(from_out), rw())?,
+            );
+            adj.push_ctor(|place| {
+                let a = AdjEntry {
+                    label: lbl,
+                    edge: InvPtr::new(&place, eobj.base_ref())?,
+                    neighbor: InvPtr::new(&place, tobj.base_ref())?,
+                };
+                Ok(place.write(a))
+            })?;
+        }
+
+        // `to` incoming list: neighbor is `from`.
+        {
+            let mut adj = VecObject::<AdjEntry, VecObjectAlloc>::from(
+                Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(ObjID::new(to_in), rw())?,
+            );
+            adj.push_ctor(|place| {
+                let a = AdjEntry {
+                    label: lbl,
+                    edge: InvPtr::new(&place, eobj.base_ref())?,
+                    neighbor: InvPtr::new(&place, fobj.base_ref())?,
+                };
+                Ok(place.write(a))
+            })?;
+        }
+
+        self.edges.push(EdgeRef {
+            id,
+            label: lbl,
+            from_id: from.0,
+            to_id: to.0,
+            eobj_raw: eobj.id().raw(),
+            flags: 0,
+        })?;
+        Ok(EdgeId(id))
+    }
+
+    /// Find a vertex by (label, name). Linear scan.
+    pub fn find_vertex(&self, label: &str, name: &str) -> Option<VertexId> {
+        let lbl = self.find_label(label)?;
+        for i in 0..self.verts.len() {
+            let r = self.verts.get_ref(i)?;
+            if r.label == lbl && r.name.eq_str(name) {
+                return Some(VertexId(r.id));
+            }
+        }
+        None
+    }
+
+    /// A traversal handle for a vertex.
+    pub fn vertex_view(&self, id: VertexId) -> Option<VertexView<'_>> {
+        let (_vobj, out_raw, in_raw) = self.vertex_locs(id)?;
+        Some(VertexView {
+            graph: self,
+            id,
+            out_raw,
+            in_raw,
+        })
+    }
+
+    /// Convenience: outgoing/incoming/both neighbors of `id` (no predicate).
+    pub fn out_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        self.vertex_view(id)
+            .map(|v| v.out_neighbors(labels))
+            .unwrap_or_default()
+    }
+    pub fn in_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        self.vertex_view(id)
+            .map(|v| v.in_neighbors(labels))
+            .unwrap_or_default()
+    }
+    pub fn both_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        self.vertex_view(id)
+            .map(|v| v.both_neighbors(labels))
+            .unwrap_or_default()
+    }
+
+    /// All vertices with the given label. Linear scan.
+    pub fn vertices_by_label(&self, label: &str) -> Vec<VertexId> {
+        let Some(lbl) = self.find_label(label) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..self.verts.len() {
+            if let Some(r) = self.verts.get_ref(i) {
+                if r.label == lbl {
+                    out.push(VertexId(r.id));
+                }
+            }
+        }
+        out
+    }
+
+    /// Read back a vertex's data from the registry.
+    pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
+        for i in 0..self.verts.len() {
+            let r = self.verts.get_ref(i)?;
+            if r.id == id.0 {
+                return Some(VertexInfo {
+                    label: self.label_name(r.label).unwrap_or_default(),
+                    name: r.name.as_str().to_string(),
+                    target: ObjID::new(r.target_raw),
+                });
+            }
+        }
+        None
+    }
+
+    /// Resolve a [`Labels`] filter to label ids. `None` means "any".
+    pub(crate) fn resolve_labels(&self, labels: Labels) -> Option<Vec<u32>> {
+        match labels {
+            Labels::Any => None,
+            Labels::These(names) => {
+                let mut ids = Vec::new();
+                for n in names {
+                    if let Some(id) = self.find_label(n) {
+                        ids.push(id);
+                    }
+                }
+                Some(ids)
+            }
+        }
+    }
+
+    // --- private key-lookup helpers (where a hachage index would later go) ---
+
+    fn vertex_locs(&self, v: VertexId) -> Option<(u128, u128, u128)> {
+        for i in 0..self.verts.len() {
+            let r = self.verts.get_ref(i)?;
+            if r.id == v.0 {
+                return Some((r.vobj_raw, r.out_raw, r.in_raw));
+            }
+        }
+        None
+    }
+
+    fn find_label(&self, name: &str) -> Option<u32> {
+        for i in 0..self.labels.len() {
+            let e = self.labels.get_ref(i)?;
+            if e.name.eq_str(name) {
+                return Some(e.id);
+            }
+        }
+        None
+    }
+
+    fn label_name(&self, id: u32) -> Option<String> {
+        for i in 0..self.labels.len() {
+            let e = self.labels.get_ref(i)?;
+            if e.id == id {
+                return Some(e.name.as_str().to_string());
+            }
+        }
+        None
+    }
+
+    fn intern_label(&mut self, name: &str) -> Result<u32> {
+        if let Some(id) = self.find_label(name) {
+            return Ok(id);
+        }
+        let id = self.labels.len() as u32;
+        self.labels.push(LabelEntry {
+            id,
+            name: NameKey::new(name),
+        })?;
+        Ok(id)
+    }
+}

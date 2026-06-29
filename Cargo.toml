@@ -16,6 +16,7 @@ members = [
     "src/lib/dynlink",
     "src/lib/secgate",
     "src/lib/twizzler",
+    "src/lib/twizzler-graph",
     "src/lib/twizzler/twizzler-derive",
     "src/rt/monitor",
     "src/rt/monitor-api",

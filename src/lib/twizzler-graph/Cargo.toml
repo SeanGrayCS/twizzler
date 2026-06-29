@@ -1,0 +1,13 @@
+[package]
+name = "twizzler-graph"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+twizzler = { path = "../twizzler" }
+twizzler-abi = "*"
+twizzler-rt-abi = "*"
+naming = { path = "../naming" }
