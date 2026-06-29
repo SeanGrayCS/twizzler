@@ -7,6 +7,7 @@ members = [
     "tools/image_builder",
     "tools/initrd_gen",
     "src/bin/init",
+    "src/bin/rns",
     "src/bin/bootstrap",
     "src/kernel",
     "src/lib/twizzler-queue-raw",
@@ -114,6 +115,7 @@ initrd = [
     #"crate:trace",
     #"crate:gfxtest",
     "crate:shell",
+    "crate:rns",
     #"crate:sshd",
 
     #"crate:sec",
