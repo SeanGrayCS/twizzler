@@ -248,6 +248,57 @@ fn dsl_edge_steps() {
 }
 
 #[test]
+fn delete_vertex_hides_it_and_incident_edges() {
+    let mut g = fresh("t-delv");
+    let a = g.add_vertex("file", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("file", "b", ObjID::new(0)).unwrap();
+    let t = g.add_vertex("tag", "x", ObjID::new(0)).unwrap();
+    g.add_edge(a, "tagged", t).unwrap();
+    g.add_edge(b, "tagged", t).unwrap();
+
+    g.delete_vertex(a).unwrap();
+    assert!(g.vertex_info(a).is_none());
+    assert_eq!(g.vertices_by_label("file"), vec![b]);
+    // a's incident edge is hidden, so only b is tagged now.
+    assert_eq!(g.in_neighbors(t, Labels::these(&["tagged"])), vec![b]);
+    // Traversal from a deleted vertex yields nothing.
+    assert!(g.vertex_view(a).is_none());
+    assert_eq!(g.traversal().v(a).count(), 0);
+}
+
+#[test]
+fn delete_edge_hides_it() {
+    let mut g = fresh("t-dele");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let e = g.add_edge(a, "e", b).unwrap();
+
+    g.delete_edge(e).unwrap();
+    assert!(g.edge_info(e).is_none());
+    assert!(g.out_neighbors(a, Labels::any()).is_empty());
+    assert!(g
+        .vertex_view(a)
+        .unwrap()
+        .out_edges(Labels::any())
+        .is_empty());
+}
+
+#[test]
+fn delete_persists_on_reopen() {
+    let name = "t-delp";
+    let _ = Graph::reset(name);
+    let a = {
+        let mut g = Graph::open_or_create(name).unwrap();
+        let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+        g.delete_vertex(a).unwrap();
+        a
+    };
+    let g = Graph::open_or_create(name).unwrap();
+    assert!(g.vertex_info(a).is_none());
+    let _ = Graph::reset(name);
+}
+
+#[test]
 fn add_edge_to_missing_vertex_errors() {
     let mut g = fresh("t-bad");
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
