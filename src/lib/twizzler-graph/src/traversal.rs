@@ -42,13 +42,23 @@ impl<'a> TraversalSource<'a> {
         let current = self.graph.vertices_by_label(label);
         VertexTraversal { graph: self.graph, current }
     }
-    /// Start from one vertex.
+    /// Start from one vertex (empty if it is deleted).
     pub fn v(self, id: VertexId) -> VertexTraversal<'a> {
-        VertexTraversal { graph: self.graph, current: vec![id] }
+        let current = if self.graph.is_vertex_alive(id) {
+            vec![id]
+        } else {
+            Vec::new()
+        };
+        VertexTraversal { graph: self.graph, current }
     }
-    /// Start from a set of vertices.
+    /// Start from a set of vertices (deleted ones are dropped).
     pub fn vs(self, ids: &[VertexId]) -> VertexTraversal<'a> {
-        VertexTraversal { graph: self.graph, current: ids.to_vec() }
+        let current = ids
+            .iter()
+            .copied()
+            .filter(|id| self.graph.is_vertex_alive(*id))
+            .collect();
+        VertexTraversal { graph: self.graph, current }
     }
 }
 

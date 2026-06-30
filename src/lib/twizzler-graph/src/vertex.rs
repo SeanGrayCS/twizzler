@@ -233,6 +233,10 @@ impl<'a> VertexView<'a> {
                     if !label_matches(&filter, e.label) {
                         continue;
                     }
+                    let edge = unsafe { e.edge.resolve() };
+                    if !self.graph.is_edge_alive(EdgeId(edge.id)) {
+                        continue;
+                    }
                     let nb = unsafe { e.neighbor.resolve() };
                     let h = VertexHandle {
                         id: VertexId(nb.id),
@@ -270,6 +274,9 @@ impl<'a> VertexView<'a> {
                         continue;
                     }
                     let edge = unsafe { e.edge.resolve() };
+                    if !self.graph.is_edge_alive(EdgeId(edge.id)) {
+                        continue;
+                    }
                     let h = EdgeHandle::new(
                         EdgeId(edge.id),
                         edge.label,

@@ -25,6 +25,7 @@ use crate::vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, V
 
 const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
 const VERSION: u32 = 1; // on-disk format version
+const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
 /// Read/write/persist map flags for reopening mutable registries.
 fn rw() -> MapFlags {
@@ -303,15 +304,18 @@ impl Graph {
         let lbl = self.find_label(label)?;
         for i in 0..self.verts.len() {
             let r = self.verts.get_ref(i)?;
-            if r.label == lbl && r.name.eq_str(name) {
+            if r.flags & TOMBSTONE == 0 && r.label == lbl && r.name.eq_str(name) {
                 return Some(VertexId(r.id));
             }
         }
         None
     }
 
-    /// A traversal handle for a vertex.
+    /// A traversal handle for a vertex, or `None` if it is deleted.
     pub fn vertex_view(&self, id: VertexId) -> Option<VertexView<'_>> {
+        if !self.is_vertex_alive(id) {
+            return None;
+        }
         let (_vobj, out_raw, in_raw) = self.vertex_locs(id)?;
         Some(VertexView {
             graph: self,
@@ -338,29 +342,81 @@ impl Graph {
             .unwrap_or_default()
     }
 
-    /// All vertex ids in the graph. Linear scan.
+    /// All live vertex ids in the graph. Linear scan.
     pub fn vertices(&self) -> Vec<VertexId> {
         let mut out = Vec::new();
         for i in 0..self.verts.len() {
             if let Some(r) = self.verts.get_ref(i) {
-                out.push(VertexId(r.id));
+                if r.flags & TOMBSTONE == 0 {
+                    out.push(VertexId(r.id));
+                }
             }
         }
         out
     }
 
-    /// An edge's label and endpoints by id. O(1): ids are append indices, so the
-    /// record is at position `id`.
+    /// An edge's label and endpoints by id, or `None` if the edge is deleted.
+    /// O(1): ids are append indices, so the record is at position `id`.
     pub fn edge_info(&self, id: EdgeId) -> Option<EdgeInfo> {
-        let r = self.edges.get_ref(id.0 as usize)?;
-        if r.id != id.0 {
+        if !self.is_edge_alive(id) {
             return None;
         }
+        let r = self.edges.get_ref(id.0 as usize)?;
         Some(EdgeInfo {
             label: self.label_name(r.label).unwrap_or_default(),
             from: VertexId(r.from_id),
             to: VertexId(r.to_id),
         })
+    }
+
+    /// Delete a vertex (tombstone). Its incident edges become hidden too, since
+    /// an edge is alive only while both endpoints are. No-op if already gone.
+    pub fn delete_vertex(&mut self, id: VertexId) -> Result<()> {
+        let idx = id.0 as usize;
+        if idx >= self.verts.len() {
+            return Ok(());
+        }
+        self.verts.with_mut_slice(idx..idx + 1, |s| {
+            if s[0].id == id.0 {
+                s[0].flags |= TOMBSTONE;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Delete an edge (tombstone). No-op if already gone.
+    pub fn delete_edge(&mut self, id: EdgeId) -> Result<()> {
+        let idx = id.0 as usize;
+        if idx >= self.edges.len() {
+            return Ok(());
+        }
+        self.edges.with_mut_slice(idx..idx + 1, |s| {
+            if s[0].id == id.0 {
+                s[0].flags |= TOMBSTONE;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Whether a vertex exists and is not tombstoned.
+    pub(crate) fn is_vertex_alive(&self, id: VertexId) -> bool {
+        match self.verts.get_ref(id.0 as usize) {
+            Some(r) if r.id == id.0 => r.flags & TOMBSTONE == 0,
+            _ => false,
+        }
+    }
+
+    /// Whether an edge exists, is not tombstoned, and both endpoints are alive.
+    pub(crate) fn is_edge_alive(&self, id: EdgeId) -> bool {
+        let Some(r) = self.edges.get_ref(id.0 as usize) else {
+            return false;
+        };
+        if r.id != id.0 || r.flags & TOMBSTONE != 0 {
+            return false;
+        }
+        self.is_vertex_alive(VertexId(r.from_id)) && self.is_vertex_alive(VertexId(r.to_id))
     }
 
     /// All vertices with the given label. Linear scan.
@@ -371,7 +427,7 @@ impl Graph {
         let mut out = Vec::new();
         for i in 0..self.verts.len() {
             if let Some(r) = self.verts.get_ref(i) {
-                if r.label == lbl {
+                if r.flags & TOMBSTONE == 0 && r.label == lbl {
                     out.push(VertexId(r.id));
                 }
             }
@@ -379,11 +435,11 @@ impl Graph {
         out
     }
 
-    /// Read back a vertex's data from the registry. O(1): ids are append
-    /// indices, so the record is at position `id`.
+    /// Read back a vertex's data from the registry, or `None` if it is deleted.
+    /// O(1): ids are append indices, so the record is at position `id`.
     pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
         let r = self.verts.get_ref(id.0 as usize)?;
-        if r.id != id.0 {
+        if r.id != id.0 || r.flags & TOMBSTONE != 0 {
             return None;
         }
         Some(VertexInfo {
