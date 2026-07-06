@@ -4,12 +4,14 @@
 //! edges, labels). Vertex-centric traversal lives on [`VertexView`] in
 //! `vertex.rs`; edge/vertex record types live in their own modules.
 //!
-//! The registries are `VecObject`s with linear-scan key lookup; those scans (the
-//! private helpers at the bottom) are where a `hachage` index would later go.
+//! The registries are `VecObject`s; lookups by id index them directly (ids are
+//! append indices), while the `(label, name) -> vertex` point lookup uses a
+//! persistent `hachage` index. `vertices_by_label` is still a scan.
 //! Adjacency is held per-vertex (see `vertex.rs`), not in the registries.
 
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
+    collections::hachage::{PersistentHashMap, PersistentHashMapBase},
     collections::vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
     error::TwzError,
     marker::{BaseType, Invariant},
@@ -24,7 +26,7 @@ use crate::name::NameKey;
 use crate::vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView};
 
 const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
-const VERSION: u32 = 1; // on-disk format version
+const VERSION: u32 = 2; // on-disk format version
 const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
 /// Read/write/persist map flags for reopening mutable registries.
@@ -42,6 +44,7 @@ pub(crate) struct GraphRoot {
     pub(crate) verts_raw: u128,
     pub(crate) edges_raw: u128,
     pub(crate) labels_raw: u128,
+    pub(crate) vindex_raw: u128,
 }
 unsafe impl Invariant for GraphRoot {}
 impl BaseType for GraphRoot {}
@@ -55,12 +58,25 @@ pub(crate) struct LabelEntry {
 }
 unsafe impl Invariant for LabelEntry {}
 
-/// An open graph: the root id plus mapped, mutable registries.
+/// Key for the vertex index: a (label id, name) pair.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+struct VKey {
+    label: u32,
+    name: NameKey,
+}
+unsafe impl Invariant for VKey {}
+
+/// Persistent index from (label, name) to vertex id.
+type VIndex = PersistentHashMap<VKey, u64>;
+
+/// An open graph: the root id, the registries, and the vertex index.
 pub struct Graph {
     root_id: ObjID,
     verts: VecObject<VertexRef, VecObjectAlloc>,
     edges: VecObject<EdgeRef, VecObjectAlloc>,
     labels: VecObject<LabelEntry, VecObjectAlloc>,
+    vindex: VIndex,
 }
 
 impl Graph {
@@ -74,11 +90,20 @@ impl Graph {
 
         if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
             let root = Object::<GraphRoot>::map(node.id.into(), MapFlags::READ | MapFlags::PERSIST)?;
-            let (magic, version, verts_raw, edges_raw, labels_raw) = {
+            let (magic, version, verts_raw, edges_raw, labels_raw, vindex_raw) = {
                 let r = root.base();
-                (r.magic, r.version, r.verts_raw, r.edges_raw, r.labels_raw)
+                (
+                    r.magic,
+                    r.version,
+                    r.verts_raw,
+                    r.edges_raw,
+                    r.labels_raw,
+                    r.vindex_raw,
+                )
             };
             if magic == MAGIC && version == VERSION {
+                let vbacking: Object<PersistentHashMapBase<VKey, u64>> =
+                    Object::map(ObjID::new(vindex_raw), rw())?;
                 return Ok(Graph {
                     root_id: node.id.into(),
                     verts: VecObject::from(Object::<TwzVec<VertexRef, VecObjectAlloc>>::map(
@@ -93,6 +118,7 @@ impl Graph {
                         ObjID::new(labels_raw),
                         rw(),
                     )?),
+                    vindex: PersistentHashMap::from(vbacking),
                 });
             }
             // Incompatible/stale format: do NOT touch the existing graph.
@@ -108,6 +134,7 @@ impl Graph {
             VecObject::new(ObjectBuilder::default().persist(true))?;
         let labels: VecObject<LabelEntry, VecObjectAlloc> =
             VecObject::new(ObjectBuilder::default().persist(true))?;
+        let vindex = VIndex::new_persist()?;
 
         let root = ObjectBuilder::<GraphRoot>::default()
             .persist(true)
@@ -117,6 +144,7 @@ impl Graph {
                 verts_raw: verts.object().id().raw(),
                 edges_raw: edges.object().id().raw(),
                 labels_raw: labels.object().id().raw(),
+                vindex_raw: vindex.object().id().raw(),
             })?;
 
         let _ = namer.remove(&path);
@@ -127,6 +155,7 @@ impl Graph {
             verts,
             edges,
             labels,
+            vindex,
         })
     }
 
@@ -165,10 +194,12 @@ impl Graph {
             VecObject::new(ObjectBuilder::default().persist(true))?;
         let labels: VecObject<LabelEntry, VecObjectAlloc> =
             VecObject::new(ObjectBuilder::default().persist(true))?;
-        let (verts_raw, edges_raw, labels_raw) = (
+        let vindex = VIndex::new_persist()?;
+        let (verts_raw, edges_raw, labels_raw, vindex_raw) = (
             verts.object().id().raw(),
             edges.object().id().raw(),
             labels.object().id().raw(),
+            vindex.object().id().raw(),
         );
 
         // Rewrite the root transactionally so the change is synced to the
@@ -180,6 +211,7 @@ impl Graph {
             b.verts_raw = verts_raw;
             b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
+            b.vindex_raw = vindex_raw;
             Ok(())
         })?;
         Ok(())
@@ -221,6 +253,14 @@ impl Graph {
             out_raw,
             in_raw,
         })?;
+
+        self.vindex.insert(
+            VKey {
+                label: lbl,
+                name: NameKey::new(name),
+            },
+            id,
+        )?;
         Ok(VertexId(id))
     }
 
@@ -299,16 +339,19 @@ impl Graph {
         Ok(EdgeId(id))
     }
 
-    /// Find a vertex by (label, name). Linear scan.
+    /// Find a vertex by (label, name) via the persistent index.
     pub fn find_vertex(&self, label: &str, name: &str) -> Option<VertexId> {
         let lbl = self.find_label(label)?;
-        for i in 0..self.verts.len() {
-            let r = self.verts.get_ref(i)?;
-            if r.flags & TOMBSTONE == 0 && r.label == lbl && r.name.eq_str(name) {
-                return Some(VertexId(r.id));
-            }
+        let key = VKey {
+            label: lbl,
+            name: NameKey::new(name),
+        };
+        let id = VertexId(*self.vindex.get(&key)?);
+        if self.is_vertex_alive(id) {
+            Some(id)
+        } else {
+            None
         }
-        None
     }
 
     /// A traversal handle for a vertex, or `None` if it is deleted.
