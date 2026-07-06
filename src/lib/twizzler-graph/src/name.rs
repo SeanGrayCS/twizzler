@@ -6,7 +6,8 @@
 
 use twizzler::marker::Invariant;
 
-#[derive(Clone, Copy)]
+// `new` zero-fills the unused tail, so byte-wise Eq/Hash are well-defined.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct NameKey {
     len: u8,

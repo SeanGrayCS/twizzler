@@ -248,6 +248,29 @@ fn dsl_edge_steps() {
 }
 
 #[test]
+fn vertex_index_find_delete_and_persist() {
+    let name = "t-vindex";
+    let _ = Graph::reset(name);
+    let (t, deleted) = {
+        let mut g = Graph::open_or_create(name).unwrap();
+        let t = g.add_vertex("tag", "thesis", ObjID::new(0)).unwrap();
+        let d = g.add_vertex("tag", "gone", ObjID::new(0)).unwrap();
+        // Index lookup.
+        assert_eq!(g.find_vertex("tag", "thesis"), Some(t));
+        // Deleted vertices are not returned by the index lookup.
+        g.delete_vertex(d).unwrap();
+        assert_eq!(g.find_vertex("tag", "gone"), None);
+        (t, d)
+    };
+    // The index persists: reopen and look up again.
+    let g = Graph::open_or_create(name).unwrap();
+    assert_eq!(g.find_vertex("tag", "thesis"), Some(t));
+    assert_eq!(g.find_vertex("tag", "gone"), None);
+    assert!(g.vertex_info(deleted).is_none());
+    let _ = Graph::reset(name);
+}
+
+#[test]
 fn delete_vertex_hides_it_and_incident_edges() {
     let mut g = fresh("t-delv");
     let a = g.add_vertex("file", "a", ObjID::new(0)).unwrap();
