@@ -4,10 +4,12 @@
 //! edges, labels). Vertex-centric traversal lives on [`VertexView`] in
 //! `vertex.rs`; edge/vertex record types live in their own modules.
 //!
-//! The registries are `VecObject`s; lookups by id index them directly (ids are
-//! append indices), while the `(label, name) -> vertex` point lookup uses a
-//! persistent `hachage` index. `vertices_by_label` is still a scan.
-//! Adjacency is held per-vertex (see `vertex.rs`), not in the registries.
+//! The registries are segmented vectors ([`SegVec`]) so they outgrow a single
+//! object; lookups by id index them directly (ids are append indices, and
+//! segments are uniformly sized, so id -> (segment, offset) is O(1)). The
+//! `(label, name) -> vertex` point lookup uses a persistent `hachage` index.
+//! `vertices_by_label` is still a scan. Adjacency is held per-vertex (see
+//! `vertex.rs`), not in the registries.
 
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
@@ -23,24 +25,33 @@ use twizzler_rt_abi::error::ArgumentError;
 use crate::error::{GraphError, Result};
 use crate::edge::{Edge, EdgeId, EdgeInfo, EdgeRef};
 use crate::name::NameKey;
+use crate::segvec::SegVec;
 use crate::vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView};
 
-const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
-const VERSION: u32 = 2; // on-disk format version
+pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
+pub(crate) const VERSION: u32 = 3; // on-disk format version (3: segmented registries)
 const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
+
+/// Default per-segment registry capacity. Registry records are plain data
+/// (~100–150 B, no `InvPtr`s), so 4096 entries keep a segment well under the
+/// object size limit while amortizing segment creation.
+pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
 
 /// Read/write/persist map flags for reopening mutable registries.
 fn rw() -> MapFlags {
     MapFlags::READ | MapFlags::WRITE | MapFlags::PERSIST
 }
 
-/// Base of the graph root object: format guard + the registry ObjIDs (raw, so
-/// the on-disk format is backend-agnostic and relocatable).
+/// Base of the graph root object: format guard, the registry segment
+/// capacity, and the registry ObjIDs (raw, so the on-disk format is
+/// backend-agnostic and relocatable). The registry ids point at `SegVec`
+/// directory objects as of version 3.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GraphRoot {
     pub(crate) magic: u64,
     pub(crate) version: u32,
+    pub(crate) seg_cap: u32,
     pub(crate) verts_raw: u128,
     pub(crate) edges_raw: u128,
     pub(crate) labels_raw: u128,
@@ -73,9 +84,9 @@ type VIndex = PersistentHashMap<VKey, u64>;
 /// An open graph: the root id, the registries, and the vertex index.
 pub struct Graph {
     root_id: ObjID,
-    verts: VecObject<VertexRef, VecObjectAlloc>,
-    edges: VecObject<EdgeRef, VecObjectAlloc>,
-    labels: VecObject<LabelEntry, VecObjectAlloc>,
+    verts: SegVec<VertexRef>,
+    edges: SegVec<EdgeRef>,
+    labels: SegVec<LabelEntry>,
     vindex: VIndex,
 }
 
@@ -85,16 +96,29 @@ impl Graph {
     /// (magic/version mismatch), this returns [`GraphError::StaleVersion`] and
     /// leaves the existing graph intact; use [`Graph::reset`] to discard it.
     pub fn open_or_create(name: &str) -> Result<Graph> {
+        Self::open_or_create_with_capacity(name, DEFAULT_SEG_CAP)
+    }
+
+    /// Like [`Graph::open_or_create`], with an explicit registry segment
+    /// capacity. The capacity is used only when *creating* a graph; an
+    /// existing graph always keeps the capacity recorded in its root, since
+    /// segment geometry must stay uniform for the graph's lifetime. (Small
+    /// capacities let tests force segment rollover cheaply.)
+    pub fn open_or_create_with_capacity(name: &str, cap: usize) -> Result<Graph> {
+        if cap == 0 || cap > u32::MAX as usize {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
 
         if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
             let root = Object::<GraphRoot>::map(node.id.into(), MapFlags::READ | MapFlags::PERSIST)?;
-            let (magic, version, verts_raw, edges_raw, labels_raw, vindex_raw) = {
+            let (magic, version, seg_cap, verts_raw, edges_raw, labels_raw, vindex_raw) = {
                 let r = root.base();
                 (
                     r.magic,
                     r.version,
+                    r.seg_cap,
                     r.verts_raw,
                     r.edges_raw,
                     r.labels_raw,
@@ -102,22 +126,15 @@ impl Graph {
                 )
             };
             if magic == MAGIC && version == VERSION {
+                // The persisted capacity governs, not the caller's.
+                let cap = seg_cap as usize;
                 let vbacking: Object<PersistentHashMapBase<VKey, u64>> =
                     Object::map(ObjID::new(vindex_raw), rw())?;
                 return Ok(Graph {
                     root_id: node.id.into(),
-                    verts: VecObject::from(Object::<TwzVec<VertexRef, VecObjectAlloc>>::map(
-                        ObjID::new(verts_raw),
-                        rw(),
-                    )?),
-                    edges: VecObject::from(Object::<TwzVec<EdgeRef, VecObjectAlloc>>::map(
-                        ObjID::new(edges_raw),
-                        rw(),
-                    )?),
-                    labels: VecObject::from(Object::<TwzVec<LabelEntry, VecObjectAlloc>>::map(
-                        ObjID::new(labels_raw),
-                        rw(),
-                    )?),
+                    verts: SegVec::open(verts_raw, cap)?,
+                    edges: SegVec::open(edges_raw, cap)?,
+                    labels: SegVec::open(labels_raw, cap)?,
                     vindex: PersistentHashMap::from(vbacking),
                 });
             }
@@ -128,12 +145,9 @@ impl Graph {
             });
         }
 
-        let verts: VecObject<VertexRef, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let edges: VecObject<EdgeRef, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let labels: VecObject<LabelEntry, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let verts = SegVec::create(cap)?;
+        let edges = SegVec::create(cap)?;
+        let labels = SegVec::create(cap)?;
         let vindex = VIndex::new_persist()?;
 
         let root = ObjectBuilder::<GraphRoot>::default()
@@ -141,9 +155,10 @@ impl Graph {
             .build(GraphRoot {
                 magic: MAGIC,
                 version: VERSION,
-                verts_raw: verts.object().id().raw(),
-                edges_raw: edges.object().id().raw(),
-                labels_raw: labels.object().id().raw(),
+                seg_cap: cap as u32,
+                verts_raw: verts.dir_raw(),
+                edges_raw: edges.dir_raw(),
+                labels_raw: labels.dir_raw(),
                 vindex_raw: vindex.object().id().raw(),
             })?;
 
@@ -164,6 +179,15 @@ impl Graph {
         self.root_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn registry_segments(&self) -> (usize, usize, usize) {
+        (
+            self.verts.segments(),
+            self.edges.segments(),
+            self.labels.segments(),
+        )
+    }
+
     /// Reset a graph to empty, reusing its registration. No-op if no such graph
     /// is registered.
     ///
@@ -174,6 +198,21 @@ impl Graph {
     /// registry objects are orphaned; reclamation and true unregistration are
     /// future work.
     pub fn reset(name: &str) -> Result<()> {
+        Self::reset_inner(name, None)
+    }
+
+    /// Like [`Graph::reset`], but the rebuilt graph uses the given registry
+    /// segment capacity instead of keeping the existing one. No-op if no such
+    /// graph is registered — pair it with
+    /// [`Graph::open_or_create_with_capacity`] so both paths agree on `cap`.
+    pub fn reset_with_capacity(name: &str, cap: usize) -> Result<()> {
+        if cap == 0 || cap > u32::MAX as usize {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        Self::reset_inner(name, Some(cap))
+    }
+
+    fn reset_inner(name: &str, cap: Option<usize>) -> Result<()> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
         let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
@@ -181,24 +220,30 @@ impl Graph {
         };
 
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
-        // Only clobber something that is actually one of our graphs.
-        let is_graph = root.base().magic == MAGIC;
+        // Only clobber something that is actually one of our graphs; trust the
+        // stored capacity only if the root has the current layout.
+        let (is_graph, old_version, old_cap) = {
+            let r = root.base();
+            (r.magic == MAGIC, r.version, r.seg_cap)
+        };
         if !is_graph {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
+        let cap = cap.unwrap_or(if old_version == VERSION && old_cap != 0 {
+            old_cap as usize
+        } else {
+            DEFAULT_SEG_CAP
+        });
 
         // Fresh, empty registries.
-        let verts: VecObject<VertexRef, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let edges: VecObject<EdgeRef, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let labels: VecObject<LabelEntry, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
+        let verts = SegVec::<VertexRef>::create(cap)?;
+        let edges = SegVec::<EdgeRef>::create(cap)?;
+        let labels = SegVec::<LabelEntry>::create(cap)?;
         let vindex = VIndex::new_persist()?;
         let (verts_raw, edges_raw, labels_raw, vindex_raw) = (
-            verts.object().id().raw(),
-            edges.object().id().raw(),
-            labels.object().id().raw(),
+            verts.dir_raw(),
+            edges.dir_raw(),
+            labels.dir_raw(),
             vindex.object().id().raw(),
         );
 
@@ -208,6 +253,7 @@ impl Graph {
             let mut b = tx.base_mut();
             b.magic = MAGIC;
             b.version = VERSION;
+            b.seg_cap = cap as u32;
             b.verts_raw = verts_raw;
             b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
@@ -419,9 +465,9 @@ impl Graph {
         if idx >= self.verts.len() {
             return Ok(());
         }
-        self.verts.with_mut_slice(idx..idx + 1, |s| {
-            if s[0].id == id.0 {
-                s[0].flags |= TOMBSTONE;
+        self.verts.with_mut_at(idx, |r| {
+            if r.id == id.0 {
+                r.flags |= TOMBSTONE;
             }
             Ok(())
         })?;
@@ -434,9 +480,9 @@ impl Graph {
         if idx >= self.edges.len() {
             return Ok(());
         }
-        self.edges.with_mut_slice(idx..idx + 1, |s| {
-            if s[0].id == id.0 {
-                s[0].flags |= TOMBSTONE;
+        self.edges.with_mut_at(idx, |r| {
+            if r.id == id.0 {
+                r.flags |= TOMBSTONE;
             }
             Ok(())
         })?;
