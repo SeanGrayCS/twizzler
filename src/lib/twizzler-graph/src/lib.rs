@@ -11,6 +11,7 @@ mod edge;
 mod error;
 mod graph;
 mod name;
+mod segvec;
 mod traversal;
 mod vertex;
 
