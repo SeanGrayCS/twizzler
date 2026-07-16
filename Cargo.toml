@@ -8,6 +8,7 @@ members = [
     "tools/initrd_gen",
     "src/bin/init",
     "src/bin/rns",
+    "src/bin/gstress",
     "src/bin/bootstrap",
     "src/kernel",
     "src/lib/twizzler-queue-raw",
@@ -116,6 +117,7 @@ initrd = [
     #"crate:gfxtest",
     "crate:shell",
     "crate:rns",
+    "crate:gstress",
     #"crate:sshd",
 
     #"crate:sec",
