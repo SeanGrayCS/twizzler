@@ -20,7 +20,7 @@ mod tests;
 
 pub use edge::{EdgeHandle, EdgeId, EdgeInfo};
 pub use error::GraphError;
-pub use graph::Graph;
+pub use graph::{BulkSession, Graph};
 pub use name::NameKey;
 pub use traversal::{EdgeTraversal, TraversalSource, VertexTraversal};
 pub use vertex::{Labels, VertexHandle, VertexId, VertexInfo, VertexView};

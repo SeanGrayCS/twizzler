@@ -14,16 +14,56 @@
 //! for the life of the graph. Directory entries are raw `ObjID`s (no
 //! `InvPtr`s), so the directory itself has no FOT pressure.
 
+use std::mem::MaybeUninit;
+
 use twizzler::{
     collections::vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
     error::TwzError,
     marker::{Invariant, StoreCopy},
     object::{MapFlags, ObjID, Object, ObjectBuilder},
-    ptr::Ref,
+    ptr::{Ref, RefMut},
 };
 use twizzler_rt_abi::error::ArgumentError;
 
 type Result<T> = core::result::Result<T, TwzError>;
+
+/// `VecObject::push` with the sync-on-drop suppressed; durability deferred
+/// to a later explicit sync of the object.
+pub(crate) fn vec_push_nosync<T>(v: &mut VecObject<T, VecObjectAlloc>, val: T) -> Result<()>
+where
+    T: Invariant + StoreCopy,
+{
+    let mut tx = v.object().as_tx()?;
+    tx.base_mut().push(val)?;
+    tx.abort();
+    Ok(())
+}
+
+/// `VecObject::push_ctor` with the sync-on-drop suppressed.
+pub(crate) fn vec_push_ctor_nosync<T, F>(
+    v: &mut VecObject<T, VecObjectAlloc>,
+    ctor: F,
+) -> Result<()>
+where
+    T: Invariant,
+    F: FnOnce(RefMut<MaybeUninit<T>>) -> Result<RefMut<T>>,
+{
+    let mut tx = v.object().as_tx()?;
+    tx.base_mut().push_ctor(ctor)?;
+    tx.abort();
+    Ok(())
+}
+
+/// `VecObject::new` without the new object's initial sync.
+pub(crate) fn vec_new_nosync<T: Invariant>(
+    builder: ObjectBuilder<TwzVec<T, VecObjectAlloc>>,
+) -> Result<VecObject<T, VecObjectAlloc>> {
+    Ok(VecObject::from(builder.build_inplace(|tx| {
+        let mut done = tx.write(TwzVec::new_in(VecObjectAlloc))?;
+        done.abort();
+        Ok(done)
+    })?))
+}
 
 /// Read/write/persist map flags for reopening mutable segments.
 fn rw() -> MapFlags {
@@ -47,6 +87,11 @@ pub(crate) struct SegVec<T: Invariant> {
     segs: Vec<VecObject<T, VecObjectAlloc>>,
     /// Per-segment capacity; every non-last segment holds exactly `cap`.
     cap: usize,
+    /// Segment indices with writes whose durability was deferred
+    /// (`push_nosync`); drained by [`SegVec::flush`].
+    dirty: std::collections::HashSet<usize>,
+    /// Whether the directory itself has deferred writes.
+    dir_dirty: bool,
 }
 
 impl<T: Invariant> SegVec<T> {
@@ -60,6 +105,8 @@ impl<T: Invariant> SegVec<T> {
             dir,
             segs: Vec::new(),
             cap,
+            dirty: std::collections::HashSet::new(),
+            dir_dirty: false,
         })
     }
 
@@ -69,9 +116,11 @@ impl<T: Invariant> SegVec<T> {
         if cap == 0 {
             return Err(ArgumentError::InvalidArgument.into());
         }
-        let dir: VecObject<SegEntry, VecObjectAlloc> = VecObject::from(
-            Object::<TwzVec<SegEntry, VecObjectAlloc>>::map(ObjID::new(dir_raw), rw())?,
-        );
+        let dir: VecObject<SegEntry, VecObjectAlloc> =
+            VecObject::from(Object::<TwzVec<SegEntry, VecObjectAlloc>>::map(
+                ObjID::new(dir_raw),
+                rw(),
+            )?);
         let mut segs = Vec::with_capacity(dir.len());
         for i in 0..dir.len() {
             let raw = dir
@@ -96,7 +145,13 @@ impl<T: Invariant> SegVec<T> {
                 return Err(ArgumentError::InvalidArgument.into());
             }
         }
-        Ok(SegVec { dir, segs, cap })
+        Ok(SegVec {
+            dir,
+            segs,
+            cap,
+            dirty: std::collections::HashSet::new(),
+            dir_dirty: false,
+        })
     }
 
     /// The directory object's ObjID — what the graph root records.
@@ -145,24 +200,67 @@ impl<T: Invariant> SegVec<T> {
     where
         T: StoreCopy,
     {
-        self.grow_for_push()?;
+        self.grow_for_push(false)?;
         self.segs
             .last_mut()
             .expect("segment exists after grow_for_push")
             .push(item)
     }
 
+    pub(crate) fn push_nosync(&mut self, item: T) -> Result<()>
+    where
+        T: StoreCopy,
+    {
+        self.grow_for_push(true)?;
+        let idx = self.segs.len() - 1;
+        let seg = self
+            .segs
+            .last_mut()
+            .expect("segment exists after grow_for_push");
+        vec_push_nosync(seg, item)?;
+        self.dirty.insert(idx);
+        Ok(())
+    }
+
+    /// Sync every object with deferred writes, once each: dirty segments and,
+    /// if it grew during a batch, the directory.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        for i in self.dirty.drain() {
+            if let Some(seg) = self.segs.get(i) {
+                // Safety: the engine is single-threaded per graph handle; no
+                // other mapping mutates these objects concurrently.
+                unsafe { seg.object().as_mut()?.sync()? };
+            }
+        }
+        if self.dir_dirty {
+            unsafe { self.dir.object().as_mut()?.sync()? };
+            self.dir_dirty = false;
+        }
+        Ok(())
+    }
+
     /// Ensure the last segment has room: create and register a new segment if
-    /// the vector is empty or the last segment is full.
-    fn grow_for_push(&mut self) -> Result<()> {
+    /// the vector is empty or the last segment is full. In `nosync` mode the
+    /// new segment and the directory write defer durability until `flush`.
+    fn grow_for_push(&mut self, nosync: bool) -> Result<()> {
         if self.segs.last().map_or(false, |s| s.len() < self.cap) {
             return Ok(());
         }
-        let seg: VecObject<T, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        self.dir.push(SegEntry {
+        let seg: VecObject<T, VecObjectAlloc> = if nosync {
+            vec_new_nosync(ObjectBuilder::default().persist(true))?
+        } else {
+            VecObject::new(ObjectBuilder::default().persist(true))?
+        };
+        let entry = SegEntry {
             raw: seg.object().id().raw(),
-        })?;
+        };
+        if nosync {
+            vec_push_nosync(&mut self.dir, entry)?;
+            self.dir_dirty = true;
+            self.dirty.insert(self.segs.len());
+        } else {
+            self.dir.push(entry)?;
+        }
         self.segs.push(seg);
         Ok(())
     }
@@ -252,7 +350,7 @@ mod tests {
         .unwrap();
         assert_eq!(sv.get_ref(5).unwrap().v, 55);
         assert_eq!(sv.get_ref(4).unwrap().v, 4); // neighbor untouched
-        // Out of bounds is an error, not a panic.
+                                                 // Out of bounds is an error, not a panic.
         assert!(sv.with_mut_at(100, |_| Ok(())).is_err());
     }
 
@@ -274,6 +372,23 @@ mod tests {
         }
         assert_eq!((sv.len(), sv.segments()), (13, 4));
         assert_eq!(sv.get_ref(12).unwrap().v, 12);
+    }
+
+    #[test]
+    fn segvec_push_nosync_and_flush() {
+        let mut sv = SegVec::create(4).unwrap();
+        for i in 0..10 {
+            sv.push_nosync(TestRec { v: i }).unwrap();
+        }
+        assert_eq!((sv.len(), sv.segments()), (10, 3));
+        assert_eq!(sv.get_ref(9).unwrap().v, 9);
+        sv.flush().unwrap();
+        let dir = sv.dir_raw();
+        drop(sv);
+        let sv = SegVec::<TestRec>::open(dir, 4).unwrap();
+        assert_eq!(sv.len(), 10);
+        assert_eq!(sv.get_ref(4).unwrap().v, 4);
+        assert_eq!(sv.get_ref(9).unwrap().v, 9);
     }
 
     #[test]

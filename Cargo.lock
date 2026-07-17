@@ -3146,6 +3146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstress"
+version = "0.1.0"
+dependencies = [
+ "twizzler",
+ "twizzler-abi",
+ "twizzler-graph",
+ "twizzler-rt-abi",
+]
+
+[[package]]
 name = "guess_host_triple"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
