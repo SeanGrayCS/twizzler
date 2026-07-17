@@ -65,7 +65,12 @@ pub struct EdgeHandle {
 }
 impl EdgeHandle {
     pub(crate) fn new(id: EdgeId, label: u32, from: VertexId, to: VertexId) -> Self {
-        EdgeHandle { id, label, from, to }
+        EdgeHandle {
+            id,
+            label,
+            from,
+            to,
+        }
     }
     pub fn id(&self) -> EdgeId {
         self.id

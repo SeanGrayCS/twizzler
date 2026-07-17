@@ -35,12 +35,18 @@ impl<'a> TraversalSource<'a> {
     /// Start from every vertex.
     pub fn vertices(self) -> VertexTraversal<'a> {
         let current = self.graph.vertices();
-        VertexTraversal { graph: self.graph, current }
+        VertexTraversal {
+            graph: self.graph,
+            current,
+        }
     }
     /// Start from every vertex with the given label.
     pub fn with_label(self, label: &str) -> VertexTraversal<'a> {
         let current = self.graph.vertices_by_label(label);
-        VertexTraversal { graph: self.graph, current }
+        VertexTraversal {
+            graph: self.graph,
+            current,
+        }
     }
     /// Start from one vertex (empty if it is deleted).
     pub fn v(self, id: VertexId) -> VertexTraversal<'a> {
@@ -49,7 +55,10 @@ impl<'a> TraversalSource<'a> {
         } else {
             Vec::new()
         };
-        VertexTraversal { graph: self.graph, current }
+        VertexTraversal {
+            graph: self.graph,
+            current,
+        }
     }
     /// Start from a set of vertices (deleted ones are dropped).
     pub fn vs(self, ids: &[VertexId]) -> VertexTraversal<'a> {
@@ -58,7 +67,10 @@ impl<'a> TraversalSource<'a> {
             .copied()
             .filter(|id| self.graph.is_vertex_alive(*id))
             .collect();
-        VertexTraversal { graph: self.graph, current }
+        VertexTraversal {
+            graph: self.graph,
+            current,
+        }
     }
 }
 
@@ -179,7 +191,10 @@ impl<'a> VertexTraversal<'a> {
                 }
             }
         }
-        EdgeTraversal { graph: g, current: edges }
+        EdgeTraversal {
+            graph: g,
+            current: edges,
+        }
     }
 }
 
@@ -205,7 +220,10 @@ impl<'a> EdgeTraversal<'a> {
                 vs.push(i.from);
             }
         }
-        VertexTraversal { graph: g, current: vs }
+        VertexTraversal {
+            graph: g,
+            current: vs,
+        }
     }
     /// Move to each edge's target vertex.
     pub fn in_v(self) -> VertexTraversal<'a> {
@@ -216,7 +234,10 @@ impl<'a> EdgeTraversal<'a> {
                 vs.push(i.to);
             }
         }
-        VertexTraversal { graph: g, current: vs }
+        VertexTraversal {
+            graph: g,
+            current: vs,
+        }
     }
     /// Move to both endpoint vertices of each edge.
     pub fn both_v(self) -> VertexTraversal<'a> {
@@ -228,7 +249,10 @@ impl<'a> EdgeTraversal<'a> {
                 vs.push(i.to);
             }
         }
-        VertexTraversal { graph: g, current: vs }
+        VertexTraversal {
+            graph: g,
+            current: vs,
+        }
     }
 
     /// Keep edges with the given label.

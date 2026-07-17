@@ -19,9 +19,11 @@ use twizzler::{
     ptr::InvPtr,
 };
 
-use crate::edge::{Edge, EdgeHandle, EdgeId};
-use crate::graph::Graph;
-use crate::name::NameKey;
+use crate::{
+    edge::{Edge, EdgeHandle, EdgeId},
+    graph::Graph,
+    name::NameKey,
+};
 
 /// Public vertex id (an append index).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

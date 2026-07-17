@@ -58,7 +58,9 @@ fn edge_and_label_registries_shard() {
     let mut spokes = Vec::new();
     let mut edges = Vec::new();
     for i in 0..6 {
-        let s = g.add_vertex("spoke", &format!("s{i}"), ObjID::new(0)).unwrap();
+        let s = g
+            .add_vertex("spoke", &format!("s{i}"), ObjID::new(0))
+            .unwrap();
         // Distinct edge labels push the label registry over a boundary too:
         // 2 vertex labels + 6 edge labels = 8 = 2 segments of 4.
         edges.push(g.add_edge(hub, &format!("l{i}"), s).unwrap());
@@ -74,7 +76,10 @@ fn edge_and_label_registries_shard() {
     }
     // Traversal liveness checks consult the sharded edge registry.
     assert_eq!(g.out_neighbors(hub, Labels::any()).len(), 6);
-    assert_eq!(g.out_neighbors(hub, Labels::these(&["l5"])), vec![spokes[5]]);
+    assert_eq!(
+        g.out_neighbors(hub, Labels::these(&["l5"])),
+        vec![spokes[5]]
+    );
 }
 
 #[test]

@@ -21,7 +21,10 @@ impl NameKey {
         let n = b.len().min(31);
         let mut bytes = [0u8; 31];
         bytes[..n].copy_from_slice(&b[..n]);
-        NameKey { len: n as u8, bytes }
+        NameKey {
+            len: n as u8,
+            bytes,
+        }
     }
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
