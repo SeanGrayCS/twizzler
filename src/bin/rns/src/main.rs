@@ -38,10 +38,16 @@ fn build() -> Result<()> {
     // The underlying data objects being named.
     let doc_obj = ObjectBuilder::<FileMeta>::default()
         .persist(true)
-        .build(FileMeta { kind: 0, size: 4_096 })?;
+        .build(FileMeta {
+            kind: 0,
+            size: 4_096,
+        })?;
     let photo_obj = ObjectBuilder::<FileMeta>::default()
         .persist(true)
-        .build(FileMeta { kind: 1, size: 220_000 })?;
+        .build(FileMeta {
+            kind: 1,
+            size: 220_000,
+        })?;
 
     // Map files and a tag onto graph vertices, then relate them with edges.
     let doc = g.add_vertex("file", "doc", doc_obj.id())?;

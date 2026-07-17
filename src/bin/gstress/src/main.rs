@@ -134,13 +134,16 @@ fn main() {
         Some("medium") => &MEDIUM,
         Some("large") => &LARGE,
         Some(other) => {
-            println!("usage: gstress [tiny|small|medium|large]  (got '{other}')");
+            println!("usage: gstress [tiny|small|medium|large] [nobulk]  (got '{other}')");
             std::process::exit(2);
         }
     };
+    let use_bulk = std::env::args().nth(2).as_deref() != Some("nobulk");
+    const CHUNK: usize = 500;
     println!(
-        "gstress: preset {} (V={} bulkE={} degCap={} churn={} chain={} clique={})",
+        "gstress: preset {} ({}) (V={} bulkE={} degCap={} churn={} chain={} clique={})",
         preset.name,
+        if use_bulk { "bulk" } else { "nobulk" },
         preset.vertices,
         preset.bulk_edges,
         preset.degree_cap,
@@ -156,11 +159,16 @@ fn main() {
     Graph::reset(GRAPH).expect("reset gstress graph");
     let mut g = Graph::open_or_create(GRAPH).expect("create gstress graph");
 
-    let mut add_v = |g: &mut Graph, st: &mut Stats, next_id: &mut u64, label: &str, name: &str| {
-        let v = g.add_vertex(label, name, ObjID::new(0)).expect("add_vertex");
+    let add_v = |g: &mut Graph, st: &mut Stats, next_id: &mut u64, label: &str, name: &str| {
+        let v = g
+            .add_vertex(label, name, ObjID::new(0))
+            .expect("add_vertex");
         // Ids are append indices and never reused; any drift is a bug.
         if v.0 != *next_id {
-            st.fail(format!("vertex id drift: got {}, expected {}", v.0, *next_id));
+            st.fail(format!(
+                "vertex id drift: got {}, expected {}",
+                v.0, *next_id
+            ));
         }
         *next_id += 1;
         v
@@ -169,10 +177,33 @@ fn main() {
     // --- Phase A: registry rollover at the real DEFAULT_SEG_CAP -------------
     let n = preset.vertices;
     let t = Instant::now();
-    for i in 0..n {
-        add_v(&mut g, &mut st, &mut next_id, "n", &format!("v{i}"));
-        if (i + 1) % 500 == 0 {
-            heartbeat("A:rollover", i + 1, n, &t);
+    if use_bulk {
+        let mut i = 0;
+        while i < n {
+            let hi = (i + CHUNK).min(n);
+            g.bulk(|b| {
+                for j in i..hi {
+                    let v = b.add_vertex("n", &format!("v{j}"), ObjID::new(0))?;
+                    if v.0 != next_id {
+                        st.fail(format!(
+                            "vertex id drift: got {}, expected {}",
+                            v.0, next_id
+                        ));
+                    }
+                    next_id += 1;
+                }
+                Ok(())
+            })
+            .expect("bulk add_vertex");
+            heartbeat("A:rollover", hi, n, &t);
+            i = hi;
+        }
+    } else {
+        for i in 0..n {
+            add_v(&mut g, &mut st, &mut next_id, "n", &format!("v{i}"));
+            if (i + 1) % 500 == 0 {
+                heartbeat("A:rollover", i + 1, n, &t);
+            }
         }
     }
     // Boundary reads around the default segment capacity (4096) and the tail
@@ -202,14 +233,33 @@ fn main() {
     let t = Instant::now();
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(preset.bulk_edges);
-    for k in 0..preset.bulk_edges {
-        let u = rng.below(n);
-        let v = rng.below(n);
-        g.add_edge(VertexId(u as u64), "b", VertexId(v as u64))
+    if use_bulk {
+        let mut k = 0;
+        while k < preset.bulk_edges {
+            let hi = (k + CHUNK).min(preset.bulk_edges);
+            g.bulk(|b| {
+                for _ in k..hi {
+                    let u = rng.below(n);
+                    let v = rng.below(n);
+                    b.add_edge(VertexId(u as u64), "b", VertexId(v as u64))?;
+                    pairs.push((u as u32, v as u32));
+                }
+                Ok(())
+            })
             .expect("bulk add_edge");
-        pairs.push((u as u32, v as u32));
-        if (k + 1) % 500 == 0 {
-            heartbeat("B:bulk", k + 1, preset.bulk_edges, &t);
+            heartbeat("B:bulk", hi, preset.bulk_edges, &t);
+            k = hi;
+        }
+    } else {
+        for k in 0..preset.bulk_edges {
+            let u = rng.below(n);
+            let v = rng.below(n);
+            g.add_edge(VertexId(u as u64), "b", VertexId(v as u64))
+                .expect("bulk add_edge");
+            pairs.push((u as u32, v as u32));
+            if (k + 1) % 500 == 0 {
+                heartbeat("B:bulk", k + 1, preset.bulk_edges, &t);
+            }
         }
     }
     // Sampled out-degree verification (no deletes yet: expected = raw count).
@@ -227,20 +277,45 @@ fn main() {
     let t = Instant::now();
     let hub = add_v(&mut g, &mut st, &mut next_id, "hub", "hub1");
     let mut hub_deg = 0usize;
-    for i in 0..preset.degree_cap {
-        let target = VertexId(safe_target(i, n) as u64);
-        if i > 0 && i % 1000 == 0 {
-            heartbeat("C:degree", i, preset.degree_cap, &t);
-        }
-        match g.add_edge(hub, "h", target) {
-            Ok(_) => hub_deg += 1,
-            Err(e) => {
+    if use_bulk {
+        let mut i = 0;
+        while i < preset.degree_cap {
+            let hi = (i + CHUNK).min(preset.degree_cap);
+            let r = g.bulk(|b| {
+                for j in i..hi {
+                    let target = VertexId(safe_target(j, n) as u64);
+                    b.add_edge(hub, "h", target)?;
+                    hub_deg += 1;
+                }
+                Ok(())
+            });
+            if let Err(e) = r {
                 println!(
                     "GSTRESS FINDING: adjacency ceiling — hub add_edge #{} failed: {e} \
                      (A2 evidence; record on the board)",
-                    i + 1
+                    hub_deg + 1
                 );
                 break;
+            }
+            heartbeat("C:degree", hi, preset.degree_cap, &t);
+            i = hi;
+        }
+    } else {
+        for i in 0..preset.degree_cap {
+            let target = VertexId(safe_target(i, n) as u64);
+            if i > 0 && i % 1000 == 0 {
+                heartbeat("C:degree", i, preset.degree_cap, &t);
+            }
+            match g.add_edge(hub, "h", target) {
+                Ok(_) => hub_deg += 1,
+                Err(e) => {
+                    println!(
+                        "GSTRESS FINDING: adjacency ceiling — hub add_edge #{} failed: {e} \
+                         (A2 evidence; record on the board)",
+                        i + 1
+                    );
+                    break;
+                }
             }
         }
     }
@@ -254,19 +329,43 @@ fn main() {
         // this should reach a higher ceiling than the distinct-target hub (I0).
         let hub2 = add_v(&mut g, &mut st, &mut next_id, "hub", "hub2");
         let target = VertexId(1); // index 1 survives churn
-        for i in 0..preset.degree_cap {
-            if i > 0 && i % 1000 == 0 {
-                heartbeat("C:degree2", i, preset.degree_cap, &t);
-            }
-            match g.add_edge(hub2, "h2", target) {
-                Ok(_) => hub2_deg += 1,
-                Err(e) => {
+        if use_bulk {
+            let mut i = 0;
+            while i < preset.degree_cap {
+                let hi = (i + CHUNK).min(preset.degree_cap);
+                let r = g.bulk(|b| {
+                    for _ in i..hi {
+                        b.add_edge(hub2, "h2", target)?;
+                        hub2_deg += 1;
+                    }
+                    Ok(())
+                });
+                if let Err(e) = r {
                     println!(
                         "GSTRESS FINDING: same-target ceiling — hub2 add_edge #{} failed: {e} \
                          (compare with hub1; informs FOT-dedup question, I0)",
-                        i + 1
+                        hub2_deg + 1
                     );
                     break;
+                }
+                heartbeat("C:degree2", hi, preset.degree_cap, &t);
+                i = hi;
+            }
+        } else {
+            for i in 0..preset.degree_cap {
+                if i > 0 && i % 1000 == 0 {
+                    heartbeat("C:degree2", i, preset.degree_cap, &t);
+                }
+                match g.add_edge(hub2, "h2", target) {
+                    Ok(_) => hub2_deg += 1,
+                    Err(e) => {
+                        println!(
+                            "GSTRESS FINDING: same-target ceiling — hub2 add_edge #{} failed: {e} \
+                             (compare with hub1; informs FOT-dedup question, I0)",
+                            i + 1
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -306,14 +405,38 @@ fn main() {
             .iter()
             .filter(|(a, b)| *a as usize == u && !deleted[*b as usize])
             .count();
-        let got = g.out_neighbors(VertexId(u as u64), Labels::these(&["b"])).len();
+        let got = g
+            .out_neighbors(VertexId(u as u64), Labels::these(&["b"]))
+            .len();
         st.ck(got == expected, || {
             format!("post-churn out-degree of v{u}: got {got}, expected {expected}")
         });
     }
     // Adds after deletes: ids continue, never reuse.
-    for i in 0..preset.churn_add {
-        add_v(&mut g, &mut st, &mut next_id, "c", &format!("c{i}"));
+    if use_bulk {
+        let mut i = 0;
+        while i < preset.churn_add {
+            let hi = (i + CHUNK).min(preset.churn_add);
+            g.bulk(|b| {
+                for j in i..hi {
+                    let v = b.add_vertex("c", &format!("c{j}"), ObjID::new(0))?;
+                    if v.0 != next_id {
+                        st.fail(format!(
+                            "vertex id drift: got {}, expected {}",
+                            v.0, next_id
+                        ));
+                    }
+                    next_id += 1;
+                }
+                Ok(())
+            })
+            .expect("bulk churn add");
+            i = hi;
+        }
+    } else {
+        for i in 0..preset.churn_add {
+            add_v(&mut g, &mut st, &mut next_id, "c", &format!("c{i}"));
+        }
     }
     report("D:churn", n + preset.churn_add, t);
 
@@ -324,10 +447,9 @@ fn main() {
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {
         "reopen: deleted v7 came back".into()
     });
-    st.ck(
-        g.find_vertex("n", "v8") == Some(VertexId(8)),
-        || "reopen: v8 lookup failed".into(),
-    );
+    st.ck(g.find_vertex("n", "v8") == Some(VertexId(8)), || {
+        "reopen: v8 lookup failed".into()
+    });
     if n > 4096 {
         st.ck(
             g.vertex_info(VertexId(4096)).map(|i| i.name) == Some("v4096".into()),
@@ -339,7 +461,8 @@ fn main() {
         format!("reopen: hub degree got {got}, expected {hub_deg}")
     });
     st.ck(
-        g.find_vertex("c", &format!("c{}", preset.churn_add - 1)).is_some(),
+        g.find_vertex("c", &format!("c{}", preset.churn_add - 1))
+            .is_some(),
         || "reopen: last churn vertex missing".into(),
     );
     report("E:reopen", 5, t);
@@ -347,12 +470,37 @@ fn main() {
     let t = Instant::now();
     let head = add_v(&mut g, &mut st, &mut next_id, "ch", "ch0");
     let mut prev = head;
-    for i in 1..preset.chain {
-        let v = add_v(&mut g, &mut st, &mut next_id, "ch", &format!("ch{i}"));
-        g.add_edge(prev, "next", v).expect("chain add_edge");
-        prev = v;
-        if (i + 1) % 500 == 0 {
-            heartbeat("F:chain", i + 1, preset.chain, &t);
+    if use_bulk {
+        let mut i = 1;
+        while i < preset.chain {
+            let hi = (i + CHUNK).min(preset.chain);
+            g.bulk(|b| {
+                for j in i..hi {
+                    let v = b.add_vertex("ch", &format!("ch{j}"), ObjID::new(0))?;
+                    if v.0 != next_id {
+                        st.fail(format!(
+                            "vertex id drift: got {}, expected {}",
+                            v.0, next_id
+                        ));
+                    }
+                    next_id += 1;
+                    b.add_edge(prev, "next", v)?;
+                    prev = v;
+                }
+                Ok(())
+            })
+            .expect("bulk chain");
+            heartbeat("F:chain", hi, preset.chain, &t);
+            i = hi;
+        }
+    } else {
+        for i in 1..preset.chain {
+            let v = add_v(&mut g, &mut st, &mut next_id, "ch", &format!("ch{i}"));
+            g.add_edge(prev, "next", v).expect("chain add_edge");
+            prev = v;
+            if (i + 1) % 500 == 0 {
+                heartbeat("F:chain", i + 1, preset.chain, &t);
+            }
         }
     }
     let mut cur = head;
@@ -360,7 +508,10 @@ fn main() {
     loop {
         // Safety bound: a cycle would otherwise walk forever.
         if hops > preset.chain {
-            st.fail(format!("chain walk exceeded {} hops — cycle?", preset.chain));
+            st.fail(format!(
+                "chain walk exceeded {} hops — cycle?",
+                preset.chain
+            ));
             break;
         }
         let next = g.out_neighbors(cur, Labels::these(&["next"]));
@@ -379,20 +530,61 @@ fn main() {
     st.ck(hops == preset.chain - 1, || {
         format!("chain walk: {hops} hops, expected {}", preset.chain - 1)
     });
-    st.ck(cur == prev, || "chain walk ended at the wrong vertex".into());
+    st.ck(cur == prev, || {
+        "chain walk ended at the wrong vertex".into()
+    });
     report("F:chain", preset.chain, t);
 
     // Dense clique: k vertices, k*(k-1) directed edges.
     let t = Instant::now();
     let k = preset.clique;
     let mut cl = Vec::with_capacity(k);
-    for i in 0..k {
-        cl.push(add_v(&mut g, &mut st, &mut next_id, "cl", &format!("cl{i}")));
-    }
-    for i in 0..k {
-        for j in 0..k {
-            if i != j {
-                g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
+    if use_bulk {
+        g.bulk(|b| {
+            for i in 0..k {
+                let v = b.add_vertex("cl", &format!("cl{i}"), ObjID::new(0))?;
+                if v.0 != next_id {
+                    st.fail(format!(
+                        "vertex id drift: got {}, expected {}",
+                        v.0, next_id
+                    ));
+                }
+                next_id += 1;
+                cl.push(v);
+            }
+            Ok(())
+        })
+        .expect("bulk clique vertices");
+        // One batch per source row keeps chunks bounded (k-1 edges each).
+        for i in 0..k {
+            g.bulk(|b| {
+                for j in 0..k {
+                    if i != j {
+                        b.add_edge(cl[i], "k", cl[j])?;
+                    }
+                }
+                Ok(())
+            })
+            .expect("bulk clique edges");
+            if (i + 1) % 10 == 0 {
+                heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
+            }
+        }
+    } else {
+        for i in 0..k {
+            cl.push(add_v(
+                &mut g,
+                &mut st,
+                &mut next_id,
+                "cl",
+                &format!("cl{i}"),
+            ));
+        }
+        for i in 0..k {
+            for j in 0..k {
+                if i != j {
+                    g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
+                }
             }
         }
     }
@@ -400,8 +592,12 @@ fn main() {
         let out = g.out_neighbors(cl[i], Labels::these(&["k"])).len();
         let inn = g.in_neighbors(cl[i], Labels::these(&["k"])).len();
         let both = g.both_neighbors(cl[i], Labels::these(&["k"])).len();
-        st.ck(out == k - 1, || format!("clique cl{i} out {out} != {}", k - 1));
-        st.ck(inn == k - 1, || format!("clique cl{i} in {inn} != {}", k - 1));
+        st.ck(out == k - 1, || {
+            format!("clique cl{i} out {out} != {}", k - 1)
+        });
+        st.ck(inn == k - 1, || {
+            format!("clique cl{i} in {inn} != {}", k - 1)
+        });
         st.ck(both == 2 * (k - 1), || {
             format!("clique cl{i} both {both} != {}", 2 * (k - 1))
         });
