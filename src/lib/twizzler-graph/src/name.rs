@@ -33,3 +33,11 @@ impl NameKey {
         self.as_str() == s
     }
 }
+
+/// Debug prints the string form, not the raw byte buffer — that's what you
+/// want in a test-failure message (needed since `PropValue::Str` derives Debug).
+impl core::fmt::Debug for NameKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("NameKey").field(&self.as_str()).finish()
+    }
+}

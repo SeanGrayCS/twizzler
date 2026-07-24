@@ -30,6 +30,7 @@ use crate::{
     edge::{Edge, EdgeId, EdgeInfo, EdgeRef},
     error::{GraphError, Result},
     name::NameKey,
+    props::{self, PropValue},
     segvec::{vec_new_nosync, vec_push_ctor_nosync, SegVec},
     vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView},
 };
@@ -500,6 +501,104 @@ impl Graph {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// Set a property on a vertex; errors if it is missing or tombstoned.
+    /// Creates the vertex's property object on first use and records it in
+    /// the registry mirror (`VertexRef.props_raw`).
+    pub fn set_vertex_prop(&mut self, v: VertexId, key: &str, val: PropValue) -> Result<()> {
+        if !self.is_vertex_alive(v) {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        let idx = v.0 as usize;
+        let cur = self.verts.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
+        let new_raw = props::set_in(cur, key, val)?;
+        if new_raw != cur {
+            self.verts.with_mut_at(idx, |r| {
+                r.props_raw = new_raw;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A vertex property, or `None` if unset or the vertex is dead.
+    pub fn get_vertex_prop(&self, v: VertexId, key: &str) -> Option<PropValue> {
+        if !self.is_vertex_alive(v) {
+            return None;
+        }
+        let raw = self.verts.get_ref(v.0 as usize)?.props_raw;
+        props::get_in(raw, key)
+    }
+
+    /// All of a vertex's properties in insertion order (empty if dead/unset).
+    pub fn vertex_props(&self, v: VertexId) -> Vec<(String, PropValue)> {
+        if !self.is_vertex_alive(v) {
+            return Vec::new();
+        }
+        match self.verts.get_ref(v.0 as usize) {
+            Some(r) => props::list_in(r.props_raw),
+            None => Vec::new(),
+        }
+    }
+
+    /// Set a property on an edge; errors if it is missing, tombstoned, or has
+    /// a dead endpoint. Edge props live in the edge *object* (`EdgeRef` has
+    /// no `props_raw` field; see `props.rs`).
+    pub fn set_edge_prop(&mut self, e: EdgeId, key: &str, val: PropValue) -> Result<()> {
+        if !self.is_edge_alive(e) {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        let eobj_raw = self
+            .edges
+            .get_ref(e.0 as usize)
+            .map(|r| r.eobj_raw)
+            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
+        let mut eo = Object::<Edge>::map(ObjID::new(eobj_raw), rw())?;
+        let cur = eo.base().props_raw;
+        let new_raw = props::set_in(cur, key, val)?;
+        if new_raw != cur {
+            eo.with_tx(|tx| {
+                tx.base_mut().props_raw = new_raw;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// An edge property, or `None` if unset or the edge is dead.
+    pub fn get_edge_prop(&self, e: EdgeId, key: &str) -> Option<PropValue> {
+        if !self.is_edge_alive(e) {
+            return None;
+        }
+        let eobj_raw = self.edges.get_ref(e.0 as usize)?.eobj_raw;
+        let eo = Object::<Edge>::map(
+            ObjID::new(eobj_raw),
+            MapFlags::READ | MapFlags::PERSIST,
+        )
+        .ok()?;
+        let raw = eo.base().props_raw;
+        props::get_in(raw, key)
+    }
+
+    /// All of an edge's properties in insertion order (empty if dead/unset).
+    pub fn edge_props(&self, e: EdgeId) -> Vec<(String, PropValue)> {
+        if !self.is_edge_alive(e) {
+            return Vec::new();
+        }
+        let Some(r) = self.edges.get_ref(e.0 as usize) else {
+            return Vec::new();
+        };
+        let eobj_raw = r.eobj_raw;
+        drop(r);
+        let Ok(eo) = Object::<Edge>::map(
+            ObjID::new(eobj_raw),
+            MapFlags::READ | MapFlags::PERSIST,
+        ) else {
+            return Vec::new();
+        };
+        let raw = eo.base().props_raw;
+        props::list_in(raw)
     }
 
     /// Whether a vertex exists and is not tombstoned.
