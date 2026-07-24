@@ -18,6 +18,7 @@ mod crud;
 mod dsl;
 mod names;
 mod persistence;
+mod props;
 mod sharding;
 
 /// Clear any existing graph of this name, then open a clean one.
