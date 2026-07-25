@@ -7459,6 +7459,7 @@ dependencies = [
  "twizzler",
  "twizzler-abi",
  "twizzler-rt-abi",
+ "uuid",
 ]
 
 [[package]]

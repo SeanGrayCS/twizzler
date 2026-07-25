@@ -32,6 +32,7 @@
 //! contrast honest: graph-native `InvPtr`-linked objects (our engine) vs.
 //! KV-on-objects (this baseline), with neither borrowing the other's design.
 
+mod keys;
 mod kv;
 
 #[cfg(test)]
