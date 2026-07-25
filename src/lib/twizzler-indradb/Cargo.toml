@@ -21,7 +21,11 @@ indradb-lib = { version = "5.0.0", default-features = false }
 # Named directly by the key codec (indradb's public API uses uuid::Uuid);
 # cargo unifies this with indradb-lib's own 1.x requirement.
 uuid = "1"
+# Property values are `indradb::Json` (a serde_json Value); we store them as
+# serialized bytes in the KV store.
+serde_json = "1"
 
 twizzler = { path = "../twizzler" }
+naming = { path = "../naming" }
 twizzler-abi = "*"
 twizzler-rt-abi = "*"

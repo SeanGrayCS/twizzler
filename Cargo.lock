@@ -7456,6 +7456,8 @@ name = "twizzler-indradb"
 version = "0.1.0"
 dependencies = [
  "indradb-lib",
+ "naming",
+ "serde_json",
  "twizzler",
  "twizzler-abi",
  "twizzler-rt-abi",
