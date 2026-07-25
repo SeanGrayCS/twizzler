@@ -19,11 +19,20 @@
 //! - `MemoryDatastore::new_db() -> Database<MemoryDatastore>` is the
 //!   no-persistence constructor used below.
 //!
-//! Portability risks to watch on the first build (D1's actual output):
-//! `tempfile` and `uuid` are non-optional dependencies; `MemoryDatastore`'s
-//! msgpack persistence paths use `std::path`/filesystem APIs, and `uuid`'s v4
-//! generation needs `getrandom` (the workspace already patches getrandom for
-//! Twizzler, so that one may come free).
+//! **D1 result:** the crate built unmodified for the Twizzler target and its
+//! in-memory datastore runs under QEMU — no fork, no `src/ports/` entry, no
+//! patched std features, despite `tempfile`/`uuid` being non-optional deps
+//! (`uuid` v4 is covered by the workspace's existing getrandom patch).
+//!
+//! **D2 (in progress):** `TwizzlerDatastore`, persisting to Twizzler objects.
+//! `Transaction` (26 required methods) is written against *sorted KV*
+//! backends — it needs ordered iteration and prefix scans — so the port
+//! builds that substrate first ([`kv`], slice D2a) and maps IndraDB's model
+//! onto it with byte-prefixed key namespaces (slice D2b). That keeps the RQ2
+//! contrast honest: graph-native `InvPtr`-linked objects (our engine) vs.
+//! KV-on-objects (this baseline), with neither borrowing the other's design.
+
+mod kv;
 
 #[cfg(test)]
 mod tests {
