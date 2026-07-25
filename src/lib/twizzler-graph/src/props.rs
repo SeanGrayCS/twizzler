@@ -13,9 +13,15 @@ fn rw() -> MapFlags {
     MapFlags::READ | MapFlags::WRITE | MapFlags::PERSIST
 }
 
-/// A property value: fixed-size, invariant, and comparable (the equality the
-/// DSL's future `has(key, value)` step builds on).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A property value: fixed-size, invariant, and comparable — equality backs
+/// the DSL's `has(key, value)`, ordering backs `order_by_prop`.
+///
+/// Ordering *within* a variant is the natural one (`Str` compares as text,
+/// not as its raw record — see `NameKey`'s manual `Ord`). Ordering *across*
+/// variants follows declaration order, which is arbitrary but deterministic;
+/// mixed-type properties are a schema smell, and a stable answer beats an
+/// unpredictable one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C, u32)]
 pub enum PropValue {
     I64(i64),

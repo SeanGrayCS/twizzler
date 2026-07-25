@@ -15,6 +15,20 @@ pub struct NameKey {
 }
 unsafe impl Invariant for NameKey {}
 
+// Ordering is by *string* content, not by the raw record. Deriving `Ord`
+// would compare `len` first — making "z" < "aa" — which would silently
+// mis-sort every `order_by_name` / `order_by_prop` result.
+impl Ord for NameKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+impl PartialOrd for NameKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl NameKey {
     pub fn new(s: &str) -> Self {
         let b = s.as_bytes();

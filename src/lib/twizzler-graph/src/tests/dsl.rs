@@ -232,6 +232,184 @@ fn dsl_edge_has_and_values() {
 }
 
 #[test]
+fn dsl_path_records_traversal() {
+    let mut g = fresh("t-dsl-path");
+    let a = g.add_vertex("file", "a", ObjID::new(0)).unwrap();
+    let t1 = g.add_vertex("tag", "t1", ObjID::new(0)).unwrap();
+    let t2 = g.add_vertex("tag", "t2", ObjID::new(0)).unwrap();
+    let p = g.add_vertex("project", "p", ObjID::new(0)).unwrap();
+    g.add_edge(a, "tagged", t1).unwrap();
+    g.add_edge(a, "tagged", t2).unwrap();
+    g.add_edge(t1, "in_project", p).unwrap();
+    g.add_edge(t2, "in_project", p).unwrap();
+
+    // Single branch first: a -> t1 -> p.
+    let paths = g
+        .traversal()
+        .v(a)
+        .out(Labels::these(&["tagged"]))
+        .has_name("t1")
+        .out(Labels::these(&["in_project"]))
+        .path();
+    assert_eq!(paths, vec![vec![a, t1, p]]);
+
+    // Fork: both two-hop routes reach p, each with its own path.
+    let paths = g
+        .traversal()
+        .v(a)
+        .out(Labels::these(&["tagged"]))
+        .out(Labels::these(&["in_project"]))
+        .path();
+    assert_eq!(paths, vec![vec![a, t1, p], vec![a, t2, p]]);
+}
+
+#[test]
+fn dsl_path_stays_aligned_through_dedup_and_limit() {
+    let mut g = fresh("t-dsl-path2");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let hub = g.add_vertex("n", "hub", ObjID::new(0)).unwrap();
+    g.add_edge(a, "e", hub).unwrap();
+    g.add_edge(b, "e", hub).unwrap();
+
+    // Both starts reach hub: two elements, two paths.
+    let t = g.traversal().vs(&[a, b]).out(Labels::any());
+    assert_eq!(t.path(), vec![vec![a, hub], vec![b, hub]]);
+
+    // dedup keeps the first occurrence — and its path.
+    let paths = g
+        .traversal()
+        .vs(&[a, b])
+        .out(Labels::any())
+        .dedup()
+        .path();
+    assert_eq!(paths, vec![vec![a, hub]]);
+
+    // limit truncates elements and paths together.
+    let paths = g
+        .traversal()
+        .vs(&[a, b])
+        .out(Labels::any())
+        .limit(1)
+        .path();
+    assert_eq!(paths, vec![vec![a, hub]]);
+
+    // A filter that drops everything leaves no paths.
+    let paths = g
+        .traversal()
+        .vs(&[a, b])
+        .out(Labels::any())
+        .has_name("nope")
+        .path();
+    assert!(paths.is_empty());
+}
+
+#[test]
+fn dsl_order_by_name() {
+    let mut g = fresh("t-dsl-order");
+    // Inserted out of order; note two vertices share the name "dup".
+    let c = g.add_vertex("n", "cherry", ObjID::new(0)).unwrap();
+    let a = g.add_vertex("n", "apple", ObjID::new(0)).unwrap();
+    let d1 = g.add_vertex("n", "dup", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "banana", ObjID::new(0)).unwrap();
+    let d2 = g.add_vertex("n", "dup", ObjID::new(0)).unwrap();
+
+    let ids = g.traversal().with_label("n").order_by_name().to_ids();
+    assert_eq!(ids, vec![a, b, c, d1, d2], "name asc, ties by id");
+
+    let names: Vec<String> = g
+        .traversal()
+        .with_label("n")
+        .order_by_name()
+        .to_infos()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    assert_eq!(names, vec!["apple", "banana", "cherry", "dup", "dup"]);
+
+    // Top-2.
+    assert_eq!(
+        g.traversal().with_label("n").order_by_name().limit(2).to_ids(),
+        vec![a, b]
+    );
+    // Descending reverses the *names* only: the id tiebreak stays ascending,
+    // so the two "dup" vertices keep insertion order. This is LDBC's own
+    // convention ("... desc, then id asc"), and it keeps the tiebreak's
+    // meaning independent of the sort direction.
+    assert_eq!(
+        g.traversal().with_label("n").order_by_name_desc().to_ids(),
+        vec![d1, d2, c, b, a]
+    );
+    assert_eq!(
+        g.traversal()
+            .with_label("n")
+            .order_by_name_desc()
+            .limit(1)
+            .to_ids(),
+        vec![d1],
+        "first of the tied 'dup' pair, not the last"
+    );
+}
+
+#[test]
+fn dsl_order_by_prop() {
+    let mut g = fresh("t-dsl-orderp");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let c = g.add_vertex("n", "c", ObjID::new(0)).unwrap();
+    let none = g.add_vertex("n", "none", ObjID::new(0)).unwrap();
+    g.set_vertex_prop(a, "at", PropValue::U64(30)).unwrap();
+    g.set_vertex_prop(b, "at", PropValue::U64(10)).unwrap();
+    g.set_vertex_prop(c, "at", PropValue::U64(20)).unwrap();
+    // `none` deliberately has no "at" property.
+
+    assert_eq!(
+        g.traversal().with_label("n").order_by_prop("at").to_ids(),
+        vec![b, c, a, none],
+        "ascending, missing key last"
+    );
+    assert_eq!(
+        g.traversal()
+            .with_label("n")
+            .order_by_prop_desc("at")
+            .to_ids(),
+        vec![a, c, b, none],
+        "descending, missing key still last"
+    );
+    // Newest-first with a cap — the LDBC short-read shape.
+    assert_eq!(
+        g.traversal()
+            .with_label("n")
+            .order_by_prop_desc("at")
+            .limit(2)
+            .to_ids(),
+        vec![a, c]
+    );
+}
+
+#[test]
+fn dsl_path_edge_cases_and_edge_steps() {
+    let mut g = fresh("t-dsl-path3");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    g.add_edge(a, "e", b).unwrap();
+
+    // Empty traversal.
+    assert!(g.traversal().with_label("missing").path().is_empty());
+
+    // Vertex-only paths: the edge hop adds only the destination vertex.
+    assert_eq!(
+        g.traversal().v(a).out_e(Labels::any()).in_v().path(),
+        vec![vec![a, b]]
+    );
+
+    // Deleted start vertex yields nothing at all.
+    g.delete_vertex(a).unwrap();
+    assert!(g.traversal().v(a).path().is_empty());
+    assert!(g.traversal().v(a).out(Labels::any()).path().is_empty());
+}
+
+#[test]
 fn dsl_has_name_and_filter() {
     let mut g = fresh("t-dsl-has");
     let d = g.add_vertex("file", "doc", ObjID::new(0)).unwrap();
