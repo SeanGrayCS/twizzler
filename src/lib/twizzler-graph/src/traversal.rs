@@ -14,10 +14,16 @@
 //!
 //! The current element set is held eagerly as a list of ids (with duplicates,
 //! as in Gremlin, until `dedup`). The DSL uses only the public engine API.
+//!
+//! Steps include movement (`out`/`in_`/`both`, `out_e`/`in_e`/`both_e`,
+//! `out_v`/`in_v`/`both_v`), filters (`has_label`, `has_name`, `filter`, and
+//! property `has(key, value)` on both vertices and edges), reshaping
+//! (`dedup`, `limit`), and terminals (`to_ids`, `to_infos`, `values(key)`,
+//! `count`, `first`).
 
 use std::collections::HashSet;
 
-use crate::{EdgeId, Graph, Labels, VertexId, VertexInfo};
+use crate::{EdgeId, Graph, Labels, PropValue, VertexId, VertexInfo};
 
 impl Graph {
     /// Start a traversal.
@@ -146,6 +152,23 @@ impl<'a> VertexTraversal<'a> {
             .retain(|v| g.vertex_info(*v).map_or(false, |i| pred(&i)));
         self
     }
+    /// Keep vertices whose property `key` equals `value` (≈ Gremlin `has`).
+    /// Vertices lacking the key are dropped.
+    pub fn has(mut self, key: &str, value: PropValue) -> Self {
+        let g = self.graph;
+        self.current
+            .retain(|v| g.get_vertex_prop(*v, key) == Some(value));
+        self
+    }
+    /// Collect the current vertices' values for property `key`, in traversal
+    /// order, skipping vertices that lack it (≈ Gremlin `values`).
+    pub fn values(&self, key: &str) -> Vec<PropValue> {
+        let g = self.graph;
+        self.current
+            .iter()
+            .filter_map(|v| g.get_vertex_prop(*v, key))
+            .collect()
+    }
     /// Remove duplicate vertices, preserving first-seen order.
     pub fn dedup(mut self) -> Self {
         let mut seen = HashSet::new();
@@ -261,6 +284,23 @@ impl<'a> EdgeTraversal<'a> {
         self.current
             .retain(|e| g.edge_info(*e).map_or(false, |i| i.label == label));
         self
+    }
+    /// Keep edges whose property `key` equals `value`; edges lacking the key
+    /// are dropped.
+    pub fn has(mut self, key: &str, value: PropValue) -> Self {
+        let g = self.graph;
+        self.current
+            .retain(|e| g.get_edge_prop(*e, key) == Some(value));
+        self
+    }
+    /// Collect the current edges' values for property `key`, in order,
+    /// skipping edges that lack it.
+    pub fn values(&self, key: &str) -> Vec<PropValue> {
+        let g = self.graph;
+        self.current
+            .iter()
+            .filter_map(|e| g.get_edge_prop(*e, key))
+            .collect()
     }
     /// Remove duplicate edges, preserving first-seen order.
     pub fn dedup(mut self) -> Self {
