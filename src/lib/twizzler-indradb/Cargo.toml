@@ -1,0 +1,24 @@
+[package]
+name = "twizzler-indradb"
+version = "0.1.0"
+edition = "2021"
+
+# The IndraDB baseline for the RQ2 comparison (board tasks D1/D2).
+#
+# D1 (this): depend on the unmodified upstream library and smoke-test its
+# in-memory datastore on Twizzler, to find out what actually fails to build or
+# run. Vendoring into src/ports/ is deliberately NOT done up front — we only
+# fork if the port note says we must.
+# D2: add `TwizzlerDatastore` (indradb::Datastore + Transaction) persisting to
+# Twizzler objects.
+#
+# `indradb-lib` is the library; the `indradb` crate is the server (not wanted).
+# default-features = false keeps the rocksdb datastore and its C++ toolchain
+# out of the build.
+
+[dependencies]
+indradb-lib = { version = "5.0.0", default-features = false }
+
+twizzler = { path = "../twizzler" }
+twizzler-abi = "*"
+twizzler-rt-abi = "*"
