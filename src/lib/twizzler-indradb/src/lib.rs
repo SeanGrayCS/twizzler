@@ -32,8 +32,14 @@
 //! contrast honest: graph-native `InvPtr`-linked objects (our engine) vs.
 //! KV-on-objects (this baseline), with neither borrowing the other's design.
 
+mod datastore;
 mod keys;
 mod kv;
+
+#[cfg(test)]
+mod tests_datastore;
+
+pub use datastore::{TwizzlerDatastore, TwizzlerTransaction};
 
 #[cfg(test)]
 mod tests {
