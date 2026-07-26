@@ -9,8 +9,10 @@
 //! - [`results`] defines canonical result types phrased in **names**, never
 //!   engine ids, so two engines' answers are directly comparable;
 //! - [`native`] implements IS1–IS7 over `twizzler-graph`;
-//! - the baseline implementation over `TwizzlerDatastore` and the
-//!   cross-engine equivalence assertions follow in slice E3b.
+//! - [`baseline`] implements the same seven over
+//!   `Database<TwizzlerDatastore>`, using IndraDB's public API only;
+//! - `tests_equivalence` asserts the two engines return **identical** results
+//!   for every query across the whole fixture — that assertion *is* M3.
 //!
 //! The queries live here rather than inside either engine so that neither can
 //! quietly special-case them — the comparison is only meaningful if both are
@@ -32,9 +34,12 @@
 //! not blocked; the gaps are recorded as evidence for what a Gremlin-subset
 //! DSL actually needs, which is itself an RQ-relevant finding.
 
+pub mod baseline;
 pub mod fixture;
 pub mod native;
 pub mod results;
 
+#[cfg(test)]
+mod tests_equivalence;
 #[cfg(test)]
 mod tests_native;

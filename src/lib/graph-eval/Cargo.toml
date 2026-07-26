@@ -23,3 +23,6 @@ twizzler-abi = "*"
 twizzler-rt-abi = "*"
 twizzler-graph = { path = "../twizzler-graph" }
 twizzler-indradb = { path = "../twizzler-indradb" }
+# The baseline queries are written against IndraDB's public API directly.
+indradb-lib = { version = "5.0.0", default-features = false }
+uuid = "1"
