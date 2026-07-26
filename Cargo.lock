@@ -3135,6 +3135,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-eval"
+version = "0.1.0"
+dependencies = [
+ "twizzler",
+ "twizzler-abi",
+ "twizzler-graph",
+ "twizzler-indradb",
+ "twizzler-rt-abi",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
