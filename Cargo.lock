@@ -3138,11 +3138,13 @@ dependencies = [
 name = "graph-eval"
 version = "0.1.0"
 dependencies = [
+ "indradb-lib",
  "twizzler",
  "twizzler-abi",
  "twizzler-graph",
  "twizzler-indradb",
  "twizzler-rt-abi",
+ "uuid",
 ]
 
 [[package]]
