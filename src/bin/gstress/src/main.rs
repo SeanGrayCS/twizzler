@@ -11,7 +11,19 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
+pub(crate) const HARNESS_REV: &str = "2026-07-10d";
+
 mod indradb_mode;
+
+/// Print the provenance header. Every recorded result must carry this line;
+/// results without one cannot be trusted after the engine changes.
+pub(crate) fn stamp(mode: &str, preset: &Preset) {
+    println!(
+        "GSTRESS STAMP harness={} mode={} preset={} V={} E={} degCap={} chain={} clique={}",
+        HARNESS_REV, mode, preset.name, preset.vertices, preset.bulk_edges,
+        preset.degree_cap, preset.chain, preset.clique
+    );
+}
 
 pub(crate) struct Preset {
     pub(crate) name: &'static str,
@@ -39,6 +51,25 @@ pub(crate) struct Preset {
     /// first H run reported 0.00 s for lookup and scan, making their rates
     /// meaningless. Repetition moves the measurement above the noise floor.
     pub(crate) read_reps: usize,
+}
+
+/// Build a preset of arbitrary size, with every sub-workload scaled in the
+/// same proportions as `tiny` (which `scaled(200)` reproduces).
+pub(crate) fn scaled(n: usize) -> Preset {
+    let n = n.max(20);
+    Preset {
+        name: "scale",
+        vertices: n,
+        bulk_edges: n * 3 / 2,
+        degree_cap: (n / 4).max(1),
+        same_target_variant: false,
+        churn_add: (n / 4).max(1),
+        chain: (n / 2).max(2),
+        clique: (((n / 2) as f64).sqrt() as usize).max(3),
+        degrade_windows: 10,
+        degrade_batch: (n / 10).max(2),
+        read_reps: 20,
+    }
 }
 
 /// Sampling stride for read phases — shared by both arms so they measure
@@ -290,14 +321,29 @@ pub(crate) fn max_distinct_degree(n: usize) -> usize {
 }
 
 fn main() {
-    let preset = match std::env::args().nth(1).as_deref() {
+    let arg1 = std::env::args().nth(1);
+    let scaled_preset;
+    let preset: &Preset = match arg1.as_deref() {
         None | Some("small") => &SMALL,
         Some("tiny") => &TINY,
         Some("medium") => &MEDIUM,
         Some("large") => &LARGE,
+        Some(s) if s.starts_with("scale:") => {
+            match s["scale:".len()..].parse::<usize>() {
+                Ok(n) => {
+                    scaled_preset = scaled(n);
+                    &scaled_preset
+                }
+                Err(_) => {
+                    println!("usage: gstress scale:<vertices> [nobulk|indradb]");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some(other) => {
             println!(
-                "usage: gstress [tiny|small|medium|large] [nobulk|indradb]  (got '{other}')"
+                "usage: gstress [tiny|small|medium|large|scale:<N>] [nobulk|indradb]  \
+                 (got '{other}')"
             );
             std::process::exit(2);
         }
@@ -307,6 +353,7 @@ fn main() {
     const CHUNK: usize = 500;
 
     if matches!(mode.as_deref(), Some("indradb") | Some("baseline")) {
+        stamp("indradb", preset);
         let mut st = Stats { fails: 0 };
         indradb_mode::run(preset, &mut st);
         if st.fails > 0 {
@@ -315,6 +362,7 @@ fn main() {
         }
         return;
     }
+    stamp(if use_bulk { "native-bulk" } else { "native-nobulk" }, preset);
     println!(
         "gstress: preset {} ({}) (V={} bulkE={} degCap={} churn={} chain={} clique={})",
         preset.name,
