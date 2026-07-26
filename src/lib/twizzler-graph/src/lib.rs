@@ -10,6 +10,7 @@
 mod edge;
 mod error;
 mod graph;
+mod arena_store;
 mod name;
 mod props;
 mod segvec;
@@ -23,6 +24,7 @@ pub use edge::{EdgeHandle, EdgeId, EdgeInfo};
 pub use error::GraphError;
 pub use graph::{BulkSession, Graph};
 pub use props::PropValue;
+pub use arena_store::{ArenaStat, ArenaStore, FillTo, OnePerArena, Placement};
 pub use name::NameKey;
 pub use traversal::{EdgeTraversal, TraversalSource, VertexTraversal};
 pub use vertex::{Labels, VertexHandle, VertexId, VertexInfo, VertexView};
