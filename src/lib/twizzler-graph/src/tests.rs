@@ -13,6 +13,7 @@
 use crate::Graph;
 
 mod adjacency;
+mod arena;
 mod bulk;
 mod crud;
 mod dsl;
