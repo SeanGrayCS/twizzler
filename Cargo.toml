@@ -20,6 +20,7 @@ members = [
     "src/lib/twizzler",
     "src/lib/twizzler-graph",
     "src/lib/twizzler-indradb",
+    "src/lib/graph-eval",
     "src/lib/twizzler/twizzler-derive",
     "src/rt/monitor",
     "src/rt/monitor-api",

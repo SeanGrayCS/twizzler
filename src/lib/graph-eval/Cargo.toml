@@ -1,0 +1,25 @@
+[package]
+name = "graph-eval"
+version = "0.1.0"
+edition = "2021"
+
+# graph-eval — the LDBC-SNB interactive short reads, expressed against BOTH
+# engines (board task E3, the M3 milestone).
+#
+# One fixture, two implementations, identical results: that equivalence is what
+# makes the Phase-4 benchmark numbers meaningful, because it proves the two
+# systems are answering the same question. Queries live here rather than in
+# either engine so neither can quietly special-case them.
+#
+# Evaluation code, not engine code — it depends on both engines and is not a
+# candidate for upstreaming.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+twizzler = { path = "../twizzler" }
+twizzler-abi = "*"
+twizzler-rt-abi = "*"
+twizzler-graph = { path = "../twizzler-graph" }
+twizzler-indradb = { path = "../twizzler-indradb" }
