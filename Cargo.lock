@@ -3721,6 +3721,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "indradb-lib"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4861c7aac237401be47a846dfe094019dd6dcd55eabba19afde1fe80d16841b9"
+dependencies = [
+ "byteorder",
+ "internment",
+ "once_cell",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -3755,6 +3771,15 @@ checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "block-padding",
  "generic-array",
+]
+
+[[package]]
+name = "internment"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "636d4b0f6a39fd684effe2a73f5310df16a3fa7954c26d36833e98f44d1977a2"
+dependencies = [
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -5810,6 +5835,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
 name = "rns"
 version = "0.1.0"
 dependencies = [
@@ -7408,6 +7452,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "twizzler-indradb"
+version = "0.1.0"
+dependencies = [
+ "indradb-lib",
+ "naming",
+ "serde_json",
+ "twizzler",
+ "twizzler-abi",
+ "twizzler-rt-abi",
+ "uuid",
+]
+
+[[package]]
 name = "twizzler-io"
 version = "0.1.0"
 dependencies = [
@@ -8283,8 +8340,10 @@ version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
+ "atomic",
  "getrandom 0.3.1",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
