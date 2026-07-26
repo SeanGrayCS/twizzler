@@ -49,6 +49,11 @@ pub(crate) struct KvRoot {
 unsafe impl Invariant for KvRoot {}
 impl BaseType for KvRoot {}
 
+/// Read/write/persist flags for reopening the root mutably.
+fn rw() -> MapFlags {
+    MapFlags::READ | MapFlags::WRITE | MapFlags::PERSIST
+}
+
 /// Map any Twizzler-side failure into IndraDB's error type.
 fn twz_err(e: impl core::fmt::Debug) -> Error {
     Error::Datastore(Box::new(std::io::Error::new(
@@ -89,6 +94,36 @@ impl TwizzlerDatastore {
         Ok(indradb::Database::new(TwizzlerDatastore {
             kv: RefCell::new(kv),
         }))
+    }
+
+    /// Clear the datastore registered at `data/<name>`, reusing its
+    /// registration; no-op if absent. Mirrors `Graph::reset`, and for the same
+    /// reason: `data/` supports create but not remove on this build, so the
+    /// root is rewritten in place to point at fresh, empty KV objects (the old
+    /// ones are orphaned). Needed for repeatable benchmark runs — without it a
+    /// re-run measures a datastore that still holds the previous run's data.
+    pub fn reset_db(name: &str) -> Result<()> {
+        let mut namer = static_naming_factory().expect("naming service available");
+        let path = format!("data/{name}");
+        let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
+            return Ok(());
+        };
+        let mut root = Object::<KvRoot>::map(node.id.into(), rw()).map_err(twz_err)?;
+        if root.base().magic != MAGIC {
+            return Err(twz_err(format!("data/{name} is not a TwizzlerDatastore")));
+        }
+        let kv = KvStore::create().map_err(twz_err)?;
+        let (data_raw, index_raw) = kv.ids();
+        root.with_tx(|tx| {
+            let mut b = tx.base_mut();
+            b.magic = MAGIC;
+            b.version = VERSION;
+            b.data_raw = data_raw;
+            b.index_raw = index_raw;
+            Ok(())
+        })
+        .map_err(twz_err)?;
+        Ok(())
     }
 
     /// Open the datastore registered at `data/<name>`, creating and

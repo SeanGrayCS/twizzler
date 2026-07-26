@@ -11,22 +11,81 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-struct Preset {
-    name: &'static str,
+mod indradb_mode;
+
+pub(crate) struct Preset {
+    pub(crate) name: &'static str,
     /// Phase A vertices (must exceed DEFAULT_SEG_CAP = 4096 to force rollover).
-    vertices: usize,
+    pub(crate) vertices: usize,
     /// Phase B random edges.
-    bulk_edges: usize,
+    pub(crate) bulk_edges: usize,
     /// Phase C hub out-degree cap ("until failure or this").
-    degree_cap: usize,
+    pub(crate) degree_cap: usize,
     /// Whether phase C also runs the same-target variant (FOT-dedup probe).
     same_target_variant: bool,
     /// Phase D vertices added after the deletes.
-    churn_add: usize,
+    pub(crate) churn_add: usize,
     /// Phase F chain length (walked end-to-end).
-    chain: usize,
+    pub(crate) chain: usize,
     /// Phase F clique size (k vertices, k*(k-1) directed edges).
-    clique: usize,
+    pub(crate) clique: usize,
+    /// Phase G: number of equal windows in the degradation probe.
+    pub(crate) degrade_windows: usize,
+    /// Phase G: records per window (kept small and *constant*, so any change
+    /// in window rate is the system degrading, not the workload changing).
+    pub(crate) degrade_batch: usize,
+    /// Phase H: how many times to repeat each read workload. Reads are fast
+    /// enough that a single pass lands at or below timer resolution — the
+    /// first H run reported 0.00 s for lookup and scan, making their rates
+    /// meaningless. Repetition moves the measurement above the noise floor.
+    pub(crate) read_reps: usize,
+}
+
+/// Sampling stride for read phases — shared by both arms so they measure
+/// the same vertices. (They did not in the first H run: 85 samples natively
+/// against 17 in the baseline, because each arm computed its own stride.)
+pub(crate) fn read_step(n: usize) -> usize {
+    (n / 100).max(1)
+}
+
+/// Warm-phase target duration. A *fixed* rep count cannot serve both arms:
+/// the native engine's warm reads are ~24× the baseline's, so a count giving
+/// the baseline a sane runtime leaves the native measurement at 0.02 s — at
+/// timer resolution — while a count that measures the native arm properly
+/// would run the baseline for minutes. Each arm therefore repeats until it
+/// reaches this duration; comparing *rates* stays valid because the rate is
+/// per-op.
+const READ_TARGET_SECS: f64 = 1.0;
+
+/// Measure a read workload in two regimes, reporting both.
+///
+/// `f` performs one pass and returns the number of logical operations in it.
+pub(crate) fn measure_read(phase: &str, max_reps: usize, mut f: impl FnMut() -> usize) {
+    let t0 = Instant::now();
+    let cold_ops = f();
+    let cold = t0.elapsed().as_secs_f64();
+    let cold_rate = if cold > 0.0 { cold_ops as f64 / cold } else { 0.0 };
+
+    let t1 = Instant::now();
+    let mut ops = 0usize;
+    let mut reps = 0usize;
+    while t1.elapsed().as_secs_f64() < READ_TARGET_SECS && reps < max_reps {
+        ops += f();
+        reps += 1;
+    }
+    let warm = t1.elapsed().as_secs_f64();
+    let warm_rate = if warm > 0.0 { ops as f64 / warm } else { 0.0 };
+
+    println!(
+        "GSTRESS {phase:<10} cold {cold_ops:>7} ops {cold:>7.3}s {cold_rate:>10.0} ops/s | \
+         warm {ops:>8} ops ({reps} reps) {warm:>6.3}s {warm_rate:>10.0} ops/s"
+    );
+    if cold_rate > 0.0 && warm_rate > 0.0 {
+        println!(
+            "GSTRESS RESIDENCY {phase}: warm/cold = {:.1}x",
+            warm_rate / cold_rate
+        );
+    }
 }
 
 const TINY: Preset = Preset {
@@ -38,6 +97,9 @@ const TINY: Preset = Preset {
     churn_add: 50,
     chain: 100,
     clique: 10,
+    degrade_windows: 10,
+    degrade_batch: 20,
+    read_reps: 20,
 };
 const SMALL: Preset = Preset {
     name: "small",
@@ -48,6 +110,9 @@ const SMALL: Preset = Preset {
     churn_add: 300,
     chain: 2_000,
     clique: 30,
+    degrade_windows: 20,
+    degrade_batch: 50,
+    read_reps: 5,
 };
 const MEDIUM: Preset = Preset {
     name: "medium",
@@ -58,6 +123,9 @@ const MEDIUM: Preset = Preset {
     churn_add: 2_000,
     chain: 10_000,
     clique: 60,
+    degrade_windows: 20,
+    degrade_batch: 200,
+    read_reps: 2,
 };
 const LARGE: Preset = Preset {
     name: "large",
@@ -68,10 +136,13 @@ const LARGE: Preset = Preset {
     churn_add: 5_000,
     chain: 10_000,
     clique: 80,
+    degrade_windows: 20,
+    degrade_batch: 500,
+    read_reps: 1,
 };
 
 /// Deterministic xorshift64 so runs are reproducible.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         let mut x = self.0;
@@ -81,20 +152,20 @@ impl Rng {
         self.0 = x;
         x
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
 
-struct Stats {
-    fails: u64,
+pub(crate) struct Stats {
+    pub(crate) fails: u64,
 }
 impl Stats {
-    fn fail(&mut self, msg: String) {
+    pub(crate) fn fail(&mut self, msg: String) {
         println!("GSTRESS FAIL: {msg}");
         self.fails += 1;
     }
-    fn ck(&mut self, cond: bool, msg: impl FnOnce() -> String) {
+    pub(crate) fn ck(&mut self, cond: bool, msg: impl FnOnce() -> String) {
         if !cond {
             self.fail(msg());
         }
@@ -102,13 +173,84 @@ impl Stats {
 }
 
 /// Progress line inside long loops, so a stall is visible and attributable.
-fn heartbeat(phase: &str, done: usize, total: usize, t: &Instant) {
+/// Windowed progress: reports the rate for *this window* alongside the
+/// cumulative rate.
+///
+/// Cumulative rates structurally hide decay — a rate that halves partway
+/// through shows up as a gentle droop — which is why the phase heartbeats
+/// could not answer whether throughput degrades *within* a run. Window rates
+/// show it directly.
+pub(crate) struct Progress {
+    phase: &'static str,
+    start: Instant,
+    last: Instant,
+    last_done: usize,
+    first_window_rate: Option<f64>,
+    last_window_rate: f64,
+}
+
+impl Progress {
+    pub(crate) fn new(phase: &'static str) -> Self {
+        let now = Instant::now();
+        Progress {
+            phase,
+            start: now,
+            last: now,
+            last_done: 0,
+            first_window_rate: None,
+            last_window_rate: 0.0,
+        }
+    }
+
+    /// Record progress at `done` total records.
+    pub(crate) fn tick(&mut self, done: usize, total: usize) {
+        let now = Instant::now();
+        let win_ops = done.saturating_sub(self.last_done);
+        let win_secs = now.duration_since(self.last).as_secs_f64();
+        let cum_secs = now.duration_since(self.start).as_secs_f64();
+        let win_rate = if win_secs > 0.0 {
+            win_ops as f64 / win_secs
+        } else {
+            0.0
+        };
+        let cum_rate = if cum_secs > 0.0 {
+            done as f64 / cum_secs
+        } else {
+            0.0
+        };
+        if self.first_window_rate.is_none() {
+            self.first_window_rate = Some(win_rate);
+        }
+        self.last_window_rate = win_rate;
+        println!(
+            "GSTRESS {}: {}/{}  window {:.1} ops/s  cumulative {:.1} ops/s",
+            self.phase, done, total, win_rate, cum_rate
+        );
+        self.last = now;
+        self.last_done = done;
+    }
+
+    pub(crate) fn summarize(&self) {
+        let first = self.first_window_rate.unwrap_or(0.0);
+        if first <= 0.0 || self.last_window_rate <= 0.0 {
+            return;
+        }
+        let ratio = first / self.last_window_rate;
+        println!(
+            "GSTRESS DEGRADE {}: first window {:.1} ops/s, last {:.1} ops/s, \
+             slowdown {:.2}x",
+            self.phase, first, self.last_window_rate, ratio
+        );
+    }
+}
+
+pub(crate) fn heartbeat(phase: &str, done: usize, total: usize, t: &Instant) {
     let secs = t.elapsed().as_secs_f64();
     let rate = if secs > 0.0 { done as f64 / secs } else { 0.0 };
     println!("GSTRESS {phase}: {done}/{total} ({rate:.0} ops/s)");
 }
 
-fn report(phase: &str, ops: usize, t: Instant) {
+pub(crate) fn report(phase: &str, ops: usize, t: Instant) {
     let secs = t.elapsed().as_secs_f64();
     let rate = if secs > 0.0 { ops as f64 / secs } else { 0.0 };
     println!("GSTRESS {phase:<12} {ops:>8} ops  {secs:>8.2}s  {rate:>10.0} ops/s");
@@ -119,12 +261,32 @@ fn report(phase: &str, ops: usize, t: Instant) {
 fn survives_churn(i: usize) -> bool {
     i % 7 != 0
 }
-fn safe_target(i: usize, n: usize) -> usize {
-    let mut j = i % n;
-    if !survives_churn(j) {
-        j = if j + 1 >= n { 1 } else { j + 1 };
-    }
-    j
+
+/// The `i`-th vertex index that survives churn — injective in `i`.
+///
+/// This must produce *distinct* targets, and the reason is a real semantic
+/// difference between the engines rather than tidiness: our engine is a
+/// multigraph (parallel edges are distinct records — see the engine's
+/// `parallel_edges` test), while IndraDB keys an edge on
+/// `(outbound, type, inbound)` and silently rejects duplicates. The previous
+/// version mapped both `i=0` and `i=1` to vertex 1 (and six more collisions),
+/// so a 50-edge hub phase stored 50 edges natively but only 43 in the
+/// baseline — the arms were doing unequal work and the comparison was biased
+/// against the native engine.
+///
+/// `i + i/6 + 1` skips every multiple of 7 and is strictly increasing, so
+/// distinct `i` give distinct surviving targets.
+pub(crate) fn safe_target(i: usize, n: usize) -> usize {
+    let j = i + i / 6 + 1;
+    debug_assert!(survives_churn(j), "target must survive churn");
+    j % n
+}
+
+/// Largest hub degree for which [`safe_target`] stays injective; beyond it the
+/// wrap reintroduces duplicates and the two engines diverge again.
+pub(crate) fn max_distinct_degree(n: usize) -> usize {
+    // invert j = i + i/6 + 1 < n
+    (n.saturating_sub(1)) * 6 / 7
 }
 
 fn main() {
@@ -134,12 +296,25 @@ fn main() {
         Some("medium") => &MEDIUM,
         Some("large") => &LARGE,
         Some(other) => {
-            println!("usage: gstress [tiny|small|medium|large] [nobulk]  (got '{other}')");
+            println!(
+                "usage: gstress [tiny|small|medium|large] [nobulk|indradb]  (got '{other}')"
+            );
             std::process::exit(2);
         }
     };
-    let use_bulk = std::env::args().nth(2).as_deref() != Some("nobulk");
+    let mode = std::env::args().nth(2);
+    let use_bulk = mode.as_deref() != Some("nobulk");
     const CHUNK: usize = 500;
+
+    if matches!(mode.as_deref(), Some("indradb") | Some("baseline")) {
+        let mut st = Stats { fails: 0 };
+        indradb_mode::run(preset, &mut st);
+        if st.fails > 0 {
+            println!("GSTRESS: {} verification failure(s)", st.fails);
+            std::process::exit(1);
+        }
+        return;
+    }
     println!(
         "gstress: preset {} ({}) (V={} bulkE={} degCap={} churn={} chain={} clique={})",
         preset.name,
@@ -603,6 +778,79 @@ fn main() {
         });
     }
     report("F:clique", k * (k - 1), t);
+
+    // Read on its own terms: `lookup` uses each engine's native key path
+    // (ours built-in, the baseline's a property index), while `1hop`/`2hop`
+    // start from ids already in hand, isolating traversal from lookup.
+    let rstep = read_step(n);
+    let reps = preset.read_reps;
+    let read_idx: Vec<usize> = (0..n).step_by(rstep).filter(|i| !deleted[*i]).collect();
+    let read_sample: Vec<VertexId> = read_idx.iter().map(|i| VertexId(*i as u64)).collect();
+    println!(
+        "GSTRESS READS: {} sampled vertices x {} reps",
+        read_sample.len(),
+        reps
+    );
+
+    let max_reps = reps * 100;
+    measure_read("H:lookup", max_reps, || {
+        let mut found = 0usize;
+        for i in &read_idx {
+            if g.find_vertex("n", &format!("v{i}")).is_some() {
+                found += 1;
+            }
+        }
+        debug_assert_eq!(found, read_idx.len());
+        read_idx.len()
+    });
+    measure_read("H:1hop", max_reps, || {
+        let mut seen = 0usize;
+        for v in &read_sample {
+            seen += g.out_neighbors(*v, Labels::any()).len();
+        }
+        let _ = seen;
+        read_sample.len()
+    });
+    measure_read("H:2hop", max_reps, || {
+        let mut seen = 0usize;
+        for v in &read_sample {
+            for n1 in g.out_neighbors(*v, Labels::any()) {
+                seen += g.out_neighbors(n1, Labels::any()).len();
+            }
+        }
+        let _ = seen;
+        read_sample.len()
+    });
+    measure_read("H:scan", max_reps, || g.vertices().len());
+
+    // A deliberately *flat* workload: identical small batches of vertex
+    // creations, repeated, reporting the rate for each window. The workload
+    // does not change, so any decline across windows is the system degrading
+    // as writes accumulate — the hypothesis that a run pays its own growing
+    // pager-backlog tax. Runs last so it measures the system at its most
+    // loaded, and the first/last ratio is printed as `GSTRESS DEGRADE`.
+    let t = Instant::now();
+    let mut prog = Progress::new("G:degrade");
+    let gtotal = preset.degrade_windows * preset.degrade_batch;
+    let mut gdone = 0usize;
+    for w in 0..preset.degrade_windows {
+        let base = gdone;
+        g.bulk(|b| {
+            for j in 0..preset.degrade_batch {
+                let v = b.add_vertex("g", &format!("g{}_{}", w, j), ObjID::new(0))?;
+                if v.0 != next_id {
+                    st.fail(format!("vertex id drift: got {}, expected {}", v.0, next_id));
+                }
+                next_id += 1;
+            }
+            Ok(())
+        })
+        .expect("degrade probe batch");
+        gdone = base + preset.degrade_batch;
+        prog.tick(gdone, gtotal);
+    }
+    prog.summarize();
+    report("G:degrade", gtotal, t);
 
     // --- Summary --------------------------------------------------------------
     let secs = total.elapsed().as_secs_f64();
