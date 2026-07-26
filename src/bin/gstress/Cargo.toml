@@ -3,8 +3,16 @@ name = "gstress"
 version = "0.1.0"
 edition = "2021"
 
+# gstress — stress harness for the twizzler-graph engine.
+# Not part of `--tests`: run from the Twizzler shell as
+# `gstress [small|medium|large]`.
+
 [dependencies]
 twizzler = { path = "../../lib/twizzler" }
 twizzler-abi = "*"
 twizzler-rt-abi = "*"
 twizzler-graph = { path = "../../lib/twizzler-graph" }
+# The `indradb` mode runs the same workload against the IndraDB baseline.
+twizzler-indradb = { path = "../../lib/twizzler-indradb" }
+indradb-lib = { version = "5.0.0", default-features = false }
+uuid = "1"
