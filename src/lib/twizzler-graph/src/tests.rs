@@ -1,11 +1,5 @@
 //! Engine integration tests, run on Twizzler via `cargo start-qemu --tests`.
 //!
-//! Organized by area in `src/tests/`: `crud` (create/read/delete), `adjacency`
-//! (edges, neighbors, filters), `dsl` (traversal steps), `names` (NameKey and
-//! label/name edge cases), `persistence` (reopen, reset, format guard), and
-//! `sharding` (segmented registries). Module-local unit tests (e.g. in
-//! `segvec.rs`) stay with their modules.
-//!
 //! Each test creates a persistent graph registered under `data/<name>`. To
 //! stay idempotent across runs every test resets its graph first (via the
 //! helpers below) and graph names are unique per test.
@@ -20,6 +14,7 @@ mod dsl;
 mod names;
 mod persistence;
 mod props;
+mod reclaim;
 mod sharding;
 
 /// Clear any existing graph of this name, then open a clean one.

@@ -5,7 +5,7 @@
 //! object holding an `InvPtr<Vertex>` to each endpoint. Traversal from a vertex
 //! is O(degree) pointer-chasing, with no global scan or index lookup. A `Graph`
 //! root owns the vertex/edge/label registries and is registered under the
-//! pager-backed `data/` namespace, so a graph re-opens by name after a reboot.
+//! pager-backed `data/` namespace, so a graph re-opens by name.
 
 mod edge;
 mod error;
@@ -13,6 +13,7 @@ mod graph;
 mod arena_store;
 mod name;
 mod props;
+mod reclaim;
 mod segvec;
 mod traversal;
 mod vertex;

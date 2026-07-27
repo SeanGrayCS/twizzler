@@ -1,5 +1,12 @@
-//! Durability and lifecycle: reopen-by-name, reset semantics, the format
-//! guard, index persistence, and graph isolation.
+//! Lifecycle: reopen-by-name, reset semantics, the format guard, index
+//! persistence, and graph isolation.
+//!
+//! These tests do not demonstrate durability across a reboot, and nothing
+//! in this suite can: every test runs inside a single QEMU session, so the
+//! strongest claim available here is that a graph survives dropping its
+//! handles and being re-opened *within one boot* — which exercises remapping,
+//! not the write-back path to the disk image. A graph could in principle live
+//! entirely in mapped memory and pass every test in this file.
 
 use twizzler::object::ObjID;
 
