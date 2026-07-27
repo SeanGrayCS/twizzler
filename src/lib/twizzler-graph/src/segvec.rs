@@ -159,6 +159,13 @@ impl<T: Invariant> SegVec<T> {
         self.dir.object().id().raw()
     }
 
+    pub(crate) fn object_ids(&self) -> Vec<u128> {
+        let mut ids = Vec::with_capacity(self.segs.len() + 1);
+        ids.push(self.dir_raw());
+        ids.extend(self.segs.iter().map(|s| s.object().id().raw()));
+        ids
+    }
+
     /// Total number of elements across all segments. Non-last segments are
     /// exactly full, so only the last one needs its length read.
     pub(crate) fn len(&self) -> usize {

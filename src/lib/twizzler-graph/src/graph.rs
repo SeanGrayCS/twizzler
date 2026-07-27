@@ -31,6 +31,7 @@ use crate::{
     error::{GraphError, Result},
     name::NameKey,
     props::{self, PropValue},
+    reclaim,
     segvec::{vec_new_nosync, vec_push_ctor_nosync, SegVec},
     vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView},
 };
@@ -243,6 +244,18 @@ impl Graph {
             DEFAULT_SEG_CAP
         });
 
+        let old_ids = {
+            let (v, e, l, x) = {
+                let r = root.base();
+                (r.verts_raw, r.edges_raw, r.labels_raw, r.vindex_raw)
+            };
+            if old_version == VERSION && old_cap != 0 {
+                old_inventory(v, e, l, x, old_cap as usize)
+            } else {
+                Vec::new()
+            }
+        };
+
         // Fresh, empty registries.
         let verts = SegVec::<VertexRef>::create(cap)?;
         let edges = SegVec::<EdgeRef>::create(cap)?;
@@ -268,6 +281,8 @@ impl Graph {
             b.vindex_raw = vindex_raw;
             Ok(())
         })?;
+
+        let _ = old_ids;
         Ok(())
     }
 
@@ -479,12 +494,20 @@ impl Graph {
         if idx >= self.verts.len() {
             return Ok(());
         }
-        self.verts.with_mut_at(idx, |r| {
-            if r.id == id.0 {
-                r.flags |= TOMBSTONE;
+        let freeable = self.verts.with_mut_at(idx, |r| {
+            if r.id != id.0 || r.flags & TOMBSTONE != 0 {
+                return Ok(Vec::new()); // unknown id, or already deleted
             }
-            Ok(())
+            r.flags |= TOMBSTONE;
+            let ids = vec![r.out_raw, r.in_raw, r.props_raw];
+            // Clear the ids in the same transaction that sets the tombstone, so
+            // the record never names an object that no longer exists.
+            r.out_raw = 0;
+            r.in_raw = 0;
+            r.props_raw = 0;
+            Ok(ids)
         })?;
+        let _ = freeable;
         Ok(())
     }
 
@@ -494,13 +517,47 @@ impl Graph {
         if idx >= self.edges.len() {
             return Ok(());
         }
-        self.edges.with_mut_at(idx, |r| {
-            if r.id == id.0 {
-                r.flags |= TOMBSTONE;
+        let eobj_raw = self.edges.with_mut_at(idx, |r| {
+            if r.id != id.0 || r.flags & TOMBSTONE != 0 {
+                return Ok(0);
             }
-            Ok(())
+            r.flags |= TOMBSTONE;
+            Ok(r.eobj_raw)
         })?;
+        if eobj_raw != 0 {
+            // The property id lives in the edge object, not the registry.
+            if let Ok(eo) =
+                Object::<Edge>::map(ObjID::new(eobj_raw), MapFlags::READ | MapFlags::PERSIST)
+            {
+                reclaim::delete_raw(eo.base().props_raw);
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_object_ids(&self) -> Vec<u128> {
+        inventory(
+            &self.verts,
+            &self.edges,
+            &self.labels,
+            self.vindex.object().id().raw(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vertex_object_ids(&self, v: VertexId) -> Option<(u128, u128, u128, u128)> {
+        let r = self.verts.get_ref(v.0 as usize)?;
+        Some((r.vobj_raw, r.out_raw, r.in_raw, r.props_raw))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_object_ids(&self, e: EdgeId) -> Option<(u128, u128)> {
+        let eobj_raw = self.edges.get_ref(e.0 as usize)?.eobj_raw;
+        let eo =
+            Object::<Edge>::map(ObjID::new(eobj_raw), MapFlags::READ | MapFlags::PERSIST).ok()?;
+        let props_raw = eo.base().props_raw;
+        Some((eobj_raw, props_raw))
     }
 
     /// Set a property on a vertex; errors if it is missing or tombstoned.
@@ -759,6 +816,71 @@ fn vertex_locs_in(verts: &SegVec<VertexRef>, v: VertexId) -> Option<(u128, u128,
         return None;
     }
     Some((r.vobj_raw, r.out_raw, r.in_raw))
+}
+
+/// Every object a graph owns, given its open registries: the per-vertex
+/// objects (vertex, both adjacency lists, properties), the per-edge objects
+/// (edge, properties), and the three registries plus the vertex index.
+///
+/// Tombstoned records are included deliberately — their objects are exactly
+/// the ones nobody will ever free otherwise. The graph root is *not* included:
+/// `reset` retains and repoints it, and it is the name-registered identity of
+/// the graph.
+fn inventory(
+    verts: &SegVec<VertexRef>,
+    edges: &SegVec<EdgeRef>,
+    labels: &SegVec<LabelEntry>,
+    vindex_raw: u128,
+) -> Vec<u128> {
+    let mut ids = Vec::new();
+    for i in 0..verts.len() {
+        if let Some(r) = verts.get_ref(i) {
+            ids.extend([r.vobj_raw, r.out_raw, r.in_raw]);
+            if r.props_raw != 0 {
+                ids.push(r.props_raw);
+            }
+        }
+    }
+    for i in 0..edges.len() {
+        if let Some(r) = edges.get_ref(i) {
+            ids.push(r.eobj_raw);
+            if let Ok(eo) = Object::<Edge>::map(
+                ObjID::new(r.eobj_raw),
+                MapFlags::READ | MapFlags::PERSIST,
+            ) {
+                let p = eo.base().props_raw;
+                if p != 0 {
+                    ids.push(p);
+                }
+            }
+        }
+    }
+    ids.extend(verts.object_ids());
+    ids.extend(edges.object_ids());
+    ids.extend(labels.object_ids());
+    ids.push(vindex_raw);
+    ids
+}
+
+/// [`inventory`] for a graph we only have raw ids for (the outgoing graph in
+/// `reset`). Opens the old registries just long enough to walk them, then
+/// drops the handles so the ids can be deleted. Anything that fails to open is
+/// skipped rather than guessed at.
+fn old_inventory(
+    verts_raw: u128,
+    edges_raw: u128,
+    labels_raw: u128,
+    vindex_raw: u128,
+    cap: usize,
+) -> Vec<u128> {
+    let (Ok(verts), Ok(edges), Ok(labels)) = (
+        SegVec::<VertexRef>::open(verts_raw, cap),
+        SegVec::<EdgeRef>::open(edges_raw, cap),
+        SegVec::<LabelEntry>::open(labels_raw, cap),
+    ) else {
+        return Vec::new();
+    };
+    inventory(&verts, &edges, &labels, vindex_raw)
 }
 
 /// A batched-insert session; see [`Graph::bulk`]. Mirrors the semantics of

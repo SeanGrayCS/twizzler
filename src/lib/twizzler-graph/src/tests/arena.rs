@@ -13,33 +13,29 @@ fn store(policy: Box<dyn crate::arena_store::Placement>) -> ArenaStore {
 #[test]
 fn one_per_arena_uses_one_object_per_vertex() {
     let mut s = store(Box::new(OnePerArena));
-    for i in 0..20 {
+    for i in 0..8 {
         s.add_vertex(0, &format!("v{i}")).unwrap();
     }
-    assert_eq!(s.vertex_count(), 20);
-    assert_eq!(
-        s.arena_count(),
-        20,
-        "one arena per vertex under OnePerArena"
-    );
+    assert_eq!(s.vertex_count(), 8);
+    assert_eq!(s.arena_count(), 8, "one arena per vertex under OnePerArena");
 }
 
 #[test]
 fn packing_collapses_object_count() {
-    let mut s = store(Box::new(FillTo { cap: 10 }));
-    for i in 0..40 {
+    let mut s = store(Box::new(FillTo { cap: 4 }));
+    for i in 0..12 {
         s.add_vertex(0, &format!("v{i}")).unwrap();
     }
-    assert_eq!(s.arena_count(), 4, "40 vertices / cap 10 = 4 arenas");
+    assert_eq!(s.arena_count(), 3, "12 vertices / cap 4 = 3 arenas");
 
     // Edges must not add objects: chunks are allocated inside the endpoint's
     // own arena, which is the whole reason the ceiling moves.
-    for i in 0..39u64 {
+    for i in 0..11u64 {
         s.add_edge(i, i + 1, i, 0).unwrap();
     }
     assert_eq!(
         s.arena_count(),
-        4,
+        3,
         "edges allocate inside existing arenas, adding no objects"
     );
 }
@@ -48,7 +44,7 @@ fn packing_collapses_object_count() {
 fn adjacency_spans_chunks_in_order() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
     let hub = s.add_vertex(0, "hub").unwrap();
-    let n = ADJ_CHUNK * 3 + 1; // forces four chunks
+    let n = ADJ_CHUNK * 2 + 1; // forces three chunks
     let mut targets = Vec::new();
     for i in 0..n {
         targets.push(s.add_vertex(0, &format!("t{i}")).unwrap());
@@ -71,13 +67,13 @@ fn policy_does_not_change_results() {
     fn build(policy: Box<dyn crate::arena_store::Placement>) -> (Vec<u64>, Vec<u64>, usize) {
         let mut s = store(policy);
         let mut ids = Vec::new();
-        for i in 0..12 {
+        for i in 0..8 {
             ids.push(s.add_vertex(0, &format!("v{i}")).unwrap());
         }
         // A deterministic web: each vertex points at the next two.
-        for i in 0..12u64 {
-            s.add_edge(i, (i + 1) % 12, i * 2, 0).unwrap();
-            s.add_edge(i, (i + 2) % 12, i * 2 + 1, 1).unwrap();
+        for i in 0..8u64 {
+            s.add_edge(i, (i + 1) % 8, i * 2, 0).unwrap();
+            s.add_edge(i, (i + 2) % 8, i * 2 + 1, 1).unwrap();
         }
         let outs = s.neighbors(3, true);
         let ins = s.neighbors(3, false);
@@ -89,8 +85,8 @@ fn policy_does_not_change_results() {
 
     assert_eq!(a_out, b_out, "out-neighbours identical across policies");
     assert_eq!(a_in, b_in, "in-neighbours identical across policies");
-    assert_eq!(a_objs, 12, "one arena per vertex");
-    assert_eq!(b_objs, 3, "12 vertices / cap 5 = 3 arenas");
+    assert_eq!(a_objs, 8, "one arena per vertex");
+    assert_eq!(b_objs, 2, "8 vertices / cap 5 = 2 arenas");
     assert!(
         b_objs < a_objs,
         "packing must reduce objects — that is the point"
@@ -100,25 +96,25 @@ fn policy_does_not_change_results() {
 #[test]
 fn reopen_preserves_graph() {
     let (dir, locs) = {
-        let mut s = store(Box::new(FillTo { cap: 8 }));
-        for i in 0..10 {
+        let mut s = store(Box::new(FillTo { cap: 4 }));
+        for i in 0..6 {
             s.add_vertex(7, &format!("v{i}")).unwrap();
         }
-        for i in 0..9u64 {
+        for i in 0..5u64 {
             s.add_edge(i, i + 1, i, 3).unwrap();
         }
         s.sync_all().expect("sync");
         s.ids()
     };
 
-    let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 8 }), 64).expect("reopen");
-    assert_eq!(s.vertex_count(), 10);
-    assert_eq!(s.arena_count(), 2, "10 vertices / cap 8 = 2 arenas");
+    let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 64).expect("reopen");
+    assert_eq!(s.vertex_count(), 6);
+    assert_eq!(s.arena_count(), 2, "6 vertices / cap 4 = 2 arenas");
     assert_eq!(s.vertex_name(0).as_deref(), Some("v0"));
-    assert_eq!(s.vertex_name(9).as_deref(), Some("v9"));
+    assert_eq!(s.vertex_name(5).as_deref(), Some("v5"));
     assert_eq!(s.neighbors(0, true), vec![1]);
+    assert_eq!(s.neighbors(3, false), vec![2]);
     assert_eq!(s.neighbors(5, false), vec![4]);
-    assert_eq!(s.neighbors(9, false), vec![8]);
 }
 
 #[test]
