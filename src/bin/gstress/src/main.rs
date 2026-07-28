@@ -11,9 +11,10 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-07-10d";
+pub(crate) const HARNESS_REV: &str = "2026-07-11f";
 
 mod indradb_mode;
+mod residency;
 
 /// Print the provenance header. Every recorded result must carry this line;
 /// results without one cannot be trusted after the engine changes.
@@ -322,6 +323,24 @@ pub(crate) fn max_distinct_degree(n: usize) -> usize {
 
 fn main() {
     let arg1 = std::env::args().nth(1);
+
+    if arg1.as_deref() == Some("residency") {
+        let arm = std::env::args().nth(2);
+        let n = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300);
+        // Doubles as the per-object element count for the `write` arm, where
+        // 10 rounds is meaningless but 64 elements is a sane default (every
+        // push syncs, so this number is expensive).
+        let rounds = std::env::args()
+            .nth(4)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(if arm.as_deref() == Some("write") { 64 } else { 10 });
+        residency::run(arm.as_deref(), n, rounds);
+        return;
+    }
+
     let scaled_preset;
     let preset: &Preset = match arg1.as_deref() {
         None | Some("small") => &SMALL,
@@ -345,6 +364,7 @@ fn main() {
                 "usage: gstress [tiny|small|medium|large|scale:<N>] [nobulk|indradb]  \
                  (got '{other}')"
             );
+            println!("       gstress residency [cycle|hold|volatile] [N] [R]   (A6 probe)");
             std::process::exit(2);
         }
     };
