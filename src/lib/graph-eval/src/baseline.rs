@@ -43,7 +43,7 @@ pub fn load(name: &str, f: &Fixture) -> Db {
     // Name lookups are property queries here, so the index must be declared.
     db.index_property(ident(P_NAME)).expect("index name");
 
-    let mut mk = |t: &str, n: &str| -> Uuid {
+    let mk = |t: &str, n: &str| -> Uuid {
         let id = db.create_vertex_from_type(ident(t)).expect("create vertex");
         set_str(&db, id, P_NAME, n);
         id
