@@ -754,6 +754,31 @@ pub fn split_frame(frame: FrameRef) -> (FrameRef, usize) {
     PFA.wait().lock().split_frame(frame)
 }
 
+/// Count the free blocks at each allocation level, summed across all regions.
+///
+/// Index `i` corresponds to [`PHYS_LEVEL_LAYOUTS`]`[i]`, so the counts are *blocks*,
+/// not frames: one level-`i` block covers `PHYS_LEVEL_LAYOUTS[i].size() / FRAME_SIZE`
+/// frames.
+///
+/// Blocks are only ever split downward, never merged back up, so a level can be
+/// empty while lower levels still hold a large amount of free memory. An
+/// allocation for that level then fails even though the total count of idle frames
+/// is high. A flat frame count cannot express that state, which is why the
+/// per-level counts are reported separately.
+///
+/// Acquires the physical frame allocator lock, so it must not be called by code
+/// already holding it.
+pub fn free_blocks_per_level() -> [usize; NR_LEVELS] {
+    let pfa = PFA.wait().lock();
+    let mut counts = [0; NR_LEVELS];
+    for region in &pfa.regions {
+        for (level, count) in region.levels.iter().zip(counts.iter_mut()) {
+            *count += level.free;
+        }
+    }
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;

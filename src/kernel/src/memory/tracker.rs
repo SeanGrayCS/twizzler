@@ -9,7 +9,10 @@ use intrusive_collections::{intrusive_adapter, LinkedList};
 use twizzler_abi::{pager::PhysRange, thread::ExecutionState};
 
 use super::{
-    frame::{get_frame, split_frame, FrameRef, PhysicalFrameFlags, PHYS_LEVEL_LAYOUTS},
+    frame::{
+        free_blocks_per_level, get_frame, split_frame, FrameRef, PhysicalFrameFlags,
+        PHYS_LEVEL_LAYOUTS,
+    },
     PhysAddr,
 };
 use crate::{
@@ -256,6 +259,18 @@ pub fn print_tracker_stats() {
         (page * 100) / total,
         loan
     );
+    // Per-level free blocks. An allocation fails when its own level is empty and no
+    // larger block is left to split, which can happen while `idle` is still high, so
+    // these counts are what distinguish that case from genuine exhaustion.
+    for (level, blocks) in free_blocks_per_level().into_iter().enumerate() {
+        let frames_per_block = PHYS_LEVEL_LAYOUTS[level].size() / FRAME_SIZE;
+        logln!(
+            "     level {}: {} blocks, {} frames",
+            level,
+            blocks,
+            blocks * frames_per_block
+        );
+    }
 }
 
 /// Allocate a physical frame. Flags specify zeroing, ownership tracking, and if waiting is okay.
