@@ -11,7 +11,7 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-07-11f";
+pub(crate) const HARNESS_REV: &str = "2026-07-28a";
 
 mod indradb_mode;
 mod residency;
