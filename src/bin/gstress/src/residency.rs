@@ -1,7 +1,19 @@
-//!   gstress residency cycle [N] [R]  # decisive: R rounds of N objects,
-//!                                    # dropping every handle between rounds
-//!   gstress residency hold [N]       # ceiling probe: allocate holding all
-//!   gstress residency volatile [N]   # same as hold, non-persistent objects
+//! Why this is not a unit test. Frame counts are kernel-only — no syscall
+//! exposes them — and exhaustion *blocks* the allocating thread rather than
+//! returning an error. So there is nothing to assert on: the measurement is the
+//! console output, and a stall is a result, not a crash. Every loop prints its
+//! count as it goes, so the last line before a stall *is* the ceiling.
+//!
+//!   gstress residency cycle [N] [R]      # R rounds of N objects, dropping
+//!                                        # every handle between rounds
+//!   gstress residency hold [N]           # ceiling probe: allocate holding all
+//!   gstress residency volatile [N]       # same as hold, non-persistent
+//!   gstress residency write [N] [elems]  # objects with data, no references
+//!   gstress residency ctrl [N] [pool]    # ptr minus the references
+//!   gstress residency ptr [N] [pool]     # N links x 2 InvPtrs into a pool
+//!   gstress residency ptrcycle [N] [R]   # ptr, dropping between rounds
+//!   gstress residency ptrwide [N] [W]    # N links x W InvPtrs, W in 1..32
+//!   gstress residency map [N] [pool]     # mapping churn
 
 use std::time::Instant;
 
@@ -212,6 +224,13 @@ fn cycle(n: usize, rounds: usize) {
 /// holds two more. Each `InvPtr` costs an FOT entry, and resolving one requires
 /// the target object mapped — so the resident set may track *references*, not
 /// objects. Nothing we have measured would have caught that.
+///
+/// This mirrors `Graph::add_edge`: a pool of `pool` target objects, then `n`
+/// link objects each holding two `InvPtr`s into the pool.
+///
+/// So A4b is not the fix: replacing pointers with ids removes a
+/// per-reference cost that does not exist. The lever is entities per object —
+/// `FillTo` in `arena_store.rs` — which amortises the one charge that is real.
 fn ptr_hold(n: usize, pool: usize) {
     use twizzler::ptr::InvPtr;
 
@@ -231,8 +250,11 @@ fn ptr_hold(n: usize, pool: usize) {
         n,
         n * 2
     );
-    println!("residency: compare the stall point against `write` at the same N -- a much lower");
-    println!("residency: ceiling here means references, not objects, are what we cannot afford");
+    println!(
+        "residency: settled 2026-07-28a -- a link costs ~1 454 frames vs ~149 for a bare \
+         persistent object, so objects that reference anything are ~10x. The count of \
+         references does not matter (see ptrwide); having a FOT at all does."
+    );
 
     let start = Instant::now();
     let targets: Vec<Object<Cell>> = (0..pool).map(|i| make(i as u64, true)).collect();
@@ -310,10 +332,12 @@ fn ptr_cycle(n: usize, rounds: usize) {
         per
     );
     println!(
-        "residency: `ptr` stalled at ~1 625 links / ~3 250 InvPtrs held. If this passes that \
-         while dropping, the ceiling is on RESIDENT references and a working-set bound is \
-         sufficient -- A6 returns. If it stalls at the same total, the ceiling is on created \
-         references and no allocator can help."
+        "residency: RESOLVED 2026-07-28a -- this stalls at the same total as `ptr` (a ~2.92M \
+         frames, idle 1%), but NOT because the ceiling is on created references. Drop returns \
+         ~3 frames per object against ~1 400 allocated, so the arm cannot distinguish resident \
+         from created at all. Watch `f` in the heartbeat: it moves exactly 900 per round of \
+         300. The original two-branch reading of this arm was wrong -- a third case, drop \
+         being a no-op, subsumes both."
     );
 
     let start = Instant::now();
