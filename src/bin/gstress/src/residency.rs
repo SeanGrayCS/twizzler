@@ -45,12 +45,15 @@ pub(crate) fn run(arm: Option<&str>, n: usize, rounds: usize) {
         Some("write") => write_hold(n, rounds),
         Some("ptr") => ptr_hold(n, rounds),
         Some("ptrcycle") => ptr_cycle(n, rounds),
+        // `rounds` doubles as the per-link reference count here.
+        Some("ptrwide") => ptr_wide(n, rounds),
         Some("ctrl") => ctrl_hold(n, rounds),
         Some("map") => map_churn(n, rounds),
         Some(other) => {
             println!(
-                "usage: gstress residency [cycle|hold|volatile|write|ptr|map] [N] [R|elems|pool] \
-                 (got '{other}')"
+                "usage: gstress residency \
+                 [cycle|hold|volatile|write|ptr|ptrcycle|ptrwide|ctrl|map] [N] \
+                 [R|elems|pool|width] (got '{other}')"
             );
             std::process::exit(2);
         }
@@ -360,6 +363,112 @@ fn ptr_cycle(n: usize, rounds: usize) {
         per,
         start.elapsed().as_secs_f64()
     );
+    drop(targets);
+}
+
+/// Is the FOT charge per object, or per entry?
+///
+/// Two design points that would otherwise flatten the curve being measured:
+/// `insert_fot` deduplicates identical entries, so every slot in a link must point
+/// at a *different* target or the object ends up with one FOT entry regardless of
+/// width; and `POOL` is fixed rather than derived from the width, so the target
+/// baseline is identical in every run and drops out of the comparison.
+fn ptr_wide(n: usize, width: usize) {
+    match width {
+        1 => wide_hold::<1>(n),
+        2 => wide_hold::<2>(n),
+        4 => wide_hold::<4>(n),
+        8 => wide_hold::<8>(n),
+        16 => wide_hold::<16>(n),
+        32 => wide_hold::<32>(n),
+        other => {
+            println!(
+                "residency ptrwide: width must be one of 1, 2, 4, 8, 16, 32 (got {other}) -- \
+                 widths are const-generic, so the set is fixed at compile time. Note the \
+                 default R is 10, so pass the width explicitly."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Fixed target pool, shared by every width so the baseline cancels. Must be at
+/// least the largest width [`ptr_wide`] dispatches.
+const WIDE_POOL: usize = 32;
+
+fn wide_hold<const W: usize>(n: usize) {
+    use twizzler::ptr::InvPtr;
+
+    // Named `N` rather than `W` so the struct's parameter is never confused with
+    // the enclosing function's: an item declared inside a function cannot use that
+    // function's generics, so these are genuinely distinct.
+    #[repr(C)]
+    struct WideLink<const N: usize> {
+        refs: [InvPtr<Cell>; N],
+    }
+    unsafe impl<const N: usize> Invariant for WideLink<N> {}
+    impl<const N: usize> BaseType for WideLink<N> {}
+
+    println!(
+        "residency ptrwide: {} link objects x {} InvPtrs = {} FOT entries, over a fixed \
+         {}-object pool",
+        n,
+        W,
+        n * W,
+        WIDE_POOL
+    );
+    println!(
+        "residency: compare the heartbeat `a:` delta per link against other widths at the \
+         same N. Flat across W means the FOT charge is per object and packing suffices; \
+         linear in W means it is per entry and A4b is required."
+    );
+
+    let start = Instant::now();
+    let targets: Vec<Object<Cell>> = (0..WIDE_POOL).map(|i| make(i as u64, true)).collect();
+    println!(
+        "residency ptrwide: {} targets created in {:.1}s",
+        WIDE_POOL,
+        start.elapsed().as_secs_f64()
+    );
+
+    let mut links: Vec<Object<WideLink<W>>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let l = ObjectBuilder::<WideLink<W>>::default()
+            .persist(true)
+            .build_inplace(|tx| {
+                // `InvPtr` is not `Copy`, so array-repeat syntax is unavailable and
+                // the fallible constructor cannot run inside `from_fn`. Build nulls,
+                // then fill in place.
+                let mut refs: [InvPtr<Cell>; W] = std::array::from_fn(|_| InvPtr::null());
+                for (k, r) in refs.iter_mut().enumerate() {
+                    // `(i + k) % WIDE_POOL` gives W distinct targets for any
+                    // W <= WIDE_POOL, so no two slots dedup onto one FOT entry,
+                    // while varying with `i` so links are not all identical.
+                    *r = InvPtr::new(&tx, targets[(i + k) % WIDE_POOL].base_ref())?;
+                }
+                tx.write(WideLink { refs })
+            })
+            .expect("create wide link object");
+        links.push(l);
+        if (i + 1) % STEP == 0 {
+            println!(
+                "residency ptrwide: {}/{} links ({} InvPtrs) t={:.1}s",
+                i + 1,
+                n,
+                (i + 1) * W,
+                start.elapsed().as_secs_f64()
+            );
+        }
+    }
+    println!(
+        "residency ptrwide: reached {} links / {} InvPtrs at width {} in {:.1}s without \
+         stalling -- ceiling is ABOVE this at this width.",
+        n,
+        n * W,
+        W,
+        start.elapsed().as_secs_f64()
+    );
+    drop(links);
     drop(targets);
 }
 
