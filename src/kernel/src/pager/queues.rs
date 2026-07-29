@@ -26,7 +26,7 @@ use crate::{
         context::{KernelMemoryContext, ObjectContextInfo, kernel_context},
         pagetables::{ContiguousProvider, MappingCursor, MappingFlags, MappingSettings},
         sim_memory_pressure,
-        tracker::start_reclaim_thread,
+        tracker::{start_reclaim_thread, start_stats_heartbeat},
     },
     obj::{
         LookupFlags, Object, ObjectRef, PageNumber, lookup_object,
@@ -135,6 +135,7 @@ pub(super) fn pager_request_handler_main() {
                 provide_pager_memory(DEFAULT_PAGER_OUTSTANDING_FRAMES, false);
 
                 start_reclaim_thread();
+                start_stats_heartbeat();
                 // TODO
                 if is_test_mode() && false {
                     run_closure_in_new_thread(Priority::USER, || {

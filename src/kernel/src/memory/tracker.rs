@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use core::{
     alloc::Layout,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use bitflags::bitflags;
@@ -21,7 +22,7 @@ use crate::{
     once::Once,
     processor::sched::{schedule, SchedFlags},
     spinlock::Spinlock,
-    syscall::sync::{add_all_to_requeue, finish_blocking, requeue_all},
+    syscall::sync::{add_all_to_requeue, finish_blocking, requeue_all, sys_thread_sync},
     thread::{current_thread_ref, entry::start_new_kernel, priority::Priority, Thread, ThreadRef},
 };
 
@@ -371,6 +372,39 @@ pub fn start_reclaim_thread() {
         .poll()
         .expect("page tracker not initialized")
         .start_reclaim_thread();
+}
+
+/// How often [`start_stats_heartbeat`] reports memory status.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+extern "C" fn stats_heartbeat_entry() {
+    let mut tick: u64 = 0;
+    loop {
+        let mut timeout = HEARTBEAT_INTERVAL;
+        let _ = sys_thread_sync(&mut [], Some(&mut timeout));
+        logln!("[heartbeat {}]", tick);
+        print_tracker_stats();
+        tick = tick.wrapping_add(1);
+    }
+}
+
+/// Start a thread that reports memory status every [`HEARTBEAT_INTERVAL`].
+///
+/// [`print_tracker_stats`] is otherwise only reached from `MemoryTracker::wait`, so a stall
+/// that never blocks on a frame allocation produces no output at all. Reporting
+/// unconditionally separates three cases that are indistinguishable from userspace, where
+/// all three look like the workload going quiet:
+///
+///   * the counters keep moving — progress, just slow;
+///   * the counters freeze but the heartbeat continues — blocked on something other than
+///     memory;
+///   * the heartbeat itself stops — the kernel is wedged.
+///
+/// Runs at realtime priority so that a merely starved thread cannot be misread as the
+/// third case.
+pub fn start_stats_heartbeat() {
+    static HEARTBEAT: Once<ThreadRef> = Once::new();
+    HEARTBEAT.call_once(|| start_new_kernel(Priority::REALTIME, stats_heartbeat_entry, 0));
 }
 
 pub fn reclaim(frames: impl IntoIterator<Item = FrameRef>) {
