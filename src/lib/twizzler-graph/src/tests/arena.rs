@@ -1,8 +1,8 @@
-//! The headline assertion is object count, because that is the constraint
-//! that stopped `gstress scale:600`: each Twizzler object costs ≈4 MB of pager
-//! frames and the ceiling is ~2 900 objects. Today's engine spends 3 objects
-//! per vertex; these tests pin that arena-backing spends 1 (or 1/N with
-//! packing) while producing *identical* traversal results.
+//! These tests pin that arena-backing spends 1 object per vertex, or 1/N with
+//! packing, while producing *identical* traversal results. Packing is the
+//! lever — cost per vertex is `1454/cap` — not the choice of ids over
+//! pointers, which the corrected model shows buys essentially nothing on
+//! memory.
 
 use crate::arena_store::{ArenaStore, FillTo, OnePerArena, ADJ_CHUNK};
 
@@ -133,6 +133,36 @@ fn delete_tombstones_vertex() {
     // Surviving vertices keep their own records.
     assert_eq!(s.vertex_name(0).as_deref(), Some("v0"));
     assert_eq!(s.vertex_name(2).as_deref(), Some("v2"));
+}
+
+#[test]
+fn allocation_syncs_once_per_arena_not_per_allocation() {
+    let mut s = store(Box::new(FillTo { cap: 4 }));
+    for i in 0..12 {
+        s.add_vertex(0, &format!("v{i}")).unwrap();
+    }
+    for i in 0..11u64 {
+        s.add_edge(i, i + 1, i, 0).unwrap();
+    }
+    // 12 vertex records plus a chunk per endpoint per edge: >30 allocations,
+    // every one of which was a sync before this change.
+    assert_eq!(s.sync_count(), 0, "nothing is synced before sync_all");
+
+    s.sync_all().unwrap();
+
+    assert_eq!(s.arena_count(), 3, "12 vertices / cap 4 = 3 arenas");
+    assert_eq!(
+        s.sync_count(),
+        3,
+        "one sync per arena — if this equals the allocation count, the \
+         batching transaction is being dropped instead of reused"
+    );
+
+    // Batching must not cost durability: the whole batch is readable after the
+    // single flush. (`reopen_preserves_graph` covers survival across a reopen.)
+    assert_eq!(s.vertex_name(0).as_deref(), Some("v0"));
+    assert_eq!(s.vertex_name(11).as_deref(), Some("v11"));
+    assert_eq!(s.neighbors(5, true), vec![6]);
 }
 
 #[test]

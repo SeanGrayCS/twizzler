@@ -10,15 +10,12 @@
 //! `u64` offset resolved through [`GlobalPtr`], so intra-arena traversal needs
 //! no FOT entry and touches no second object. Neighbours in *other* arenas are
 //! named by `VertexId` and resolved through the location registry — the "A4b"
-//! reference form. This was chosen deliberately: the cold/warm measurement
-//! showed cold `InvPtr` traversal is no better than the KV baseline (1.1×),
-//! while warm speed comes from data being *mapped*, which ids into a mapped
-//! registry also enjoy. A4a (`InvPtr`s) remains the comparison variant.
+//! reference form.
 
 use twizzler::{
-    alloc::arena::ArenaObject,
+    alloc::arena::{ArenaBase, ArenaObject},
     marker::Invariant,
-    object::{ObjID, ObjectBuilder},
+    object::{ObjID, ObjectBuilder, TxObject},
     ptr::GlobalPtr,
 };
 
@@ -135,8 +132,12 @@ pub struct ArenaStore {
     dir: SegVec<ArenaEntry>,
     locs: SegVec<VertexLoc>,
     open: Vec<ArenaObject>,
+    txs: Vec<Option<TxObject<ArenaBase>>>,
     stats: Vec<ArenaStat>,
     policy: Box<dyn Placement>,
+    /// Syncs issued by `sync_all`, so a test can assert the batching property
+    /// directly rather than inferring it from wall time.
+    syncs: usize,
 }
 
 impl ArenaStore {
@@ -145,8 +146,10 @@ impl ArenaStore {
             dir: SegVec::create(seg_cap)?,
             locs: SegVec::create(seg_cap)?,
             open: Vec::new(),
+            txs: Vec::new(),
             stats: Vec::new(),
             policy,
+            syncs: 0,
         })
     }
 
@@ -178,12 +181,15 @@ impl ArenaStore {
                 }
             }
         }
+        let txs = (0..open.len()).map(|_| None).collect();
         Ok(ArenaStore {
             dir,
             locs,
             open,
+            txs,
             stats,
             policy,
+            syncs: 0,
         })
     }
 
@@ -202,10 +208,23 @@ impl ArenaStore {
     fn new_arena(&mut self) -> Result<usize> {
         let arena = ArenaObject::new(ObjectBuilder::default().persist(true))?;
         let raw = arena.object().id().raw();
-        self.dir.push(ArenaEntry { raw })?;
+        self.dir.push_nosync(ArenaEntry { raw })?;
         self.open.push(arena);
+        self.txs.push(None);
         self.stats.push(ArenaStat { vertices: 0 });
         Ok(self.open.len() - 1)
+    }
+
+    fn tx_for(&mut self, idx: usize) -> Result<&mut TxObject<ArenaBase>> {
+        if self.txs[idx].is_none() {
+            let tx = self.open[idx].as_tx()?;
+            self.txs[idx] = Some(tx);
+        }
+        Ok(self.txs[idx].as_mut().expect("just opened"))
+    }
+
+    pub fn sync_count(&self) -> usize {
+        self.syncs
     }
 
     fn arena_id(&self, idx: usize) -> ObjID {
@@ -224,16 +243,19 @@ impl ArenaStore {
             _ => self.new_arena()?,
         };
         let id = self.locs.len() as u64;
-        let gp = self.open[idx].alloc(ArenaVertex {
-            id,
-            label,
-            flags: 0,
-            name: NameKey::new(name),
-            out_head: 0,
-            in_head: 0,
-        })?;
-        let off = gp.offset();
-        self.locs.push(VertexLoc {
+        let off = {
+            let tx = self.tx_for(idx)?;
+            tx.alloc(ArenaVertex {
+                id,
+                label,
+                flags: 0,
+                name: NameKey::new(name),
+                out_head: 0,
+                in_head: 0,
+            })?
+            .offset()
+        };
+        self.locs.push_nosync(VertexLoc {
             arena: idx as u32,
             _pad: 0,
             off,
@@ -282,13 +304,16 @@ impl ArenaStore {
             _pad: 0,
         }; ADJ_CHUNK];
         entries[0] = entry;
-        let cgp = self.open[arena_idx].alloc(AdjChunk {
-            len: 1,
-            _pad: 0,
-            next: head,
-            entries,
-        })?;
-        let new_off = cgp.offset();
+        let new_off = {
+            let tx = self.tx_for(arena_idx)?;
+            tx.alloc(AdjChunk {
+                len: 1,
+                _pad: 0,
+                next: head,
+                entries,
+            })?
+            .offset()
+        };
         let mut v = unsafe { vgp.resolve_mut() };
         if out {
             v.out_head = new_off;
@@ -379,9 +404,22 @@ impl ArenaStore {
         Ok(())
     }
 
+    /// Closes each arena's batching transaction first. `abort()` is what makes
+    /// the batching worth anything: it suppresses the transaction's sync-on-drop
+    /// so the arena is synced exactly once here, rather than once per open
+    /// transaction plus once again below. Upstream transactions have no
+    /// rollback, so the writes stand — the assumption is pinned by
+    /// `tx_abort_does_not_roll_back` in `tests/bulk.rs`, which fails loudly if
+    /// upstream ever implements one.
     pub fn sync_all(&mut self) -> Result<()> {
+        for slot in self.txs.iter_mut() {
+            if let Some(mut tx) = slot.take() {
+                tx.abort();
+            }
+        }
         for a in &self.open {
             unsafe { a.object().as_mut()?.sync()? };
+            self.syncs += 1;
         }
         self.dir.flush()?;
         self.locs.flush()?;
