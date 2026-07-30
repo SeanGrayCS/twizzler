@@ -16,7 +16,7 @@ use twizzler::{
     alloc::arena::{ArenaBase, ArenaObject},
     marker::Invariant,
     object::{ObjID, ObjectBuilder, TxObject},
-    ptr::GlobalPtr,
+    ptr::{GlobalPtr, InvPtr},
 };
 
 use crate::name::NameKey;
@@ -40,27 +40,54 @@ pub(crate) struct ArenaVertex {
     pub(crate) label: u32,
     pub(crate) flags: u32,
     pub(crate) name: NameKey,
+    /// VERSION 4: absorbed from `VertexRef`, which is retiring. Holding these
+    /// here is what lets the `verts` registry go away entirely rather than
+    /// shadowing the arena with a second structure that assigns ids in
+    /// lockstep by convention.
+    pub(crate) target_raw: u128,
+    pub(crate) props_raw: u128,
     pub(crate) out_head: u64,
     pub(crate) in_head: u64,
 }
 unsafe impl Invariant for ArenaVertex {}
 
-/// One adjacency entry. The neighbour is named by id, not by pointer — see the
-/// module docs on reference form.
-#[derive(Clone, Copy)]
+/// One adjacency entry (VERSION 4).
+///
+/// The neighbour is an [`InvPtr`], which handles both cases in one field:
+/// a target in *this* arena gets FOT index 0 — no FOT entry, and
+/// `resolve()` takes an inlined base+offset path — while a target elsewhere
+/// costs one FOT entry, deduped per target arena by the runtime's
+/// `insert_fot`. Traversal therefore never consults the location registry.
+///
+/// Neither this nor [`AdjChunk`] is `Copy`, and that is load-bearing: a FOT
+/// index means something only inside its containing object, so copying an entry
+/// between arenas would silently mis-resolve. `InvPtr` is not `Copy` for
+/// exactly this reason; do not "fix" it by storing the raw `u64`.
 #[repr(C)]
 pub(crate) struct AdjRef {
     pub(crate) edge_id: u64,
-    pub(crate) neighbor: u64,
+    pub(crate) neighbor: InvPtr<ArenaVertex>,
     pub(crate) label: u32,
     pub(crate) _pad: u32,
 }
 unsafe impl Invariant for AdjRef {}
 
+impl AdjRef {
+    /// Filler for the unused tail of a freshly allocated chunk. `len` bounds
+    /// every read, so these are never resolved.
+    fn null() -> Self {
+        AdjRef {
+            edge_id: 0,
+            neighbor: InvPtr::null(),
+            label: 0,
+            _pad: 0,
+        }
+    }
+}
+
 /// A chunk of adjacency entries. Chunks are prepended, so walking from the
 /// head yields newest-first; readers reverse the chunk order to recover
 /// insertion order (entries within a chunk are already in order).
-#[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct AdjChunk {
     pub(crate) len: u32,
@@ -237,7 +264,7 @@ impl ArenaStore {
     }
 
     /// Add a vertex, letting the policy choose its arena.
-    pub fn add_vertex(&mut self, label: u32, name: &str) -> Result<u64> {
+    pub fn add_vertex(&mut self, label: u32, name: &str, target_raw: u128) -> Result<u64> {
         let idx = match self.policy.place(&self.stats) {
             Some(i) if i < self.open.len() => i,
             _ => self.new_arena()?,
@@ -250,6 +277,8 @@ impl ArenaStore {
                 label,
                 flags: 0,
                 name: NameKey::new(name),
+                target_raw,
+                props_raw: 0,
                 out_head: 0,
                 in_head: 0,
             })?
@@ -267,7 +296,19 @@ impl ArenaStore {
     /// Append an adjacency entry to `vertex`'s out (or in) chain. The chunk is
     /// allocated in the vertex's own arena, so a low-degree vertex adds no
     /// objects at all.
-    fn append_adj(&mut self, vertex: u64, out: bool, entry: AdjRef) -> Result<()> {
+    ///
+    /// The neighbour is given as a location rather than a built [`AdjRef`]:
+    /// the entry's `InvPtr` can only be constructed against the transaction of
+    /// the arena that will *hold* it, since a FOT index is object-relative.
+    /// Building it here is what makes a same-arena neighbour cost no FOT entry.
+    fn append_adj(
+        &mut self,
+        vertex: u64,
+        out: bool,
+        edge_id: u64,
+        label: u32,
+        neighbor: GlobalPtr<ArenaVertex>,
+    ) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
@@ -284,6 +325,18 @@ impl ArenaStore {
             }
         };
 
+        // Build the entry against this arena's transaction. `InvPtr::new`
+        // returns FOT index 0 when `neighbor` lives in this same arena.
+        let entry = {
+            let tx = self.tx_for(arena_idx)?;
+            AdjRef {
+                edge_id,
+                neighbor: InvPtr::new(&*tx, neighbor)?,
+                label,
+                _pad: 0,
+            }
+        };
+
         // Room in the head chunk? Append there and we are done.
         if head != 0 {
             let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, head);
@@ -297,13 +350,17 @@ impl ArenaStore {
         }
 
         // Otherwise allocate a fresh chunk in the same arena and link it in.
-        let mut entries = [AdjRef {
-            edge_id: 0,
-            neighbor: 0,
-            label: 0,
-            _pad: 0,
-        }; ADJ_CHUNK];
-        entries[0] = entry;
+        // `from_fn` rather than an array-repeat literal because `AdjRef` is not
+        // `Copy` (see its docs); indices are visited in order, so `take` at 0 is
+        // the single move of `entry`.
+        let mut slot = Some(entry);
+        let entries: [AdjRef; ADJ_CHUNK] = core::array::from_fn(|i| {
+            if i == 0 {
+                slot.take().expect("index 0 is visited exactly once")
+            } else {
+                AdjRef::null()
+            }
+        });
         let new_off = {
             let tx = self.tx_for(arena_idx)?;
             tx.alloc(AdjChunk {
@@ -325,39 +382,27 @@ impl ArenaStore {
 
     /// Record an edge on both endpoints.
     pub fn add_edge(&mut self, from: u64, to: u64, edge_id: u64, label: u32) -> Result<()> {
-        self.append_adj(
-            from,
-            true,
-            AdjRef {
-                edge_id,
-                neighbor: to,
-                label,
-                _pad: 0,
-            },
-        )?;
-        self.append_adj(
-            to,
-            false,
-            AdjRef {
-                edge_id,
-                neighbor: from,
-                label,
-                _pad: 0,
-            },
-        )
+        let Some(from_gp) = self.vertex_ptr(from) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        let Some(to_gp) = self.vertex_ptr(to) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        self.append_adj(from, true, edge_id, label, to_gp)?;
+        self.append_adj(to, false, edge_id, label, from_gp)
     }
 
-    /// Neighbours in insertion order. Chunks are prepended, so the chunk list
-    /// is walked then reversed; entries within a chunk are already ordered.
-    pub fn neighbors(&self, vertex: u64, out: bool) -> Vec<u64> {
+    /// Walk `vertex`'s out (or in) chain in insertion order, calling
+    /// `f(edge_id, label, neighbour_id)` for each live entry.
+    fn walk_adj(&self, vertex: u64, out: bool, mut f: impl FnMut(u64, u32, u64)) {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
-            return Vec::new();
+            return;
         };
         let aid = self.arena_id(loc.arena as usize);
         let vgp: GlobalPtr<ArenaVertex> = GlobalPtr::new(aid, loc.off);
         let v = unsafe { vgp.resolve() };
         if v.flags & TOMBSTONE != 0 {
-            return Vec::new();
+            return;
         }
         let mut off = if out { v.out_head } else { v.in_head };
         drop(v);
@@ -371,15 +416,118 @@ impl ArenaStore {
         }
         chunks.reverse();
 
-        let mut out_ids = Vec::new();
         for (coff, len) in chunks {
             let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, coff);
             let c = unsafe { cgp.resolve() };
             for e in c.entries.iter().take(len) {
-                out_ids.push(e.neighbor);
+                // Same-arena neighbours take `InvPtr`'s inlined local path
+                // (FOT index 0): base + offset inside this already-mapped
+                // object, no registry read and no FOT lookup.
+                let nb = unsafe { e.neighbor.resolve() };
+                if nb.flags & TOMBSTONE == 0 {
+                    f(e.edge_id, e.label, nb.id);
+                }
             }
         }
-        out_ids
+    }
+
+    /// Neighbours in insertion order.
+    pub fn neighbors(&self, vertex: u64, out: bool) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.walk_adj(vertex, out, |_, _, nb| ids.push(nb));
+        ids
+    }
+
+    /// Neighbours whose incident edge carries one of `labels`; `None` means any.
+    /// Filtering happens inside the walk so a selective query does not
+    /// materialise the whole neighbourhood first.
+    pub fn neighbors_labeled(&self, vertex: u64, out: bool, labels: Option<&[u32]>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.walk_adj(vertex, out, |_, l, nb| {
+            if labels.map_or(true, |ls| ls.contains(&l)) {
+                ids.push(nb);
+            }
+        });
+        ids
+    }
+
+    /// Incident edge ids, same filter semantics as [`Self::neighbors_labeled`].
+    pub fn edge_ids(&self, vertex: u64, out: bool, labels: Option<&[u32]>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.walk_adj(vertex, out, |e, l, _| {
+            if labels.map_or(true, |ls| ls.contains(&l)) {
+                ids.push(e);
+            }
+        });
+        ids
+    }
+
+    // --- record accessors (VERSION 4) ---------------------------------------
+    //
+    // These exist so `Graph` can retire the `verts` SegVec: everything the old
+    // `VertexRef` mirror carried now lives in the arena record, and the store
+    // is the single place that knows how to reach it. Each returns `None` for a
+    // missing or tombstoned vertex, so callers get `Graph`'s liveness semantics
+    // without repeating the check.
+
+    /// Run `f` on a live vertex's record, or `None` if missing/tombstoned.
+    fn with_vertex<R>(&self, vertex: u64, f: impl FnOnce(&ArenaVertex) -> R) -> Option<R> {
+        let gp = self.vertex_ptr(vertex)?;
+        let v = unsafe { gp.resolve() };
+        if v.flags & TOMBSTONE != 0 {
+            return None;
+        }
+        Some(f(&v))
+    }
+
+    /// Whether the vertex exists and is not tombstoned.
+    pub fn is_alive(&self, vertex: u64) -> bool {
+        self.with_vertex(vertex, |_| ()).is_some()
+    }
+
+    /// `(label, name, target)` — the old `VertexInfo` triple.
+    pub fn vertex_info(&self, vertex: u64) -> Option<(u32, String, u128)> {
+        self.with_vertex(vertex, |v| {
+            (v.label, v.name.as_str().to_string(), v.target_raw)
+        })
+    }
+
+    pub fn vertex_label(&self, vertex: u64) -> Option<u32> {
+        self.with_vertex(vertex, |v| v.label)
+    }
+
+    /// The vertex's property-object id (0 = none).
+    pub fn props_raw(&self, vertex: u64) -> Option<u128> {
+        self.with_vertex(vertex, |v| v.props_raw)
+    }
+
+    /// Point the vertex at a (possibly new) property object. Writes mapped
+    /// memory; durable at [`Self::sync_all`] like every other mutation here.
+    pub fn set_props_raw(&mut self, vertex: u64, raw: u128) -> Result<()> {
+        let Some(gp) = self.vertex_ptr(vertex) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        let mut v = unsafe { gp.resolve_mut() };
+        if v.flags & TOMBSTONE != 0 {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        }
+        v.props_raw = raw;
+        Ok(())
+    }
+
+    /// All live vertex ids. Linear over the location registry, as `Graph`'s
+    /// `vertices()` is linear over its registry today.
+    pub fn vertices(&self) -> Vec<u64> {
+        (0..self.locs.len() as u64)
+            .filter(|id| self.is_alive(*id))
+            .collect()
+    }
+
+    /// Live vertices carrying `label`. Linear scan, matching `Graph`.
+    pub fn vertices_by_label(&self, label: u32) -> Vec<u64> {
+        (0..self.locs.len() as u64)
+            .filter(|id| self.vertex_label(*id) == Some(label))
+            .collect()
     }
 
     pub fn vertex_name(&self, vertex: u64) -> Option<String> {
