@@ -27,6 +27,7 @@ use twizzler::{
 use twizzler_rt_abi::error::ArgumentError;
 
 use crate::{
+    arena_store::{ArenaStore, FillTo},
     edge::{Edge, EdgeId, EdgeInfo, EdgeRef},
     error::{GraphError, Result},
     name::NameKey,
@@ -38,12 +39,23 @@ use crate::{
 
 pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
 pub(crate) const VERSION: u32 = 3; // on-disk format version (3: segmented registries)
+
+/// On-disk format 4: vertices and adjacency live in packed arenas
+/// ([`ArenaStore`]) instead of three objects per vertex plus one per edge.
+pub(crate) const VERSION_ARENA: u32 = 4;
+
+/// Whether this build understands a graph in the given on-disk format.
+fn version_supported(v: u32) -> bool {
+    v == VERSION || v == VERSION_ARENA
+}
 const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
 /// Default per-segment registry capacity. Registry records are plain data
 /// (~100–150 B, no `InvPtr`s), so 4096 entries keep a segment well under the
 /// object size limit while amortizing segment creation.
 pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
+
+pub const DEFAULT_ARENA_CAP: usize = 4096;
 
 /// Read/write/persist map flags for reopening mutable registries.
 fn rw() -> MapFlags {
@@ -64,6 +76,11 @@ pub(crate) struct GraphRoot {
     pub(crate) edges_raw: u128,
     pub(crate) labels_raw: u128,
     pub(crate) vindex_raw: u128,
+    /// VERSION 4 only: the [`ArenaStore`]'s arena directory and location
+    /// registry. Both zero in a v3 graph, and only read when `version` says 4 —
+    /// appended at the end so a v3 root stays byte-compatible.
+    pub(crate) arena_dir_raw: u128,
+    pub(crate) arena_locs_raw: u128,
 }
 unsafe impl Invariant for GraphRoot {}
 impl BaseType for GraphRoot {}
@@ -96,6 +113,25 @@ pub struct Graph {
     edges: SegVec<EdgeRef>,
     labels: SegVec<LabelEntry>,
     vindex: VIndex,
+    /// `Some` on a VERSION 4 graph: vertices and adjacency live here instead of
+    /// in `verts` and per-vertex objects. When set, `verts` stays empty and
+    /// every vertex path defers to the store.
+    store: Option<ArenaStore>,
+}
+
+impl Graph {
+    /// Whether this graph uses the arena layout (VERSION 4).
+    pub fn is_arena(&self) -> bool {
+        self.store.is_some()
+    }
+
+    pub fn arena_count(&self) -> usize {
+        self.store.as_ref().map_or(0, |s| s.arena_count())
+    }
+
+    pub fn arena_sync_count(&self) -> usize {
+        self.store.as_ref().map_or(0, |s| s.sync_count())
+    }
 }
 
 impl Graph {
@@ -113,9 +149,38 @@ impl Graph {
     /// segment geometry must stay uniform for the graph's lifetime. (Small
     /// capacities let tests force segment rollover cheaply.)
     pub fn open_or_create_with_capacity(name: &str, cap: usize) -> Result<Graph> {
+        Self::open_inner(name, cap, None)
+    }
+
+    /// Open or create a graph on the arena layout (VERSION 4), packing
+    /// `arena_cap` vertices per object.
+    pub fn open_or_create_arena(name: &str, arena_cap: usize) -> Result<Graph> {
+        Self::open_inner(name, DEFAULT_SEG_CAP, Some(arena_cap))
+    }
+
+    /// [`Graph::open_or_create_arena`] with an explicit registry segment
+    /// capacity, for tests that force segment rollover cheaply.
+    pub fn open_or_create_arena_with_capacity(
+        name: &str,
+        cap: usize,
+        arena_cap: usize,
+    ) -> Result<Graph> {
+        Self::open_inner(name, cap, Some(arena_cap))
+    }
+
+    /// `arena` is `Some(cap)` to *create* a VERSION 4 graph; it does not affect
+    /// opening an existing one.
+    fn open_inner(name: &str, cap: usize, arena: Option<usize>) -> Result<Graph> {
         if cap == 0 || cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
+        if matches!(arena, Some(0)) {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        // Packing is what the arena layout buys, so an arena graph reopened
+        // without a stated cap still needs one for future inserts; the store's
+        // existing contents are unaffected by the choice.
+        let arena_cap = arena.unwrap_or(DEFAULT_ARENA_CAP);
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
 
@@ -134,17 +199,34 @@ impl Graph {
                     r.vindex_raw,
                 )
             };
-            if magic == MAGIC && version == VERSION {
+            if magic == MAGIC && version_supported(version) {
                 // The persisted capacity governs, not the caller's.
                 let cap = seg_cap as usize;
                 let vbacking: Object<PersistentHashMapBase<VKey, u64>> =
                     Object::map(ObjID::new(vindex_raw), rw())?;
+                // The *stored* version decides the layout, not the caller: a
+                // graph opened by name must come back the way it was written.
+                let store = if version == VERSION_ARENA {
+                    let (dir, locs) = {
+                        let r = root.base();
+                        (r.arena_dir_raw, r.arena_locs_raw)
+                    };
+                    Some(ArenaStore::open(
+                        dir,
+                        locs,
+                        Box::new(FillTo { cap: arena_cap }),
+                        cap,
+                    )?)
+                } else {
+                    None
+                };
                 return Ok(Graph {
                     root_id: node.id.into(),
                     verts: SegVec::open(verts_raw, cap)?,
                     edges: SegVec::open(edges_raw, cap)?,
                     labels: SegVec::open(labels_raw, cap)?,
                     vindex: PersistentHashMap::from(vbacking),
+                    store,
                 });
             }
             // Incompatible/stale format: do NOT touch the existing graph.
@@ -158,17 +240,32 @@ impl Graph {
         let edges = SegVec::create(cap)?;
         let labels = SegVec::create(cap)?;
         let vindex = VIndex::new_persist()?;
+        let store = match arena {
+            Some(_) => Some(ArenaStore::create(
+                Box::new(FillTo { cap: arena_cap }),
+                cap,
+            )?),
+            None => None,
+        };
+        let (arena_dir_raw, arena_locs_raw) =
+            store.as_ref().map_or((0, 0), |s| s.ids());
 
         let root = ObjectBuilder::<GraphRoot>::default()
             .persist(true)
             .build(GraphRoot {
                 magic: MAGIC,
-                version: VERSION,
+                version: if arena.is_some() {
+                    VERSION_ARENA
+                } else {
+                    VERSION
+                },
                 seg_cap: cap as u32,
                 verts_raw: verts.dir_raw(),
                 edges_raw: edges.dir_raw(),
                 labels_raw: labels.dir_raw(),
                 vindex_raw: vindex.object().id().raw(),
+                arena_dir_raw,
+                arena_locs_raw,
             })?;
 
         let _ = namer.remove(&path);
@@ -180,6 +277,7 @@ impl Graph {
             edges,
             labels,
             vindex,
+            store,
         })
     }
 
@@ -279,6 +377,11 @@ impl Graph {
             b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
             b.vindex_raw = vindex_raw;
+            // `reset` rebuilds as v3, so any arena ids from a previous v4
+            // incarnation must be cleared — leaving them would make a v3 root
+            // name arenas it does not own.
+            b.arena_dir_raw = 0;
+            b.arena_locs_raw = 0;
             Ok(())
         })?;
 
@@ -288,6 +391,24 @@ impl Graph {
 
     pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
         let lbl = self.intern_label(label)?;
+
+        // VERSION 4: one arena allocation, shared with `cap-1` other vertices,
+        // instead of three whole objects (vertex + two adjacency `VecObject`s).
+        if self.store.is_some() {
+            let id = {
+                let store = self.store.as_mut().expect("arena graph");
+                store.add_vertex(lbl, name, target.raw())?
+            };
+            self.vindex.insert(
+                VKey {
+                    label: lbl,
+                    name: NameKey::new(name),
+                },
+                id,
+            )?;
+            return Ok(VertexId(id));
+        }
+
         let id = self.verts.len() as u64;
 
         // Per-vertex adjacency lists, split by direction.
@@ -338,6 +459,29 @@ impl Graph {
     /// list.
     pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
         let lbl = self.intern_label(label)?;
+
+        // VERSION 4: no edge object at all. The adjacency entry carries the
+        // edge id and label, and its `InvPtr` neighbour costs no FOT entry when
+        // both endpoints share an arena.
+        if self.store.is_some() {
+            let id = self.edges.len() as u64;
+            {
+                let store = self.store.as_mut().expect("arena graph");
+                if !store.is_alive(from.0) || !store.is_alive(to.0) {
+                    return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+                }
+                store.add_edge(from.0, to.0, id, lbl)?;
+            }
+            self.edges.push_nosync(EdgeRef {
+                id,
+                label: lbl,
+                from_id: from.0,
+                to_id: to.0,
+                eobj_raw: 0, // no edge object on this layout
+                flags: 0,
+            })?;
+            return Ok(EdgeId(id));
+        }
         let (from_vobj, from_out, _from_in) = self
             .vertex_locs(from)
             .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
@@ -445,23 +589,55 @@ impl Graph {
 
     /// Convenience: outgoing/incoming/both neighbors of `id` (no predicate).
     pub fn out_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        if self.store.is_some() {
+            return self.arena_neighbors(id, labels, true, false);
+        }
         self.vertex_view(id)
             .map(|v| v.out_neighbors(labels))
             .unwrap_or_default()
     }
     pub fn in_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        if self.store.is_some() {
+            return self.arena_neighbors(id, labels, false, true);
+        }
         self.vertex_view(id)
             .map(|v| v.in_neighbors(labels))
             .unwrap_or_default()
     }
     pub fn both_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
+        if self.store.is_some() {
+            return self.arena_neighbors(id, labels, true, true);
+        }
         self.vertex_view(id)
             .map(|v| v.both_neighbors(labels))
             .unwrap_or_default()
     }
 
+    fn arena_neighbors(
+        &self,
+        id: VertexId,
+        labels: Labels,
+        out: bool,
+        inc: bool,
+    ) -> Vec<VertexId> {
+        let store = self.store.as_ref().expect("arena graph");
+        let filter = self.resolve_labels(labels);
+        let ls = filter.as_deref();
+        let mut ids = Vec::new();
+        if out {
+            ids.extend(store.neighbors_labeled(id.0, true, ls));
+        }
+        if inc {
+            ids.extend(store.neighbors_labeled(id.0, false, ls));
+        }
+        ids.into_iter().map(VertexId).collect()
+    }
+
     /// All live vertex ids in the graph. Linear scan.
     pub fn vertices(&self) -> Vec<VertexId> {
+        if let Some(store) = &self.store {
+            return store.vertices().into_iter().map(VertexId).collect();
+        }
         let mut out = Vec::new();
         for i in 0..self.verts.len() {
             if let Some(r) = self.verts.get_ref(i) {
@@ -490,6 +666,10 @@ impl Graph {
     /// Delete a vertex (tombstone). Its incident edges become hidden too, since
     /// an edge is alive only while both endpoints are. No-op if already gone.
     pub fn delete_vertex(&mut self, id: VertexId) -> Result<()> {
+        if let Some(store) = self.store.as_mut() {
+            store.delete_vertex(id.0)?;
+            return Ok(());
+        }
         let idx = id.0 as usize;
         if idx >= self.verts.len() {
             return Ok(());
@@ -567,6 +747,21 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
+        if self.store.is_some() {
+            let cur = self
+                .store
+                .as_ref()
+                .and_then(|s| s.props_raw(v.0))
+                .unwrap_or(0);
+            let new_raw = props::set_in(cur, key, val)?;
+            if new_raw != cur {
+                self.store
+                    .as_mut()
+                    .expect("arena graph")
+                    .set_props_raw(v.0, new_raw)?;
+            }
+            return Ok(());
+        }
         let idx = v.0 as usize;
         let cur = self.verts.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
         let new_raw = props::set_in(cur, key, val)?;
@@ -584,6 +779,9 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return None;
         }
+        if let Some(store) = &self.store {
+            return props::get_in(store.props_raw(v.0)?, key);
+        }
         let raw = self.verts.get_ref(v.0 as usize)?.props_raw;
         props::get_in(raw, key)
     }
@@ -592,6 +790,9 @@ impl Graph {
     pub fn vertex_props(&self, v: VertexId) -> Vec<(String, PropValue)> {
         if !self.is_vertex_alive(v) {
             return Vec::new();
+        }
+        if let Some(store) = &self.store {
+            return store.props_raw(v.0).map_or(Vec::new(), props::list_in);
         }
         match self.verts.get_ref(v.0 as usize) {
             Some(r) => props::list_in(r.props_raw),
@@ -660,10 +861,24 @@ impl Graph {
 
     /// Whether a vertex exists and is not tombstoned.
     pub(crate) fn is_vertex_alive(&self, id: VertexId) -> bool {
+        if let Some(store) = &self.store {
+            return store.is_alive(id.0);
+        }
         match self.verts.get_ref(id.0 as usize) {
             Some(r) if r.id == id.0 => r.flags & TOMBSTONE == 0,
             _ => false,
         }
+    }
+
+    /// Make the arena layout durable — one sync per arena plus the registries.
+    /// A no-op on v3, where every write already synced as it went.
+    pub fn sync(&mut self) -> Result<()> {
+        if let Some(store) = self.store.as_mut() {
+            store.sync_all()?;
+        }
+        self.edges.flush()?;
+        self.labels.flush()?;
+        Ok(())
     }
 
     /// Whether an edge exists, is not tombstoned, and both endpoints are alive.
@@ -682,6 +897,13 @@ impl Graph {
         let Some(lbl) = self.find_label(label) else {
             return Vec::new();
         };
+        if let Some(store) = &self.store {
+            return store
+                .vertices_by_label(lbl)
+                .into_iter()
+                .map(VertexId)
+                .collect();
+        }
         let mut out = Vec::new();
         for i in 0..self.verts.len() {
             if let Some(r) = self.verts.get_ref(i) {
@@ -696,6 +918,14 @@ impl Graph {
     /// Read back a vertex's data from the registry, or `None` if it is deleted.
     /// O(1): ids are append indices, so the record is at position `id`.
     pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
+        if let Some(store) = &self.store {
+            let (lbl, name, target) = store.vertex_info(id.0)?;
+            return Some(VertexInfo {
+                label: self.label_name(lbl).unwrap_or_default(),
+                name,
+                target: ObjID::new(target),
+            });
+        }
         let r = self.verts.get_ref(id.0 as usize)?;
         if r.id != id.0 || r.flags & TOMBSTONE != 0 {
             return None;
