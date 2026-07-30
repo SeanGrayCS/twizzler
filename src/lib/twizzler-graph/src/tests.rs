@@ -8,6 +8,7 @@ use crate::Graph;
 
 mod adjacency;
 mod arena;
+mod arena_graph;
 mod bulk;
 mod crud;
 mod dsl;

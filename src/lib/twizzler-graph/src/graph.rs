@@ -319,7 +319,28 @@ impl Graph {
         Self::reset_inner(name, Some(cap))
     }
 
+    /// Discard a graph and rebuild it empty on the arena layout
+    /// (VERSION 4), packing `arena_cap` vertices per object.
+    ///
+    /// Arena tests need this to be idempotent across runs: the disk image
+    /// survives between QEMU invocations, so a graph left behind by an earlier
+    /// run would otherwise be re-opened in whatever format it was written in,
+    /// and a plain [`Graph::reset`] would rebuild it as v3. Unbinding the name
+    /// is not an option — `data/` names cannot be removed on this build — so
+    /// the root is rewritten in place, exactly as `reset` does.
+    pub fn reset_arena(name: &str, arena_cap: usize) -> Result<()> {
+        if arena_cap == 0 {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        Self::reset_inner_fmt(name, None, Some(arena_cap))
+    }
+
     fn reset_inner(name: &str, cap: Option<usize>) -> Result<()> {
+        Self::reset_inner_fmt(name, cap, None)
+    }
+
+    /// `arena` is `Some(cap)` to rebuild on VERSION 4, `None` for VERSION 3.
+    fn reset_inner_fmt(name: &str, cap: Option<usize>, arena: Option<usize>) -> Result<()> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
         let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
@@ -365,23 +386,31 @@ impl Graph {
             labels.dir_raw(),
             vindex.object().id().raw(),
         );
+        let store = match arena {
+            Some(ac) => Some(ArenaStore::create(Box::new(FillTo { cap: ac }), cap)?),
+            None => None,
+        };
+        let (arena_dir_raw, arena_locs_raw) = store.as_ref().map_or((0, 0), |s| s.ids());
 
         // Rewrite the root transactionally so the change is synced to the
         // backing store; a raw write would be lost on reboot.
         root.with_tx(|tx| {
             let mut b = tx.base_mut();
             b.magic = MAGIC;
-            b.version = VERSION;
+            b.version = if arena.is_some() {
+                VERSION_ARENA
+            } else {
+                VERSION
+            };
             b.seg_cap = cap as u32;
             b.verts_raw = verts_raw;
             b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
             b.vindex_raw = vindex_raw;
-            // `reset` rebuilds as v3, so any arena ids from a previous v4
-            // incarnation must be cleared — leaving them would make a v3 root
-            // name arenas it does not own.
-            b.arena_dir_raw = 0;
-            b.arena_locs_raw = 0;
+            // Zero on a v3 rebuild: a v3 root must not name arenas it does not
+            // own, and a previous v4 incarnation would have left ids here.
+            b.arena_dir_raw = arena_dir_raw;
+            b.arena_locs_raw = arena_locs_raw;
             Ok(())
         })?;
 

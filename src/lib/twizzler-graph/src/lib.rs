@@ -23,7 +23,7 @@ mod tests;
 
 pub use edge::{EdgeHandle, EdgeId, EdgeInfo};
 pub use error::GraphError;
-pub use graph::{BulkSession, Graph};
+pub use graph::{BulkSession, Graph, DEFAULT_ARENA_CAP};
 pub use props::PropValue;
 pub use arena_store::{ArenaStat, ArenaStore, FillTo, OnePerArena, Placement};
 pub use name::NameKey;
