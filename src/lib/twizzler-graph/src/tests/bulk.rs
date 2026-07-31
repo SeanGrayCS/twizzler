@@ -1,6 +1,6 @@
 use twizzler::object::ObjID;
 
-use super::{fresh, fresh_cap};
+use super::{fresh_v3 as fresh, fresh_cap};
 use crate::{Graph, Labels, VertexId};
 
 #[test]

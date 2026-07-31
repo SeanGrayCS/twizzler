@@ -6,6 +6,20 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
+# `xtask` writes `target.<triple>.rustflags` itself and calls
+# `clear_rustflags()`, so a `RUSTFLAGS --cfg` would clobber the `machine` cfg
+# and break the build — features are the only usable switch.
+[features]
+default = ["test-core"]
+test-all = ["test-core", "test-storage", "test-query"]
+## crud, names, adjacency, persistence — plain semantics, cheapest slice.
+test-core = []
+## arena, arena_graph, sharding, bulk, reclaim — the layout tests, and the
+## v3 holdouts that still spend three referencing objects per vertex.
+test-storage = []
+## dsl, props — traversal and property semantics.
+test-query = []
+
 [dependencies]
 twizzler = { path = "../twizzler" }
 twizzler-abi = "*"

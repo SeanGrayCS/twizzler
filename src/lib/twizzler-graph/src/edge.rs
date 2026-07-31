@@ -43,6 +43,10 @@ pub(crate) struct EdgeRef {
     pub(crate) from_id: u64,
     pub(crate) to_id: u64,
     pub(crate) eobj_raw: u128,
+    /// VERSION 4: the edge's property object. On v3 this stays 0 and the id
+    /// lives in the edge *object* instead — v4 has no edge object, so the
+    /// registry has to carry it.
+    pub(crate) props_raw: u128,
     pub(crate) flags: u32,
 }
 unsafe impl Invariant for EdgeRef {}

@@ -151,6 +151,35 @@ fn arena_matches_legacy_on_properties_and_deletes() {
 }
 
 #[test]
+fn arena_matches_legacy_when_an_edge_is_deleted() {
+    let (mut legacy, mut arena) = pair("deledge");
+    let (hub, spokes) = build(&mut legacy);
+    build(&mut arena);
+
+    // The hub->spokes[0] edge is edge id 0 on both layouts (append indices).
+    let e0 = crate::EdgeId(0);
+    assert_eq!(legacy.edge_info(e0).is_some(), arena.edge_info(e0).is_some());
+
+    legacy.delete_edge(e0).unwrap();
+    arena.delete_edge(e0).unwrap();
+
+    assert!(legacy.edge_info(e0).is_none());
+    assert!(arena.edge_info(e0).is_none());
+    assert_eq!(
+        legacy.out_neighbors(hub, Labels::any()),
+        arena.out_neighbors(hub, Labels::any()),
+        "the deleted edge's neighbour is dropped on both layouts"
+    );
+    assert_eq!(
+        legacy.in_neighbors(spokes[0], Labels::any()),
+        arena.in_neighbors(spokes[0], Labels::any())
+    );
+    // The endpoints themselves survive.
+    assert_eq!(legacy.vertices(), arena.vertices());
+    assert!(arena.vertex_info(spokes[0]).is_some());
+}
+
+#[test]
 fn arena_packs_vertices_and_adds_no_object_per_edge() {
     let name = "t-ab-objects";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");

@@ -214,6 +214,15 @@ impl<'a> VertexView<'a> {
         }
     }
 
+    /// Which direction(s) `which` selects, as `(out, in)`.
+    fn dirs(which: Which) -> (bool, bool) {
+        match which {
+            Which::Out => (true, false),
+            Which::In => (false, true),
+            Which::Both => (true, true),
+        }
+    }
+
     fn collect_neighbors<F: Fn(&VertexHandle) -> bool>(
         &self,
         which: Which,
@@ -221,6 +230,33 @@ impl<'a> VertexView<'a> {
         pred: F,
     ) -> Vec<VertexId> {
         let filter = self.graph.resolve_labels(labels);
+
+        // VERSION 4: adjacency is a chunk chain inside the vertex's arena, so
+        // there is no per-direction object to map and no `InvPtr` to resolve
+        // for a neighbour in the same arena. Liveness of both the source and
+        // each neighbour is already applied by the store's walk.
+        if self.graph.is_arena() {
+            let (o, i) = Self::dirs(which);
+            let mut out = Vec::new();
+            for (_, elabel, nb) in self.graph.arena_adjacency(self.id, o, i) {
+                if !label_matches(&filter, elabel) {
+                    continue;
+                }
+                let Some((label, name)) = self.graph.arena_vertex_key(nb) else {
+                    continue;
+                };
+                let h = VertexHandle {
+                    id: VertexId(nb),
+                    label,
+                    name,
+                };
+                if pred(&h) {
+                    out.push(h.id);
+                }
+            }
+            return out;
+        }
+
         let mut out = Vec::new();
         for raw in self.lists(which) {
             let Ok(obj) = Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(
@@ -261,6 +297,28 @@ impl<'a> VertexView<'a> {
         pred: F,
     ) -> Vec<EdgeId> {
         let filter = self.graph.resolve_labels(labels);
+
+        // VERSION 4: the adjacency entry carries the edge id and label, and the
+        // endpoints come from the shared registry — there is no edge *object*
+        // on this layout to resolve them from.
+        if self.graph.is_arena() {
+            let (o, i) = Self::dirs(which);
+            let mut out = Vec::new();
+            for (eid, elabel, _) in self.graph.arena_adjacency(self.id, o, i) {
+                if !label_matches(&filter, elabel) {
+                    continue;
+                }
+                let Some((label, from, to)) = self.graph.edge_endpoints(EdgeId(eid)) else {
+                    continue;
+                };
+                let h = EdgeHandle::new(EdgeId(eid), label, from, to);
+                if pred(&h) {
+                    out.push(h.id());
+                }
+            }
+            return out;
+        }
+
         let mut out = Vec::new();
         for raw in self.lists(which) {
             let Ok(obj) = Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(

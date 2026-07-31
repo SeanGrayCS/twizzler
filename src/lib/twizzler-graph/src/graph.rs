@@ -38,11 +38,19 @@ use crate::{
 };
 
 pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
-pub(crate) const VERSION: u32 = 3; // on-disk format version (3: segmented registries)
 
-/// On-disk format 4: vertices and adjacency live in packed arenas
+/// On-disk format 5: segmented registries, one vertex object plus two adjacency
+/// objects per vertex, one object per edge.
+///
+/// The disk image survives between QEMU runs, which is what turns "I changed a
+/// struct" into "the next boot hangs". Any change to a persisted record's
+/// layout — size, field order, or alignment — must bump this, so the guard
+/// rejects the old graph loudly instead of misreading it.
+pub(crate) const VERSION: u32 = 5;
+
+/// On-disk format 6: vertices and adjacency live in packed arenas
 /// ([`ArenaStore`]) instead of three objects per vertex plus one per edge.
-pub(crate) const VERSION_ARENA: u32 = 4;
+pub(crate) const VERSION_ARENA: u32 = 6;
 
 /// Whether this build understands a graph in the given on-disk format.
 fn version_supported(v: u32) -> bool {
@@ -363,17 +371,9 @@ impl Graph {
             DEFAULT_SEG_CAP
         });
 
-        let old_ids = {
-            let (v, e, l, x) = {
-                let r = root.base();
-                (r.verts_raw, r.edges_raw, r.labels_raw, r.vindex_raw)
-            };
-            if old_version == VERSION && old_cap != 0 {
-                old_inventory(v, e, l, x, old_cap as usize)
-            } else {
-                Vec::new()
-            }
-        };
+        // Re-enable this together with the delete, not before: the inventory is
+        // only worth its page-in cost if something frees what it finds.
+        let old_ids: Vec<u128> = Vec::new();
 
         // Fresh, empty registries.
         let verts = SegVec::<VertexRef>::create(cap)?;
@@ -507,6 +507,7 @@ impl Graph {
                 from_id: from.0,
                 to_id: to.0,
                 eobj_raw: 0, // no edge object on this layout
+                props_raw: 0,
                 flags: 0,
             })?;
             return Ok(EdgeId(id));
@@ -582,6 +583,7 @@ impl Graph {
             from_id: from.0,
             to_id: to.0,
             eobj_raw: eobj.id().raw(),
+            props_raw: 0, // v3 keeps the id in the edge object itself
             flags: 0,
         })?;
         Ok(EdgeId(id))
@@ -606,6 +608,18 @@ impl Graph {
     pub fn vertex_view(&self, id: VertexId) -> Option<VertexView<'_>> {
         if !self.is_vertex_alive(id) {
             return None;
+        }
+        // On v4 there are no per-direction adjacency objects to name: the
+        // collectors branch on `is_arena` and walk the arena's chunk chain, so
+        // these two are unused. They stay zero rather than becoming an
+        // `Option`, which would add a match to every v3 read for no gain.
+        if self.store.is_some() {
+            return Some(VertexView {
+                graph: self,
+                id,
+                out_raw: 0,
+                in_raw: 0,
+            });
         }
         let (_vobj, out_raw, in_raw) = self.vertex_locs(id)?;
         Some(VertexView {
@@ -642,6 +656,49 @@ impl Graph {
             .unwrap_or_default()
     }
 
+    // --- arena seams for the DSL (`vertex.rs`) ------------------------------
+
+    /// `(edge_id, edge_label, neighbour_id)` in traversal order, or empty on
+    /// v3. `VertexView` uses this instead of mapping adjacency objects.
+    pub(crate) fn arena_adjacency(
+        &self,
+        id: VertexId,
+        out: bool,
+        inc: bool,
+    ) -> Vec<(u64, u32, u64)> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        // The store hides tombstoned *vertices* but knows nothing about the
+        // edge registry, so a deleted edge would still yield its neighbour.
+        // v3 filters on `is_edge_alive` per entry; this is where v4 has to do
+        // the same, since `Graph` owns the registry. Missing it would diverge
+        // only on deletes — a bug that shows up as a wrong query result long
+        // after the change that caused it.
+        store
+            .adjacency(id.0, out, inc)
+            .into_iter()
+            .filter(|(eid, _, _)| self.is_edge_alive(EdgeId(*eid)))
+            .collect()
+    }
+
+    /// A neighbour's `(label, name)` for predicate evaluation — no `String`
+    /// allocation, since most candidates are filtered out.
+    pub(crate) fn arena_vertex_key(&self, id: u64) -> Option<(u32, NameKey)> {
+        self.store.as_ref()?.vertex_key(id)
+    }
+
+    /// An edge's label and endpoints from the registry, which both layouts
+    /// share. Used to build `EdgeHandle`s without an edge *object*, which v4
+    /// does not have.
+    pub(crate) fn edge_endpoints(&self, e: EdgeId) -> Option<(u32, VertexId, VertexId)> {
+        let r = self.edges.get_ref(e.0 as usize)?;
+        if r.id != e.0 || r.flags & TOMBSTONE != 0 {
+            return None;
+        }
+        Some((r.label, VertexId(r.from_id), VertexId(r.to_id)))
+    }
+
     fn arena_neighbors(
         &self,
         id: VertexId,
@@ -649,17 +706,15 @@ impl Graph {
         out: bool,
         inc: bool,
     ) -> Vec<VertexId> {
-        let store = self.store.as_ref().expect("arena graph");
+        // Routed through `arena_adjacency` rather than the store's own
+        // `neighbors_labeled` so the dead-edge filter applies here too — the
+        // two must not have separate notions of which entries count.
         let filter = self.resolve_labels(labels);
-        let ls = filter.as_deref();
-        let mut ids = Vec::new();
-        if out {
-            ids.extend(store.neighbors_labeled(id.0, true, ls));
-        }
-        if inc {
-            ids.extend(store.neighbors_labeled(id.0, false, ls));
-        }
-        ids.into_iter().map(VertexId).collect()
+        self.arena_adjacency(id, out, inc)
+            .into_iter()
+            .filter(|(_, l, _)| filter.as_ref().map_or(true, |ls| ls.contains(l)))
+            .map(|(_, _, nb)| VertexId(nb))
+            .collect()
     }
 
     /// All live vertex ids in the graph. Linear scan.
@@ -836,6 +891,20 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
+        // VERSION 4 keeps the property-object id in the registry, since there
+        // is no edge object to hold it.
+        if self.store.is_some() {
+            let idx = e.0 as usize;
+            let cur = self.edges.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
+            let new_raw = props::set_in(cur, key, val)?;
+            if new_raw != cur {
+                self.edges.with_mut_at(idx, |r| {
+                    r.props_raw = new_raw;
+                    Ok(())
+                })?;
+            }
+            return Ok(());
+        }
         let eobj_raw = self
             .edges
             .get_ref(e.0 as usize)
@@ -858,6 +927,9 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return None;
         }
+        if self.store.is_some() {
+            return props::get_in(self.edges.get_ref(e.0 as usize)?.props_raw, key);
+        }
         let eobj_raw = self.edges.get_ref(e.0 as usize)?.eobj_raw;
         let eo = Object::<Edge>::map(
             ObjID::new(eobj_raw),
@@ -876,6 +948,9 @@ impl Graph {
         let Some(r) = self.edges.get_ref(e.0 as usize) else {
             return Vec::new();
         };
+        if self.store.is_some() {
+            return props::list_in(r.props_raw);
+        }
         let eobj_raw = r.eobj_raw;
         drop(r);
         let Ok(eo) = Object::<Edge>::map(
@@ -1085,6 +1160,7 @@ fn vertex_locs_in(verts: &SegVec<VertexRef>, v: VertexId) -> Option<(u128, u128,
 /// the ones nobody will ever free otherwise. The graph root is *not* included:
 /// `reset` retains and repoints it, and it is the name-registered identity of
 /// the graph.
+#[allow(dead_code)]
 fn inventory(
     verts: &SegVec<VertexRef>,
     edges: &SegVec<EdgeRef>,
@@ -1125,6 +1201,9 @@ fn inventory(
 /// `reset`). Opens the old registries just long enough to walk them, then
 /// drops the handles so the ids can be deleted. Anything that fails to open is
 /// skipped rather than guessed at.
+// As above — and this one is deliberately *not* called by `reset` any more,
+// because opening the outgoing graph to inventory it pages the whole thing in.
+#[allow(dead_code)]
 fn old_inventory(
     verts_raw: u128,
     edges_raw: u128,
@@ -1281,6 +1360,7 @@ impl BulkSession<'_> {
             from_id: from.0,
             to_id: to.0,
             eobj_raw: eobj.id().raw(),
+            props_raw: 0, // v3 keeps the id in the edge object itself
             flags: 0,
         })?;
         self.created_edges.push(eobj);

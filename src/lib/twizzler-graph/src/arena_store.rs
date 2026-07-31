@@ -407,12 +407,27 @@ impl ArenaStore {
         let mut off = if out { v.out_head } else { v.in_head };
         drop(v);
 
+        // Bounded walk. A malformed `next` — a cycle, or an offset misread from
+        // a stale on-disk layout — would otherwise spin here forever with no
+        // output, which is the worst failure mode we have: no panic, no log,
+        // nothing to attribute it to. The bound converts that into a loud,
+        // located failure. `vertex_count` is a true upper bound because a chunk
+        // is only ever allocated by `append_adj`, at most one per entry.
+        let max_chunks = self.locs.len() + 2;
         let mut chunks = Vec::new();
         while off != 0 {
             let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, off);
             let c = unsafe { cgp.resolve() };
             chunks.push((off, c.len as usize));
             off = c.next;
+            if chunks.len() > max_chunks {
+                panic!(
+                    "arena_store: adjacency chain for vertex {vertex} in arena \
+                     {} exceeded {max_chunks} chunks — cycle or corrupt `next` \
+                     (last offset {off:#x})",
+                    loc.arena
+                );
+            }
         }
         chunks.reverse();
 
@@ -494,6 +509,27 @@ impl ArenaStore {
 
     pub fn vertex_label(&self, vertex: u64) -> Option<u32> {
         self.with_vertex(vertex, |v| v.label)
+    }
+
+    /// `(label, name)` without allocating — what a traversal predicate needs
+    /// per candidate, so filtering a large neighbourhood does not build a
+    /// `String` per vertex just to throw it away.
+    pub(crate) fn vertex_key(&self, vertex: u64) -> Option<(u32, NameKey)> {
+        self.with_vertex(vertex, |v| (v.label, v.name))
+    }
+
+    /// `(edge_id, edge_label, neighbour_id)` in traversal order, for the DSL.
+    /// `out`/`inc` select the direction(s); both selected yields out then in,
+    /// matching `VertexView`'s `Which::Both`.
+    pub(crate) fn adjacency(&self, vertex: u64, out: bool, inc: bool) -> Vec<(u64, u32, u64)> {
+        let mut res = Vec::new();
+        if out {
+            self.walk_adj(vertex, true, |e, l, nb| res.push((e, l, nb)));
+        }
+        if inc {
+            self.walk_adj(vertex, false, |e, l, nb| res.push((e, l, nb)));
+        }
+        res
     }
 
     /// The vertex's property-object id (0 = none).

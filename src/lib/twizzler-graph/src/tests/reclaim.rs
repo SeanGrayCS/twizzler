@@ -13,7 +13,7 @@
 
 use twizzler::object::ObjID;
 
-use super::fresh;
+use super::fresh_v3 as fresh;
 use crate::{Graph, Labels, PropValue};
 
 #[test]
