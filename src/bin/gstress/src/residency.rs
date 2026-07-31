@@ -1,15 +1,39 @@
-//!   gstress residency cycle [N] [R]  # decisive: R rounds of N objects,
-//!                                    # dropping every handle between rounds
-//!   gstress residency hold [N]       # ceiling probe: allocate holding all
-//!   gstress residency volatile [N]   # same as hold, non-persistent objects
+//! Residency probes: does dropping an `ObjectHandle` return frames?
+//!
+//! Not unit tests, because frame exhaustion blocks the allocating thread
+//! rather than returning an error — there is nothing to assert on. The
+//! measurement is the console output: a stall is a result, every loop prints
+//! its count as it goes, and the last line before a stall is the ceiling.
+//!
+//! Arms (run each in its own boot — ordering within a boot skews throughput):
+//!
+//!   gstress residency cycle [N] [R]     # R rounds of N objects, dropping every
+//!                                       # handle between rounds
+//!   gstress residency hold [N]          # ceiling probe: allocate holding all
+//!   gstress residency volatile [N]      # same as hold, non-persistent objects
+//!   gstress residency write [N] [E]     # VecObjects, E elements pushed+synced each
+//!   gstress residency ptr [N] [P]       # links holding InvPtrs into a P-object pool
+//!   gstress residency ptrcycle [N] [R]  # as ptr, dropping links between batches
+//!   gstress residency ptrwide [N] [W]   # links holding W InvPtrs each
+//!   gstress residency ctrl [N] [P]      # as ptr, without the InvPtrs (control)
+//!   gstress residency map [N] [R]       # map N objects by id, R rounds, hold none
+//!   gstress residency del [N]           # staged sys_object_ctrl(Delete) probe
+//!
+//! Reading `cycle`: it allocates `N*R` objects in total but never holds more
+//! than `N` at once. Completing all rounds means dropping handles returns
+//! frames; stalling means it does not, and the round number locates the
+//! ceiling. Per-round timing is printed because a slowdown without a stall is
+//! the third possible answer: frames returned lazily, under pressure.
 
 use std::time::Instant;
 
 use twizzler::{
     marker::{BaseType, Invariant},
-    object::{Object, ObjectBuilder, TypedObject},
+    object::{MapFlags, Object, ObjectBuilder, TypedObject},
 };
 
+/// Smallest thing that can own an object. The point is the object, not what
+/// is in it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Cell {
@@ -49,10 +73,11 @@ pub(crate) fn run(arm: Option<&str>, n: usize, rounds: usize) {
         Some("ptrwide") => ptr_wide(n, rounds),
         Some("ctrl") => ctrl_hold(n, rounds),
         Some("map") => map_churn(n, rounds),
+        Some("del") => delete_probe(n),
         Some(other) => {
             println!(
                 "usage: gstress residency \
-                 [cycle|hold|volatile|write|ptr|ptrcycle|ptrwide|ctrl|map] [N] \
+                 [cycle|hold|volatile|write|ptr|ptrcycle|ptrwide|ctrl|map|del] [N] \
                  [R|elems|pool|width] (got '{other}')"
             );
             std::process::exit(2);
@@ -60,10 +85,11 @@ pub(crate) fn run(arm: Option<&str>, n: usize, rounds: usize) {
     }
 }
 
-/// The arm that actually models the engine. `hold`/`cycle` create an object and
-/// write 8 bytes to it; the engine creates an object, pushes many elements into
-/// a `VecObject`, and syncs — which is what fills the pager's *page cache*, and
-/// the page cache is what was at 75% when the suite died.
+/// The arm that models the engine's write path. `hold`/`cycle` create an
+/// object and write 8 bytes to it; the engine creates an object, pushes many
+/// elements into a `VecObject`, and syncs — which is what fills the pager's
+/// page cache. A ceiling far below `hold`'s means the limit is dirty/synced
+/// pages rather than object count, and sync behaviour is the lever.
 fn write_hold(n: usize, elems: usize) {
     use twizzler::collections::vec::{VecObject, VecObjectAlloc};
 
@@ -81,6 +107,9 @@ fn write_hold(n: usize, elems: usize) {
             VecObject::new(ObjectBuilder::default().persist(true)).expect("create vecobject");
         for j in 0..elems {
             v.push(Cell { v: j as u64 }).expect("push");
+            // Heartbeat inside the push loop for the first object. Every push
+            // syncs, so an object can take minutes; without this a slow run is
+            // indistinguishable from a stall until the first per-object line.
             if i == 0 && (j + 1) % STEP == 0 {
                 println!(
                     "residency write: object 1, push {}/{} t={:.1}s (per-push sync: this is \
@@ -191,6 +220,9 @@ fn cycle(n: usize, rounds: usize) {
         );
     }
 
+    // Not a finding on its own. Completing N*R while holding at most N is
+    // evidence of reclaim only if holding N*R at once would have failed --
+    // otherwise the run never applied any pressure and says nothing.
     println!(
         "residency cycle: completed {} objects ({} rounds x {}) in {:.1}s without stalling.",
         n * rounds,
@@ -206,12 +238,16 @@ fn cycle(n: usize, rounds: usize) {
     );
 }
 
-/// The prime suspect. `hold`, `write` and `cycle` all create objects that
-/// reference nothing. The engine is nothing *but* cross-object references: an
-/// edge object holds an `InvPtr` to each endpoint, and every adjacency entry
-/// holds two more. Each `InvPtr` costs an FOT entry, and resolving one requires
-/// the target object mapped — so the resident set may track *references*, not
-/// objects. Nothing we have measured would have caught that.
+/// Cross-object references. `hold`, `write` and `cycle` all create objects
+/// that reference nothing, while the engine is built on cross-object
+/// references: an edge object holds an `InvPtr` to each endpoint, and every
+/// adjacency entry holds two more. Each `InvPtr` costs an FOT entry, and
+/// resolving one requires the target object mapped — so the resident set may
+/// track references, not objects.
+///
+/// Mirrors `Graph::add_edge`: a pool of `pool` target objects, then `n` link
+/// objects each holding two `InvPtr`s into the pool. A ceiling far below
+/// `write`'s at the same `n` means references are the binding cost.
 fn ptr_hold(n: usize, pool: usize) {
     use twizzler::ptr::InvPtr;
 
@@ -281,11 +317,13 @@ fn ptr_hold(n: usize, pool: usize) {
     drop(targets);
 }
 
-/// Is the reference ceiling on *resident* references or on *created* ones?
+/// Is the reference ceiling on resident references or on created ones? If
+/// dropping link objects returns the resource, a bounded working set permits
+/// an arbitrarily large graph.
 ///
 /// `rounds` batches of `n/rounds` links each, dropped between batches: `n`
 /// references created in total, at most `n/rounds` live. Run it with an `n`
-/// well past the ~3 000 wall.
+/// well past where `ptr` stalls.
 fn ptr_cycle(n: usize, rounds: usize) {
     use twizzler::ptr::InvPtr;
 
@@ -366,13 +404,22 @@ fn ptr_cycle(n: usize, rounds: usize) {
     drop(targets);
 }
 
-/// Is the FOT charge per object, or per entry?
+/// Is the FOT charge per object, or per entry? Every link in [`ptr_hold`]
+/// carries exactly two `InvPtr`s, whose FOT entries sit on the same page, so
+/// that arm cannot separate the two. This one varies the width: `n` links of
+/// `W` references each.
 ///
-/// Two design points that would otherwise flatten the curve being measured:
-/// `insert_fot` deduplicates identical entries, so every slot in a link must point
-/// at a *different* target or the object ends up with one FOT entry regardless of
-/// width; and `POOL` is fixed rather than derived from the width, so the target
-/// baseline is identical in every run and drops out of the comparison.
+/// Run at a fixed `n` across several widths, one boot each, and read the
+/// per-link cost from the kernel heartbeat's `a:` delta. Flat across widths
+/// means the charge is per object and packing suffices; linear in width means
+/// it is per entry and cross-arena references must be minimised structurally.
+///
+/// Two design points that would otherwise flatten the curve: `insert_fot`
+/// deduplicates identical entries, so every slot in a link must point at a
+/// different target or the object ends up with one FOT entry regardless of
+/// width; and the target pool is fixed rather than derived from the width, so
+/// the target baseline is identical in every run and drops out of the
+/// comparison.
 fn ptr_wide(n: usize, width: usize) {
     match width {
         1 => wide_hold::<1>(n),
@@ -472,16 +519,15 @@ fn wide_hold<const W: usize>(n: usize) {
     drop(targets);
 }
 
-/// Control for [`ptr_hold`]. `ptr` differs from `write`/`hold` in *two*
-/// ways, not one: it holds `InvPtr`s, and it builds through `build_inplace`
-/// with a transaction instead of plain `build`. This arm is `ptr` with the
+/// Control for [`ptr_hold`]. `ptr` differs from `write`/`hold` in two ways,
+/// not one: it holds `InvPtr`s, and it builds through `build_inplace` with a
+/// transaction instead of plain `build`. This arm is `ptr` with the
 /// references removed and everything else identical — same transactional
 /// creation path, same struct size, same pool walk, two `u64`s where the
 /// `InvPtr`s were.
 ///
-/// If `ctrl` stalls where `ptr` stalled, the cost is transactional object
-/// creation and the `InvPtr` conclusion is wrong. If `ctrl` runs to 10 000 like
-/// `write` did, references are confirmed as the binding constraint.
+/// Stalling where `ptr` stalls pins the cost on transactional creation;
+/// running far past it pins the cost on the references.
 fn ctrl_hold(n: usize, pool: usize) {
     #[repr(C)]
     struct NoLink {
@@ -538,6 +584,84 @@ fn ctrl_hold(n: usize, pool: usize) {
     drop(targets);
 }
 
+/// Staged `sys_object_ctrl(Delete)` probe. The delete path is implemented in
+/// the kernel, and the pager livelocks on a lookup for an object it does not
+/// know however the id arose — so the suspect operation is mapping a deleted
+/// id, not deletion itself. The stages separate the two.
+///
+/// The stages run in increasing order of risk, each printing before it acts,
+/// so the last line before a hang identifies the stage that hangs. Run it and
+/// read the output; do not infer.
+fn delete_probe(n: usize) {
+    use twizzler::object::ObjID;
+    use twizzler_abi::syscall::{sys_object_ctrl, DeleteFlags, ObjectControlCmd};
+
+    fn del(id: ObjID, flags: DeleteFlags) -> bool {
+        sys_object_ctrl(id, ObjectControlCmd::Delete(flags)).is_ok()
+    }
+
+    println!("residency del: A5 re-test, {n} objects per stage");
+    println!("residency del: each stage announces itself first — a hang is attributed");
+    println!("residency del: to the last line printed, not guessed at.");
+
+    // --- Stage 1: delete, never touch the id again -------------------------
+    println!("\nresidency del: STAGE 1 — delete after dropping the handle, never map again");
+    let t = Instant::now();
+    let mut ok = 0;
+    for i in 0..n {
+        let o = make(i as u64, true);
+        let id = o.id();
+        drop(o); // release our handle first; `mark_for_delete` defers teardown
+        if del(id, DeleteFlags::empty()) {
+            ok += 1;
+        }
+    }
+    println!(
+        "residency del: STAGE 1 PASSED — {ok}/{n} deletes accepted in {:.1}s, no hang. \
+         Delete is usable; the 2026-07-11 conclusion was wrong.",
+        t.elapsed().as_secs_f64()
+    );
+
+    // --- Stage 2: delete, then deliberately map the dead id ----------------
+    println!("\nresidency del: STAGE 2 — map a deleted id (the suspected real cause)");
+    println!("residency del: if the loop starts here, the rule is 'never map a freed id',");
+    println!("residency del: which a database maintains by construction.");
+    let o = make(1_000_000, true);
+    let id = o.id();
+    drop(o);
+    let _ = del(id, DeleteFlags::empty());
+    let mapped = Object::<Cell>::map(id, MapFlags::READ | MapFlags::PERSIST).is_ok();
+    println!("residency del: STAGE 2 PASSED — mapping a deleted id returned ok={mapped}");
+
+    // --- Stage 3: delete while a handle is still live -----------------------
+    println!("\nresidency del: STAGE 3 — delete with a live handle, then drop it");
+    let held = make(1_000_001, true);
+    let hid = held.id();
+    let accepted = del(hid, DeleteFlags::empty());
+    println!("residency del: delete-with-live-handle accepted={accepted}");
+    drop(held);
+    println!("residency del: STAGE 3 PASSED — handle dropped after delete, no hang");
+
+    // --- Stage 4: FORCE ------------------------------------------------------
+    println!("\nresidency del: STAGE 4 — DeleteFlags::FORCE (we only ever passed empty())");
+    let o = make(1_000_002, true);
+    let id = o.id();
+    drop(o);
+    let forced = del(id, DeleteFlags::FORCE);
+    println!("residency del: STAGE 4 PASSED — FORCE accepted={forced}");
+
+    println!(
+        "\nGSTRESS FINDING: all four delete stages completed. Record which stages \
+         changed behaviour; stage 1 passing means A5 is unblocked."
+    );
+}
+
+/// Map-by-id churn. `Graph::add_edge` maps four objects by `ObjID` on every
+/// call and drops them at scope end; traversal maps an adjacency object per
+/// step. If the runtime caches handles by id and never evicts, the resident
+/// set grows with distinct ids ever mapped and dropping the handle buys
+/// nothing.
+///
 /// Creates `n` objects, drops every creation handle, then maps each by id
 /// `rounds` times, holding nothing.
 fn map_churn(n: usize, rounds: usize) {
@@ -593,6 +717,9 @@ fn map_churn(n: usize, rounds: usize) {
     );
 }
 
+/// Ceiling probe: allocate holding every handle, so nothing is ever released.
+/// Expected to stall; the last heartbeat is the answer. `persist=false`
+/// separates the pager's cost from the object's.
 fn hold(n: usize, persist: bool) {
     let kind = if persist { "persistent" } else { "volatile" };
     println!(

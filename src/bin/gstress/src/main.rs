@@ -1,6 +1,11 @@
 //! Deliberately NOT part of `cargo start-qemu --tests`, so the default
 //! harness stays fast. Usage, from the Twizzler shell:
 //!
+//! Clear `target/disk-<triple>.img` before any recorded measurement. It is
+//! created only if absent and nothing ever deletes an object, so it carries
+//! every graph every previous run made; a dirty image is not comparable to a
+//! clean one.
+//!
 //! The graph is registered as `data/gstress` and reset at startup, so runs
 //! are idempotent (old registries are orphaned, as with `Graph::reset`).
 
@@ -11,7 +16,7 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-07-28a";
+pub(crate) const HARNESS_REV: &str = "2026-07-30a";
 
 mod indradb_mode;
 mod residency;
@@ -369,7 +374,16 @@ fn main() {
         }
     };
     let mode = std::env::args().nth(2);
-    let use_bulk = mode.as_deref() != Some("nobulk");
+
+    let arena_cap: Option<usize> = mode.as_deref().and_then(|m| {
+        let rest = m.strip_prefix("arena")?;
+        Some(match rest.strip_prefix(':') {
+            Some(c) => c.parse().unwrap_or(twizzler_graph::DEFAULT_ARENA_CAP),
+            None => twizzler_graph::DEFAULT_ARENA_CAP,
+        })
+    });
+
+    let use_bulk = mode.as_deref() != Some("nobulk") && arena_cap.is_none();
     const CHUNK: usize = 500;
 
     if matches!(mode.as_deref(), Some("indradb") | Some("baseline")) {
@@ -382,11 +396,22 @@ fn main() {
         }
         return;
     }
-    stamp(if use_bulk { "native-bulk" } else { "native-nobulk" }, preset);
+    // The layout and the batching mode both belong in the stamp: a result that
+    // does not say which layout produced it cannot be compared to anything.
+    let mode_label = match arena_cap {
+        Some(c) => format!("native-arena:{c}"),
+        None if use_bulk => "native-bulk".to_string(),
+        None => "native-nobulk".to_string(),
+    };
+    stamp(&mode_label, preset);
     println!(
         "gstress: preset {} ({}) (V={} bulkE={} degCap={} churn={} chain={} clique={})",
         preset.name,
-        if use_bulk { "bulk" } else { "nobulk" },
+        match arena_cap {
+            Some(c) => format!("v4 arena, cap={c}"),
+            None if use_bulk => "v3 bulk".to_string(),
+            None => "v3 nobulk".to_string(),
+        },
         preset.vertices,
         preset.bulk_edges,
         preset.degree_cap,
@@ -399,8 +424,16 @@ fn main() {
     let mut st = Stats { fails: 0 };
     let mut next_id: u64 = 0;
 
-    Graph::reset(GRAPH).expect("reset gstress graph");
-    let mut g = Graph::open_or_create(GRAPH).expect("create gstress graph");
+    let mut g = match arena_cap {
+        Some(cap) => {
+            Graph::reset_arena(GRAPH, cap).expect("reset arena graph");
+            Graph::open_or_create_arena(GRAPH, cap).expect("create arena graph")
+        }
+        None => {
+            Graph::reset(GRAPH).expect("reset gstress graph");
+            Graph::open_or_create(GRAPH).expect("create gstress graph")
+        }
+    };
 
     let add_v = |g: &mut Graph, st: &mut Stats, next_id: &mut u64, label: &str, name: &str| {
         let v = g
@@ -903,34 +936,62 @@ fn main() {
     let mut gdone = 0usize;
     for w in 0..preset.degrade_windows {
         let base = gdone;
-        g.bulk(|b| {
-            for j in 0..preset.degrade_batch {
-                let v = b.add_vertex("g", &format!("g{}_{}", w, j), ObjID::new(0))?;
-                if v.0 != next_id {
-                    st.fail(format!("vertex id drift: got {}, expected {}", v.0, next_id));
+        // `bulk` is a v3 construct and now refuses on v4 (see `Graph::bulk`).
+        // The arena layout batches by construction, so the direct path here is
+        // the like-for-like comparison, not a slower one.
+        if use_bulk {
+            g.bulk(|b| {
+                for j in 0..preset.degrade_batch {
+                    let v = b.add_vertex("g", &format!("g{}_{}", w, j), ObjID::new(0))?;
+                    if v.0 != next_id {
+                        st.fail(format!("vertex id drift: got {}, expected {}", v.0, next_id));
+                    }
+                    next_id += 1;
                 }
-                next_id += 1;
+                Ok(())
+            })
+            .expect("degrade probe batch");
+        } else {
+            for j in 0..preset.degrade_batch {
+                add_v(&mut g, &mut st, &mut next_id, "g", &format!("g{}_{}", w, j));
             }
-            Ok(())
-        })
-        .expect("degrade probe batch");
+        }
         gdone = base + preset.degrade_batch;
         prog.tick(gdone, gtotal);
     }
     prog.summarize();
     report("G:degrade", gtotal, t);
 
-    // --- Summary --------------------------------------------------------------
+    let sync_t = Instant::now();
+    if let Err(e) = g.sync() {
+        println!("GSTRESS: final sync failed: {e:?}");
+        st.fails += 1;
+    }
+    let sync_secs = sync_t.elapsed().as_secs_f64();
+
     let secs = total.elapsed().as_secs_f64();
     println!(
-        "GSTRESS {}: preset {} — {} vertices, hub degree {} (+{} same-target), {:.1}s total",
+        "GSTRESS {}: preset {} — {} vertices, hub degree {} (+{} same-target), {:.1}s total \
+         ({:.2}s of it the final sync)",
         if st.fails == 0 { "OK" } else { "FAILED" },
         preset.name,
         next_id,
         hub_deg,
         hub2_deg,
-        secs
+        secs,
+        sync_secs
     );
+    if g.is_arena() {
+        println!(
+            "GSTRESS ARENA: {} arenas for {} vertices ({:.4} objects/vertex), {} syncs; \
+             v3 would have spent ~{} objects (3/vertex + 1/edge)",
+            g.arena_count(),
+            next_id,
+            g.arena_count() as f64 / next_id.max(1) as f64,
+            g.arena_sync_count(),
+            next_id * 3 + preset.bulk_edges as u64
+        );
+    }
     if st.fails > 0 {
         println!("GSTRESS: {} verification failure(s)", st.fails);
         std::process::exit(1);
