@@ -1095,6 +1095,9 @@ impl Graph {
     }
 
     pub fn bulk<R>(&mut self, f: impl FnOnce(&mut BulkSession<'_>) -> Result<R>) -> Result<R> {
+        if self.store.is_some() {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
         let Graph {
             verts,
             edges,

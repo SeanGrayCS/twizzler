@@ -213,6 +213,24 @@ fn arena_packs_vertices_and_adds_no_object_per_edge() {
 }
 
 #[test]
+fn bulk_is_refused_on_the_arena_layout() {
+    let name = "t-ab-bulk";
+    Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
+    let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+
+    let r = g.bulk(|b| b.add_vertex("n", "b", ObjID::new(0)));
+    assert!(r.is_err(), "bulk on v4 must error, not silently misplace");
+
+    // The refusal leaves the graph untouched — no half-written vertex, and the
+    // next real insert still gets the next id.
+    assert_eq!(g.vertices(), vec![a]);
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    assert_eq!(b.0, a.0 + 1, "ids continue normally after a refused bulk");
+    assert_eq!(g.find_vertex("n", "b"), Some(b));
+}
+
+#[test]
 fn arena_graph_reopens_in_its_own_format() {
     let name = "t-ab-reopen";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
