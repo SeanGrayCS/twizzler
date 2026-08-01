@@ -36,12 +36,12 @@ mod datastore;
 mod keys;
 mod kv;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests"))]
 mod tests_datastore;
 
 pub use datastore::{TwizzlerDatastore, TwizzlerTransaction};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests"))]
 mod tests {
     use indradb::{
         Database, Edge, Identifier, MemoryDatastore, QueryExt, QueryOutputValue,

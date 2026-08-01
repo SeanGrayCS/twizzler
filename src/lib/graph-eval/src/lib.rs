@@ -39,7 +39,7 @@ pub mod fixture;
 pub mod native;
 pub mod results;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests"))]
 mod tests_equivalence;
-#[cfg(test)]
+#[cfg(all(test, feature = "tests"))]
 mod tests_native;

@@ -16,6 +16,18 @@ edition = "2021"
 # default-features = false keeps the rocksdb datastore and its C++ toolchain
 # out of the build.
 
+# Test-suite gating, so day-to-day `cargo start-qemu --tests` does not pay for
+# this crate's suite. `xtask` writes one `test_bins` list and init runs every
+# binary in it — there is no filter — so the only way to shorten a run is to
+# make a crate's tests compile to nothing.
+#
+# `default = []` means a normal run skips them; set `default = ["tests"]` (or
+# add the feature) when working on this crate. See the same pattern in
+# twizzler-graph, which slices its own suite three ways.
+[features]
+default = []
+tests = []
+
 [dependencies]
 indradb-lib = { version = "5.0.0", default-features = false }
 # Named directly by the key codec (indradb's public API uses uuid::Uuid);

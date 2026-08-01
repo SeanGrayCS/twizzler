@@ -346,6 +346,210 @@ fn main() {
         return;
     }
 
+    // The two phases are separate processes in separate boots by construction:
+    // there is no way for `verify` to see anything `seed` left in memory.
+    if matches!(arg1.as_deref(), Some("seed") | Some("verify")) {
+        let verify = arg1.as_deref() == Some("verify");
+        let n = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5000);
+        const DUR: &str = "gdurable";
+        println!(
+            "GSTRESS STAMP harness={} mode={} N={}",
+            HARNESS_REV,
+            if verify { "verify" } else { "seed" },
+            n
+        );
+        let mut st = Stats { fails: 0 };
+
+        if !verify {
+            Graph::reset_arena(DUR, twizzler_graph::DEFAULT_ARENA_CAP).expect("reset");
+            let mut g = Graph::open_or_create_arena(DUR, twizzler_graph::DEFAULT_ARENA_CAP)
+                .expect("open");
+            let mut ids = Vec::with_capacity(n);
+            for i in 0..n {
+                ids.push(
+                    g.add_vertex("d", &format!("v{i}"), ObjID::new(i as u128))
+                        .expect("add_vertex"),
+                );
+            }
+            for i in 0..n.saturating_sub(1) {
+                g.add_edge(ids[i], "e", ids[i + 1]).expect("add_edge");
+            }
+            // A property on every 5th, a tombstone on every 7th, so `verify`
+            // checks live records, deleted ones, and properties.
+            for i in (0..n).step_by(5) {
+                g.set_vertex_prop(ids[i], "k", twizzler_graph::PropValue::I64(i as i64))
+                    .expect("set prop");
+            }
+            for i in (0..n).step_by(7) {
+                g.delete_vertex(ids[i]).expect("delete");
+            }
+            g.sync().expect("sync");
+
+            // Reopen mid-seed, then keep writing. This is the shape that
+            // lost the arena directory: a store is dropped and reopened, and
+            // the *reopened* instance grows the graph. Writes made through the
+            // second instance have to be durable even though the first
+            // instance created the structures they live in. Without this, the
+            // check passes on a store whose registries were only ever written
+            // by one instance — which is what let the bug through.
+            drop(g);
+            let mut g = Graph::open_or_create(DUR).expect("mid-seed reopen");
+            let base = ids.len();
+            for i in 0..n / 4 {
+                let v = g
+                    .add_vertex("d2", &format!("w{i}"), ObjID::new(i as u128))
+                    .expect("add_vertex after reopen");
+                ids.push(v);
+            }
+            for i in 0..(n / 4).saturating_sub(1) {
+                g.add_edge(ids[base + i], "e2", ids[base + i + 1])
+                    .expect("add_edge after reopen");
+            }
+            g.sync().expect("sync after reopen");
+            println!(
+                "GSTRESS SEED: {} vertices ({} arenas), every 5th has a property, \
+                 every 7th deleted, {} more added through a reopened handle. \
+                 Now reboot and run `gstress verify {n}`.",
+                ids.len(),
+                g.arena_count(),
+                n / 4
+            );
+            return;
+        }
+
+        // --- verify, in a fresh boot -------------------------------------
+        let g = match Graph::open_or_create(DUR) {
+            Ok(g) => g,
+            Err(e) => {
+                println!("GSTRESS DURABILITY FAILED: cannot open the seeded graph: {e:?}");
+                std::process::exit(1);
+            }
+        };
+        st.ck(g.is_arena(), || "seeded graph did not come back as v4".into());
+        // The `w*` vertices were written through a reopened handle; if the
+        // registries created by the first handle did not reach disk, these are
+        // the ones that vanish.
+        let post = n / 4;
+        for i in (0..post).step_by(23) {
+            let v = VertexId((n + i) as u64);
+            st.ck(
+                g.vertex_info(v).map(|inf| inf.name) == Some(format!("w{i}")),
+                || format!("w{i} (written after a mid-seed reopen) did not survive"),
+            );
+        }
+        let expect_live = (0..n).filter(|i| i % 7 != 0).count() + post;
+        let live = g.vertices().len();
+        st.ck(live == expect_live, || {
+            format!("live vertices: got {live}, expected {expect_live}")
+        });
+        println!("GSTRESS VERIFY: {} arenas recovered", g.arena_count());
+        st.ck(g.arena_count() > 0, || {
+            "arena directory came back empty — the store's arenas did not reach disk".into()
+        });
+
+        for i in (0..n).step_by(97) {
+            let v = VertexId(i as u64);
+            if i % 7 == 0 {
+                st.ck(g.vertex_info(v).is_none(), || {
+                    format!("v{i} was deleted before the reboot but came back")
+                });
+                continue;
+            }
+            match g.vertex_info(v) {
+                Some(info) => {
+                    st.ck(info.name == format!("v{i}"), || {
+                        format!("v{i} name: got {}", info.name)
+                    });
+                    st.ck(info.target == ObjID::new(i as u128), || {
+                        format!("v{i} target did not survive")
+                    });
+                }
+                None => st.fail(format!("v{i} missing after reboot")),
+            }
+            if i % 5 == 0 {
+                st.ck(
+                    g.get_vertex_prop(v, "k") == Some(twizzler_graph::PropValue::I64(i as i64)),
+                    || format!("v{i} property did not survive"),
+                );
+            }
+            // Adjacency: i-1 -> i unless either end was deleted.
+            if i > 0 && (i - 1) % 7 != 0 {
+                let got = g.in_neighbors(v, Labels::any());
+                st.ck(got.contains(&VertexId(i as u64 - 1)), || {
+                    format!("v{i} lost its inbound edge from v{}", i - 1)
+                });
+            }
+        }
+
+        if st.fails == 0 {
+            println!("GSTRESS DURABILITY OK: {n} vertices survived a reboot intact.");
+        } else {
+            println!("GSTRESS DURABILITY FAILED: {} check(s)", st.fails);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if arg1.as_deref() == Some("destroy") {
+        let n = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(200);
+        let rounds = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+        let control = std::env::args().nth(4).as_deref() == Some("reset");
+        println!(
+            "GSTRESS STAMP harness={} mode={} N={} R={}",
+            HARNESS_REV,
+            if control { "destroy-control-reset" } else { "destroy" },
+            n,
+            rounds
+        );
+        let t = Instant::now();
+        let mut freed_total = 0usize;
+        for r in 1..=rounds {
+            Graph::reset_arena("gdestroy", twizzler_graph::DEFAULT_ARENA_CAP)
+                .expect("reset arena graph");
+            {
+                let mut g =
+                    Graph::open_or_create_arena("gdestroy", twizzler_graph::DEFAULT_ARENA_CAP)
+                        .expect("open arena graph");
+                let mut ids = Vec::with_capacity(n);
+                for i in 0..n {
+                    ids.push(
+                        g.add_vertex("d", &format!("d{r}_{i}"), ObjID::new(0))
+                            .expect("add_vertex"),
+                    );
+                }
+                for i in 0..n.saturating_sub(1) {
+                    g.add_edge(ids[i], "e", ids[i + 1]).expect("add_edge");
+                }
+                g.sync().expect("sync");
+            }
+            let freed = if control {
+                0
+            } else {
+                Graph::destroy("gdestroy").expect("destroy")
+            };
+            freed_total += freed;
+            println!(
+                "GSTRESS DESTROY: round {r}/{rounds} freed {freed} objects, t={:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        println!(
+            "GSTRESS DESTROY: {rounds} cycles x {n} vertices, {freed_total} objects freed \
+             total in {:.1}s. Now measure the disk image on the host — that is the result.",
+            t.elapsed().as_secs_f64()
+        );
+        return;
+    }
+
     let scaled_preset;
     let preset: &Preset = match arg1.as_deref() {
         None | Some("small") => &SMALL,
@@ -718,6 +922,12 @@ fn main() {
 
     // --- Phase E: reopen by name, re-verify by sampling ---------------------
     let t = Instant::now();
+    // Sync before dropping. On v4 nothing is durable until `sync()`, so a bare
+    // drop discards the batch — and worse, it used to strand the registries'
+    // dirty flags, which is how the arena directory came back empty on the
+    // next boot. The library no longer depends on that (see `SegVec::flush`),
+    // but dropping an unsynced graph is still throwing writes away.
+    g.sync().expect("sync before reopen");
     drop(g);
     let mut g = Graph::open_or_create(GRAPH).expect("reopen gstress graph");
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {

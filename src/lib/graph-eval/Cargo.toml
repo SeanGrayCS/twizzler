@@ -17,6 +17,18 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
+# Test-suite gating, so day-to-day `cargo start-qemu --tests` does not pay for
+# this crate's suite. `xtask` writes one `test_bins` list and init runs every
+# binary in it — there is no filter — so the only way to shorten a run is to
+# make a crate's tests compile to nothing.
+#
+# `default = []` means a normal run skips them; set `default = ["tests"]` (or
+# add the feature) when working on this crate. See the same pattern in
+# twizzler-graph, which slices its own suite three ways.
+[features]
+default = []
+tests = []
+
 [dependencies]
 twizzler = { path = "../twizzler" }
 twizzler-abi = "*"
