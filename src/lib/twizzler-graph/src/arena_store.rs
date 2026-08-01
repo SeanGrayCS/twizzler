@@ -97,12 +97,15 @@ pub(crate) struct AdjChunk {
 }
 unsafe impl Invariant for AdjChunk {}
 
-/// Where a vertex lives: which arena, and at what offset within it.
+/// Where a vertex lives: which arena, at what offset, and whether it is alive.
+///
+/// The duplication is real and must be maintained: `delete_vertex` is the only
+/// writer and sets both. `arena_liveness_mirrors_the_record` pins it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct VertexLoc {
     pub(crate) arena: u32,
-    pub(crate) _pad: u32,
+    pub(crate) flags: u32,
     pub(crate) off: u64,
 }
 unsafe impl Invariant for VertexLoc {}
@@ -199,14 +202,37 @@ impl ArenaStore {
             let raw = dir.get_ref(i).map(|e| e.raw).unwrap_or(0);
             open.push(ArenaObject::from_objid(ObjID::new(raw))?);
         }
+        // Consistency check on reopen. `locs` names arenas by position, so a
+        // registry describing vertices in arenas the directory does not list is
+        // unusable — every lookup would index past the end. Refuse here, where
+        // the cause is visible, rather than panicking later in whatever path
+        // happens to touch a vertex first.
+        if locs.len() > 0 && open.is_empty() {
+            eprintln!(
+                "twizzler-graph: arena store inconsistent — {} vertices in registry, \
+                 0 arenas in directory (dir={dir_raw:#x} locs={locs_raw:#x}); refusing to open",
+                locs.len()
+            );
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        }
+
         // Rebuild per-arena counts from the location registry.
         let mut stats = vec![ArenaStat { vertices: 0 }; open.len()];
+        let mut stray = 0usize;
         for i in 0..locs.len() {
             if let Some(l) = locs.get_ref(i) {
-                if let Some(s) = stats.get_mut(l.arena as usize) {
-                    s.vertices += 1;
+                match stats.get_mut(l.arena as usize) {
+                    Some(s) => s.vertices += 1,
+                    None => stray += 1,
                 }
             }
+        }
+        if stray > 0 {
+            eprintln!(
+                "twizzler-graph: arena store has {stray} vertices naming arenas beyond the \
+                 directory's {} entries (dir={dir_raw:#x})",
+                open.len()
+            );
         }
         let txs = (0..open.len()).map(|_| None).collect();
         Ok(ArenaStore {
@@ -218,6 +244,30 @@ impl ArenaStore {
             policy,
             syncs: 0,
         })
+    }
+
+    /// Every object this store owns: the arena directory, the location
+    /// registry, each arena, and each vertex's property object.
+    ///
+    /// Walking the vertices to collect `props_raw` pages the arenas in, which
+    /// is wasted work if the caller is not about to free them — so this is for
+    /// teardown only. It is cheap in the way that matters: arena count is
+    /// `vertices/cap`, not `vertices`.
+    pub fn owned_object_ids(&self) -> Vec<u128> {
+        let mut ids = self.dir.object_ids();
+        ids.extend(self.locs.object_ids());
+        ids.extend(self.open.iter().map(|a| a.object().id().raw()));
+        for id in 0..self.locs.len() as u64 {
+            // Tombstoned vertices included: their property objects are exactly
+            // the ones nothing else will ever free.
+            if let Some(gp) = self.vertex_ptr(id) {
+                let p = unsafe { gp.resolve() }.props_raw;
+                if p != 0 {
+                    ids.push(p);
+                }
+            }
+        }
+        ids
     }
 
     pub fn arena_count(&self) -> usize {
@@ -254,13 +304,21 @@ impl ArenaStore {
         self.syncs
     }
 
+    /// Panics if `idx` is out of range — callers that may hold an untrusted
+    /// index must use [`Self::try_arena_id`].
     fn arena_id(&self, idx: usize) -> ObjID {
         self.open[idx].object().id()
     }
 
+    /// Bounds-checked arena lookup, for paths reading a *persisted* index.
+    fn try_arena_id(&self, idx: usize) -> Option<ObjID> {
+        self.open.get(idx).map(|a| a.object().id())
+    }
+
     fn vertex_ptr(&self, id: u64) -> Option<GlobalPtr<ArenaVertex>> {
         let loc = self.locs.get_ref(id as usize)?;
-        Some(GlobalPtr::new(self.arena_id(loc.arena as usize), loc.off))
+        let aid = self.try_arena_id(loc.arena as usize)?;
+        Some(GlobalPtr::new(aid, loc.off))
     }
 
     /// Add a vertex, letting the policy choose its arena.
@@ -286,7 +344,7 @@ impl ArenaStore {
         };
         self.locs.push_nosync(VertexLoc {
             arena: idx as u32,
-            _pad: 0,
+            flags: 0,
             off,
         })?;
         self.stats[idx].vertices += 1;
@@ -497,7 +555,9 @@ impl ArenaStore {
 
     /// Whether the vertex exists and is not tombstoned.
     pub fn is_alive(&self, vertex: u64) -> bool {
-        self.with_vertex(vertex, |_| ()).is_some()
+        self.locs
+            .get_ref(vertex as usize)
+            .map_or(false, |l| l.flags & TOMBSTONE == 0)
     }
 
     /// `(label, name, target)` — the old `VertexInfo` triple.
@@ -551,12 +611,19 @@ impl ArenaStore {
         Ok(())
     }
 
-    /// All live vertex ids. Linear over the location registry, as `Graph`'s
-    /// `vertices()` is linear over its registry today.
+    /// All live vertex ids — a linear walk of `locs`, touching no arena.
     pub fn vertices(&self) -> Vec<u64> {
-        (0..self.locs.len() as u64)
-            .filter(|id| self.is_alive(*id))
-            .collect()
+        let mut out = Vec::new();
+        for id in 0..self.locs.len() {
+            if self
+                .locs
+                .get_ref(id)
+                .map_or(false, |l| l.flags & TOMBSTONE == 0)
+            {
+                out.push(id as u64);
+            }
+        }
+        out
     }
 
     /// Live vertices carrying `label`. Linear scan, matching `Graph`.
@@ -577,14 +644,30 @@ impl ArenaStore {
         Some(v.name.as_str().to_string())
     }
 
+    /// Tombstone a vertex in both places: the arena record (authoritative,
+    /// and what adjacency walks see when they resolve a neighbour) and the
+    /// location registry (what scans read without resolving).
+    ///
+    /// The duplication exists for the scan path; this is its only writer, so
+    /// the two cannot drift unless someone adds a second one.
+    /// `arena_liveness_mirrors_the_record` fails loudly if they do.
     pub fn delete_vertex(&mut self, vertex: u64) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Ok(());
         };
         let gp: GlobalPtr<ArenaVertex> =
             GlobalPtr::new(self.arena_id(loc.arena as usize), loc.off);
-        let mut v = unsafe { gp.resolve_mut() };
-        v.flags |= TOMBSTONE;
+        {
+            let mut v = unsafe { gp.resolve_mut() };
+            v.flags |= TOMBSTONE;
+        }
+        // nosync: `with_mut_at` would sync the registry on every delete, which
+        // measured 2.5× on the churn phase. Drained by `sync_all`'s
+        // `locs.flush()`, like every other write here.
+        self.locs.with_mut_at_nosync(vertex as usize, |l| {
+            l.flags |= TOMBSTONE;
+            Ok(())
+        })?;
         Ok(())
     }
 

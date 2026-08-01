@@ -231,6 +231,72 @@ fn bulk_is_refused_on_the_arena_layout() {
 }
 
 #[test]
+fn destroy_frees_the_graph_and_refuses_reopen() {
+    let name = "t-ab-destroy";
+    Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
+    let arenas = {
+        let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
+        let (hub, spokes) = build(&mut g);
+        g.set_vertex_prop(hub, "k", PropValue::I64(1)).unwrap();
+        g.set_edge_prop(crate::EdgeId(0), "w", PropValue::I64(2))
+            .unwrap();
+        assert!(!spokes.is_empty());
+        g.sync().unwrap();
+        g.arena_count()
+    };
+    assert!(arenas >= 1);
+
+    let freed = Graph::destroy(name).expect("destroy");
+    // Arenas, both store registries, the edge/label/vertex registries, the
+    // index, and both property objects — comfortably more than the arenas.
+    assert!(
+        freed > arenas,
+        "destroy freed {freed} objects, expected more than {arenas} arenas"
+    );
+
+    // The name is still bound (data/ entries cannot be removed), but the root
+    // is no longer a graph, so opening refuses instead of reading freed ids.
+    assert!(
+        Graph::open_or_create(name).is_err(),
+        "a destroyed graph must not open"
+    );
+    // Idempotent.
+    assert_eq!(Graph::destroy(name).expect("second destroy"), 0);
+
+    // The name is reusable via an explicit reset, which rebuilds in place.
+    // This is why `destroy` marks the root rather than zeroing it: the root
+    // survives in the disk image, so a zeroed one would burn the name in every
+    // future boot too.
+    Graph::reset_arena(name, ARENA_CAP).expect("rebuild after destroy");
+    let g = Graph::open_or_create(name).expect("reopen after rebuild");
+    assert!(g.is_arena());
+    assert!(g.vertices().is_empty());
+}
+
+#[test]
+fn destroy_cycles_do_not_accumulate() {
+    let name = "t-ab-cycle";
+    let mut freed_each = Vec::new();
+    for _ in 0..4 {
+        Graph::reset_arena(name, ARENA_CAP).expect("reset");
+        {
+            let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open");
+            build(&mut g);
+            g.sync().unwrap();
+        }
+        freed_each.push(Graph::destroy(name).expect("destroy"));
+    }
+    // Every cycle frees the same amount: the workload is identical, so a
+    // growing figure would mean a cycle is inheriting the previous one's
+    // objects instead of freeing its own.
+    assert!(
+        freed_each.windows(2).all(|w| w[0] == w[1]),
+        "per-cycle frees drifted: {freed_each:?}"
+    );
+    assert!(freed_each[0] > 0);
+}
+
+#[test]
 fn arena_graph_reopens_in_its_own_format() {
     let name = "t-ab-reopen";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");

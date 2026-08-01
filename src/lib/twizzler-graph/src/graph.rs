@@ -39,6 +39,17 @@ use crate::{
 
 pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
 
+/// Magic of a root whose graph has been [`destroyed`](Graph::destroy).
+///
+/// A destroyed root cannot simply be zeroed: `data/` names cannot be unbound on
+/// this build, so the root outlives the graph, and a zeroed one is
+/// indistinguishable from "not our object" — which made `reset` refuse it and
+/// the name unusable forever, across boots, since the root persists in the
+/// disk image. A distinct marker keeps three states apart: a live graph, our
+/// destroyed root (rebuildable in place), and something that was never ours
+/// (must not be touched).
+pub(crate) const MAGIC_DESTROYED: u64 = MAGIC ^ 0xFFFF_FFFF_FFFF_FFFF;
+
 /// On-disk format 5: segmented registries, one vertex object plus two adjacency
 /// objects per vertex, one object per edge.
 ///
@@ -50,7 +61,7 @@ pub(crate) const VERSION: u32 = 5;
 
 /// On-disk format 6: vertices and adjacency live in packed arenas
 /// ([`ArenaStore`]) instead of three objects per vertex plus one per edge.
-pub(crate) const VERSION_ARENA: u32 = 6;
+pub(crate) const VERSION_ARENA: u32 = 7;
 
 /// Whether this build understands a graph in the given on-disk format.
 fn version_supported(v: u32) -> bool {
@@ -347,6 +358,95 @@ impl Graph {
         Self::reset_inner_fmt(name, cap, None)
     }
 
+    /// The name is not unbound, because `data/` entries cannot be removed
+    /// on this build. The root object is retained and its magic cleared, which
+    /// makes it (a) unmistakably not a graph, so a later `open_or_create`
+    /// refuses rather than reading freed ids, and (b) one leaked object per
+    /// destroyed name instead of a whole graph. Re-using the name needs an
+    /// explicit `reset`/`reset_arena`, which rebuilds in place.
+    pub fn destroy(name: &str) -> Result<usize> {
+        let mut namer = static_naming_factory().expect("naming service available");
+        let path = format!("data/{name}");
+        let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
+            return Ok(0); // nothing registered
+        };
+        let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
+        let (is_graph, version, cap, v, e, l, x, ad, al) = {
+            let r = root.base();
+            (
+                r.magic == MAGIC,
+                r.version,
+                r.seg_cap as usize,
+                r.verts_raw,
+                r.edges_raw,
+                r.labels_raw,
+                r.vindex_raw,
+                r.arena_dir_raw,
+                r.arena_locs_raw,
+            )
+        };
+        if !is_graph {
+            // Already destroyed (magic is `MAGIC_DESTROYED`), or never ours.
+            // Idempotent either way, and safe: a destroyed root's registry ids
+            // are zeroed, so there is nothing left to chase.
+            return Ok(0);
+        }
+        if !version_supported(version) || cap == 0 {
+            // Refuse rather than delete objects named by a layout we cannot
+            // read correctly.
+            return Err(GraphError::StaleVersion {
+                found: version,
+                expected: VERSION,
+            });
+        }
+
+        let mut ids = match version {
+            VERSION => inventory_raw(v, e, l, x, cap),
+            _ => {
+                let mut ids = Vec::new();
+                if let Ok(store) = ArenaStore::open(
+                    ad,
+                    al,
+                    Box::new(FillTo {
+                        cap: DEFAULT_ARENA_CAP,
+                    }),
+                    cap,
+                ) {
+                    ids.extend(store.owned_object_ids());
+                }
+                ids.extend(edge_registry_ids(e, cap));
+                if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
+                    ids.extend(sv.object_ids());
+                }
+                if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
+                    ids.extend(sv.object_ids());
+                }
+                ids.push(x);
+                ids
+            }
+        };
+        // Guard against a double-free: an id reachable two ways (a shared
+        // property object, say) would otherwise be deleted twice.
+        ids.sort_unstable();
+        ids.dedup();
+
+        // Mark the root dead *before* freeing, so an interruption leaves a root
+        // that refuses to open rather than one naming freed objects.
+        root.with_tx(|tx| {
+            let mut b = tx.base_mut();
+            b.magic = MAGIC_DESTROYED;
+            b.verts_raw = 0;
+            b.edges_raw = 0;
+            b.labels_raw = 0;
+            b.vindex_raw = 0;
+            b.arena_dir_raw = 0;
+            b.arena_locs_raw = 0;
+            Ok(())
+        })?;
+
+        Ok(reclaim::delete_all(ids))
+    }
+
     /// `arena` is `Some(cap)` to rebuild on VERSION 4, `None` for VERSION 3.
     fn reset_inner_fmt(name: &str, cap: Option<usize>, arena: Option<usize>) -> Result<()> {
         let mut namer = static_naming_factory().expect("naming service available");
@@ -358,10 +458,19 @@ impl Graph {
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
         // Only clobber something that is actually one of our graphs; trust the
         // stored capacity only if the root has the current layout.
+        // A destroyed root is ours and rebuildable in place; only a root that
+        // was never ours is refused. Without this, `destroy` would burn the
+        // name permanently — the root survives in the disk image, so the next
+        // boot inherits the refusal too.
         let (is_graph, old_version, old_cap) = {
             let r = root.base();
-            (r.magic == MAGIC, r.version, r.seg_cap)
+            (
+                r.magic == MAGIC || r.magic == MAGIC_DESTROYED,
+                r.version,
+                r.seg_cap,
+            )
         };
+        let was_destroyed = root.base().magic == MAGIC_DESTROYED;
         if !is_graph {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
@@ -371,9 +480,55 @@ impl Graph {
             DEFAULT_SEG_CAP
         });
 
-        // Re-enable this together with the delete, not before: the inventory is
-        // only worth its page-in cost if something frees what it finds.
-        let old_ids: Vec<u128> = Vec::new();
+        let old_ids = {
+            let (v, e, l, x, ad, al) = {
+                let r = root.base();
+                (
+                    r.verts_raw,
+                    r.edges_raw,
+                    r.labels_raw,
+                    r.vindex_raw,
+                    r.arena_dir_raw,
+                    r.arena_locs_raw,
+                )
+            };
+            match old_version {
+                // A destroyed root already freed everything and zeroed its
+                // registry ids; walking them would chase freed objects.
+                _ if was_destroyed => Vec::new(),
+                // v3: three objects per vertex, one per edge, plus registries.
+                VERSION if old_cap != 0 => old_inventory(v, e, l, x, old_cap as usize),
+                // v4: arenas plus registries. The `verts` registry exists but
+                // is unused, and is freed with the rest.
+                VERSION_ARENA if old_cap != 0 => {
+                    let cap = old_cap as usize;
+                    let mut ids = Vec::new();
+                    if let Ok(store) = ArenaStore::open(
+                        ad,
+                        al,
+                        Box::new(FillTo {
+                            cap: DEFAULT_ARENA_CAP,
+                        }),
+                        cap,
+                    ) {
+                        ids.extend(store.owned_object_ids());
+                    }
+                    ids.extend(edge_registry_ids(e, cap));
+                    if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
+                        ids.extend(sv.object_ids());
+                    }
+                    if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
+                        ids.extend(sv.object_ids());
+                    }
+                    ids.push(x);
+                    ids
+                }
+                // An unrecognised format is left alone rather than guessed at:
+                // deleting objects named by a layout we cannot read is how a
+                // live graph gets destroyed.
+                _ => Vec::new(),
+            }
+        };
 
         // Fresh, empty registries.
         let verts = SegVec::<VertexRef>::create(cap)?;
@@ -414,7 +569,7 @@ impl Graph {
             Ok(())
         })?;
 
-        let _ = old_ids;
+        reclaim::delete_all(old_ids);
         Ok(())
     }
 
@@ -1163,7 +1318,26 @@ fn vertex_locs_in(verts: &SegVec<VertexRef>, v: VertexId) -> Option<(u128, u128,
 /// the ones nobody will ever free otherwise. The graph root is *not* included:
 /// `reset` retains and repoints it, and it is the name-registered identity of
 /// the graph.
-#[allow(dead_code)]
+/// The edge registry's own objects plus every edge property object.
+///
+/// v4 keeps `props_raw` in `EdgeRef`, so this needs no edge *objects* — which
+/// is why it is separate from [`inventory`], whose v3 form has to map each edge
+/// object to find the same id.
+fn edge_registry_ids(edges_raw: u128, cap: usize) -> Vec<u128> {
+    let Ok(edges) = SegVec::<EdgeRef>::open(edges_raw, cap) else {
+        return Vec::new();
+    };
+    let mut ids = edges.object_ids();
+    for i in 0..edges.len() {
+        if let Some(r) = edges.get_ref(i) {
+            if r.props_raw != 0 {
+                ids.push(r.props_raw);
+            }
+        }
+    }
+    ids
+}
+
 fn inventory(
     verts: &SegVec<VertexRef>,
     edges: &SegVec<EdgeRef>,
@@ -1204,9 +1378,19 @@ fn inventory(
 /// `reset`). Opens the old registries just long enough to walk them, then
 /// drops the handles so the ids can be deleted. Anything that fails to open is
 /// skipped rather than guessed at.
-// As above — and this one is deliberately *not* called by `reset` any more,
-// because opening the outgoing graph to inventory it pages the whole thing in.
-#[allow(dead_code)]
+/// [`inventory`] for a v3 graph known only by its raw registry ids. Named apart
+/// from `old_inventory` because `destroy` uses it on the *current* graph, not
+/// an outgoing one.
+fn inventory_raw(
+    verts_raw: u128,
+    edges_raw: u128,
+    labels_raw: u128,
+    vindex_raw: u128,
+    cap: usize,
+) -> Vec<u128> {
+    old_inventory(verts_raw, edges_raw, labels_raw, vindex_raw, cap)
+}
+
 fn old_inventory(
     verts_raw: u128,
     edges_raw: u128,

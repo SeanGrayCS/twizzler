@@ -243,6 +243,100 @@ fn labeled_neighbor_and_edge_queries() {
 }
 
 #[test]
+fn arena_liveness_mirrors_the_record() {
+    let mut s = store(Box::new(FillTo { cap: 4 }));
+    for i in 0..10 {
+        s.add_vertex(0, &format!("v{i}"), 0).unwrap();
+    }
+    for i in 0..9u64 {
+        s.add_edge(i, i + 1, i, 0).unwrap();
+    }
+
+    // Registry view (`vertices`, no resolve) and record view (`vertex_name`,
+    // resolves) must agree before any delete.
+    assert_eq!(s.vertices().len(), 10);
+    for i in 0..10u64 {
+        assert!(s.is_alive(i));
+        assert!(s.vertex_name(i).is_some());
+    }
+
+    s.delete_vertex(3).unwrap();
+    s.delete_vertex(7).unwrap();
+
+    // Registry view.
+    assert_eq!(s.vertices(), vec![0, 1, 2, 4, 5, 6, 8, 9]);
+    assert!(!s.is_alive(3) && !s.is_alive(7));
+    // Record view — the one adjacency walks consult when resolving a
+    // neighbour. A mirror that updated only the registry would leave deleted
+    // vertices visible in traversal while absent from scans.
+    assert_eq!(s.vertex_name(3), None);
+    assert_eq!(s.vertex_name(7), None);
+    assert_eq!(s.vertex_info(3), None);
+    assert!(s.neighbors(2, true).is_empty(), "neighbour 3 is hidden");
+    assert!(s.neighbors(4, false).is_empty(), "neighbour 3 is hidden");
+
+    // And across a reopen, since `flags` is now persisted state.
+    s.sync_all().expect("sync");
+    let (dir, locs) = s.ids();
+    let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 64).expect("reopen");
+    assert_eq!(s.vertices(), vec![0, 1, 2, 4, 5, 6, 8, 9]);
+    assert_eq!(s.vertex_name(3), None);
+    assert!(s.is_alive(9));
+}
+
+/// Multi-segment store. Every other test here fits the location registry
+/// and the arena directory in one segment each, which is why two bugs reached
+/// `gstress scale:20000` before anything caught them: deletes had no effect,
+/// and a reopened store found 0 arenas against 5 532 registered vertices.
+///
+/// A tiny `seg_cap` reproduces the same geometry in a second: 20 vertices at
+/// `seg_cap` 4 gives 5 `locs` segments and 5 arena-directory entries, where
+/// `scale:20000` needed 55 101 vertices to reach 14.
+#[test]
+fn multi_segment_store_deletes_and_reopens() {
+    // seg_cap 4 (not 64) so both registries roll over; cap 4 so each vertex
+    // group also opens a new arena.
+    let mut s = ArenaStore::create(Box::new(FillTo { cap: 4 }), 4).expect("create");
+    for i in 0..20 {
+        s.add_vertex(0, &format!("v{i}"), 0).unwrap();
+    }
+    for i in 0..19u64 {
+        s.add_edge(i, i + 1, i, 0).unwrap();
+    }
+    assert_eq!(s.arena_count(), 5, "20 vertices / cap 4");
+    assert_eq!(s.vertex_count(), 20);
+
+    // Delete across segment boundaries: 3 is in segment 0, 7 in segment 1,
+    // 19 in the last.
+    for v in [3u64, 7, 19] {
+        s.delete_vertex(v).unwrap();
+    }
+    for v in [3u64, 7, 19] {
+        assert!(!s.is_alive(v), "v{v} still alive after delete");
+        assert_eq!(s.vertex_name(v), None, "v{v} record not tombstoned");
+    }
+    assert_eq!(s.vertices().len(), 17);
+
+    // Survives a reopen with every segment populated — the case where the
+    // arena directory came back empty.
+    s.sync_all().expect("sync");
+    let (dir, locs) = s.ids();
+    let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 4).expect("reopen");
+    assert_eq!(
+        s.arena_count(),
+        5,
+        "arena directory lost its entries across reopen"
+    );
+    assert_eq!(s.vertex_count(), 20);
+    assert_eq!(s.vertices().len(), 17, "tombstones did not survive reopen");
+    assert_eq!(s.vertex_name(0).as_deref(), Some("v0"));
+    assert_eq!(s.vertex_name(19), None);
+    // Adjacency still resolves across arenas after the reopen.
+    assert_eq!(s.neighbors(0, true), vec![1]);
+    assert_eq!(s.neighbors(5, false), vec![4]);
+}
+
+#[test]
 fn policy_is_identifiable() {
     let a = store(Box::new(OnePerArena));
     let b = store(Box::new(FillTo { cap: 4 }));

@@ -201,6 +201,33 @@ impl<T: Invariant> SegVec<T> {
         seg.with_mut_slice(off..off + 1, |s| f(&mut s[0]))
     }
 
+    /// [`SegVec::with_mut_at`] with durability deferred to [`SegVec::flush`].
+    pub(crate) fn with_mut_at_nosync<R>(
+        &mut self,
+        idx: usize,
+        f: impl FnOnce(&mut T) -> Result<R>,
+    ) -> Result<R> {
+        let (si, off) = (idx / self.cap, idx % self.cap);
+        let seg = self
+            .segs
+            .get_mut(si)
+            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
+        let mut tx = seg.object().as_tx()?;
+        let r = {
+            let mut base = tx.base_mut();
+            // Safety: single-threaded per graph handle, and the index is
+            // bounds-checked below — same contract as `with_mut_slice`.
+            let mut item = unsafe { base.get_mut(off) }
+                .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
+            f(&mut item)?
+        };
+        // Suppress sync-on-drop; the write stands (see the module docs on
+        // `abort` and the `tx_abort_does_not_roll_back` canary).
+        tx.abort();
+        self.dirty.insert(si);
+        Ok(r)
+    }
+
     /// Append an element, rolling over to a fresh segment when the last one
     /// is full.
     pub(crate) fn push(&mut self, item: T) -> Result<()>
@@ -239,10 +266,19 @@ impl<T: Invariant> SegVec<T> {
                 unsafe { seg.object().as_mut()?.sync()? };
             }
         }
-        if self.dir_dirty {
-            unsafe { self.dir.object().as_mut()?.sync()? };
-            self.dir_dirty = false;
-        }
+        // Always sync the directory, not just when this instance grew it.
+        //
+        // `dir_dirty` lives on the `SegVec` instance, so dropping one without
+        // flushing discards the flag while the writes stay in mapped memory —
+        // where a later instance still sees them and has no reason to set the
+        // flag again. A subsequent `flush` then syncs segments but not the
+        // directory, and the directory reaches disk empty.
+        //
+        // The flag now only avoids a redundant sync, never a required one, so
+        // it is gone. One extra object sync per `flush` is not worth the
+        // failure mode it was buying.
+        unsafe { self.dir.object().as_mut()?.sync()? };
+        self.dir_dirty = false;
         Ok(())
     }
 
