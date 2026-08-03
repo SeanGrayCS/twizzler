@@ -27,7 +27,7 @@ mod props;
 #[cfg(feature = "test-storage")]
 mod reclaim;
 #[cfg(feature = "test-storage")]
-mod sharding;
+mod segmentation;
 
 /// Vertices per arena for the general suite. Large on purpose.
 ///
@@ -50,7 +50,7 @@ pub(crate) fn fresh(name: &str) -> Graph {
 }
 
 /// A clean graph on the legacy v3 layout, for tests of v3 internals that
-/// have no v4 equivalent: registry sharding (`sharding`), per-vertex object
+/// have no v4 equivalent: registry segmentation (`segmentation`), per-vertex object
 /// inventory (`reclaim`), and `BulkSession` (`bulk`), whose batching the arena
 /// store does internally instead.
 ///
@@ -63,9 +63,9 @@ pub(crate) fn fresh_v3(name: &str) -> Graph {
     Graph::open_or_create(name).expect("create graph")
 }
 
-/// Like `fresh`, but with a forced registry segment capacity, so sharding
+/// Like `fresh`, but with a forced registry segment capacity, so segmentation
 /// tests can trigger rollover with a handful of inserts. v3 — registry
-/// sharding is a v3 concern; v4 shards the location registry instead.
+/// segmentation is a v3 concern; v4 segments the location registry instead.
 #[allow(dead_code)]
 pub(crate) fn fresh_cap(name: &str, cap: usize) -> Graph {
     Graph::reset_with_capacity(name, cap).expect("reset graph");

@@ -22,7 +22,7 @@ fn registry_rollover_segments_and_lookup() {
 }
 
 #[test]
-fn registry_sharding_persists_and_appends() {
+fn registry_segmentation_persists_and_appends() {
     let name = "t-shardp";
     Graph::reset_with_capacity(name, 4).expect("reset");
     let ids = {
@@ -52,7 +52,7 @@ fn registry_sharding_persists_and_appends() {
 }
 
 #[test]
-fn edge_and_label_registries_shard() {
+fn edge_and_label_registries_segment() {
     let mut g = fresh_cap("t-sharde", 4);
     let hub = g.add_vertex("hub", "h", ObjID::new(0)).unwrap();
     let mut spokes = Vec::new();
@@ -74,7 +74,7 @@ fn edge_and_label_registries_shard() {
         assert_eq!(info.from, hub);
         assert_eq!(info.to, spokes[i]);
     }
-    // Traversal liveness checks consult the sharded edge registry.
+    // Traversal liveness checks consult the segmented edge registry.
     assert_eq!(g.out_neighbors(hub, Labels::any()).len(), 6);
     assert_eq!(
         g.out_neighbors(hub, Labels::these(&["l5"])),
