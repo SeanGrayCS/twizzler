@@ -194,13 +194,52 @@ impl Rng {
     }
 }
 
+/// Failure lines printed before suppression starts.
+///
+/// A *systematic* failure emits one line per checked item, and the checks run
+/// over every vertex. The `scale:20000` churn scan produced 2 858 of them and
+/// the run died inside `println!` itself — "I/O error: data loss", the serial
+/// console dropping writes — which took every phase after D with it. The
+/// failure count is still reported in full; only the per-item lines are
+/// capped, because a dozen of them already show the pattern and the rest costs
+/// the remainder of the run.
+const MAX_FAIL_LINES: u64 = 20;
+
 pub(crate) struct Stats {
     pub(crate) fails: u64,
+    printed: u64,
+    last: Option<String>,
 }
 impl Stats {
+    pub(crate) fn new() -> Self {
+        Stats {
+            fails: 0,
+            printed: 0,
+            last: None,
+        }
+    }
     pub(crate) fn fail(&mut self, msg: String) {
-        println!("GSTRESS FAIL: {msg}");
         self.fails += 1;
+        if self.printed < MAX_FAIL_LINES {
+            println!("GSTRESS FAIL: {msg}");
+            self.printed += 1;
+            return;
+        }
+        if self.printed == MAX_FAIL_LINES {
+            println!(
+                "GSTRESS FAIL: further failure lines suppressed after {MAX_FAIL_LINES}; \
+                 the last one and the total are reported at exit"
+            );
+            self.printed += 1;
+        }
+        self.last = Some(msg);
+    }
+
+    /// The final suppressed failure, printed at exit.
+    pub(crate) fn report_suppressed(&self) {
+        if let Some(msg) = &self.last {
+            println!("GSTRESS FAIL (last suppressed): {msg}");
+        }
     }
     pub(crate) fn ck(&mut self, cond: bool, msg: impl FnOnce() -> String) {
         if !cond {
@@ -361,7 +400,7 @@ fn main() {
             if verify { "verify" } else { "seed" },
             n
         );
-        let mut st = Stats { fails: 0 };
+        let mut st = Stats::new();
 
         if !verify {
             Graph::reset_arena(DUR, twizzler_graph::DEFAULT_ARENA_CAP).expect("reset");
@@ -487,6 +526,7 @@ fn main() {
         if st.fails == 0 {
             println!("GSTRESS DURABILITY OK: {n} vertices survived a reboot intact.");
         } else {
+            st.report_suppressed();
             println!("GSTRESS DURABILITY FAILED: {} check(s)", st.fails);
             std::process::exit(1);
         }
@@ -592,7 +632,7 @@ fn main() {
 
     if matches!(mode.as_deref(), Some("indradb") | Some("baseline")) {
         stamp("indradb", preset);
-        let mut st = Stats { fails: 0 };
+        let mut st = Stats::new();
         indradb_mode::run(preset, &mut st);
         if st.fails > 0 {
             println!("GSTRESS: {} verification failure(s)", st.fails);
@@ -625,7 +665,7 @@ fn main() {
     );
 
     let total = Instant::now();
-    let mut st = Stats { fails: 0 };
+    let mut st = Stats::new();
     let mut next_id: u64 = 0;
 
     let mut g = match arena_cap {
@@ -860,6 +900,12 @@ fn main() {
     let t = Instant::now();
     let mut deleted = vec![false; n];
     let mut ndel = 0usize;
+    // One delete probed in isolation before the loop. Record and mirror should
+    // now agree; a run where they don't is the mapping split returning.
+    g.delete_vertex(VertexId(0)).expect("delete_vertex");
+    if let Some(d) = g.debug_liveness(VertexId(0)) {
+        println!("GSTRESS PROBE: immediately after deleting v0: {d}");
+    }
     for i in (0..n).step_by(7) {
         g.delete_vertex(VertexId(i as u64)).expect("delete_vertex");
         deleted[i] = true;
@@ -868,9 +914,21 @@ fn main() {
             heartbeat("D:churn", ndel, n / 7 + 1, &t);
         }
     }
+    for (v, expect) in [(0u64, "deleted"), (1u64, "live")] {
+        if let Some(d) = g.debug_liveness(VertexId(v)) {
+            println!("GSTRESS PROBE: control ({expect}) {d}");
+        }
+    }
     // Full scan: every phase-A id reads back consistent with the bookkeeping.
+    let mut probes_left = 3;
     for i in 0..n {
         let alive = g.vertex_info(VertexId(i as u64)).is_some();
+        if alive != !deleted[i] && probes_left > 0 {
+            probes_left -= 1;
+            if let Some(d) = g.debug_liveness(VertexId(i as u64)) {
+                println!("GSTRESS PROBE: mismatch (deleted={}) {d}", deleted[i]);
+            }
+        }
         st.ck(alive == !deleted[i], || {
             format!("churn scan v{i}: alive={alive}, expected {}", !deleted[i])
         });
@@ -1203,6 +1261,7 @@ fn main() {
         );
     }
     if st.fails > 0 {
+        st.report_suppressed();
         println!("GSTRESS: {} verification failure(s)", st.fails);
         std::process::exit(1);
     }
