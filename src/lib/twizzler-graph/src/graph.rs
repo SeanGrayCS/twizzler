@@ -1196,6 +1196,14 @@ impl Graph {
         })
     }
 
+    /// Diagnostic, temporary — pass-through to
+    /// [`ArenaStore::debug_liveness`]. `None` on v3, which has no
+    /// record/mirror split to disagree about.
+    pub fn debug_liveness(&self, id: VertexId) -> Option<String> {
+        Some(self.store.as_ref()?.debug_liveness(id.0))
+    }
+
+
     /// Resolve a [`Labels`] filter to label ids. `None` means "any".
     pub(crate) fn resolve_labels(&self, labels: Labels) -> Option<Vec<u32>> {
         match labels {

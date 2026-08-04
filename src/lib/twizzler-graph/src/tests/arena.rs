@@ -266,9 +266,6 @@ fn arena_liveness_mirrors_the_record() {
     // Registry view.
     assert_eq!(s.vertices(), vec![0, 1, 2, 4, 5, 6, 8, 9]);
     assert!(!s.is_alive(3) && !s.is_alive(7));
-    // Record view — the one adjacency walks consult when resolving a
-    // neighbour. A mirror that updated only the registry would leave deleted
-    // vertices visible in traversal while absent from scans.
     assert_eq!(s.vertex_name(3), None);
     assert_eq!(s.vertex_name(7), None);
     assert_eq!(s.vertex_info(3), None);
@@ -282,6 +279,55 @@ fn arena_liveness_mirrors_the_record() {
     assert_eq!(s.vertices(), vec![0, 1, 2, 4, 5, 6, 8, 9]);
     assert_eq!(s.vertex_name(3), None);
     assert!(s.is_alive(9));
+}
+
+/// That disagreement is not hypothetical. `GlobalPtr::resolve` maps `READ` and
+/// `resolve_mut` maps `READ | WRITE | PERSIST`, so they are separate mappings
+/// and a record write is invisible to a record read. At `scale:20000` this left
+/// 2 858 deleted vertices live on every record-reading path while the mirror
+/// had them right. A small in-boot test cannot provoke the incoherence — the
+/// suite was green throughout — so this stages it directly instead.
+///
+/// Record access no longer uses `GlobalPtr`, so the two agree again in the
+/// ordinary case. The mirror stays authoritative for the cross-arena
+/// `InvPtr::resolve` path, and this test is what stops that quietly eroding.
+///
+/// If someone reinstates a record-side liveness check, every assertion below
+/// fails at once.
+#[test]
+fn liveness_reads_come_from_the_mirror_not_the_record() {
+    let mut s = store(Box::new(FillTo { cap: 4 }));
+    for i in 0..6 {
+        s.add_vertex(0, &format!("v{i}"), 0).unwrap();
+    }
+    for i in 0..5u64 {
+        s.add_edge(i, i + 1, i, 0).unwrap();
+    }
+    assert!(s.vertex_info(2).is_some(), "v2 starts live");
+
+    s.tombstone_mirror_only(2).expect("mirror tombstone");
+
+    assert!(!s.is_alive(2));
+    assert_eq!(s.vertex_info(2), None, "vertex_info follows the mirror");
+    assert_eq!(s.vertex_name(2), None, "vertex_name follows the mirror");
+    assert_eq!(s.vertex_label(2), None, "vertex_label follows the mirror");
+    assert!(
+        s.neighbors(2, true).is_empty(),
+        "a dead vertex yields no adjacency"
+    );
+    assert!(
+        !s.neighbors(1, true).contains(&2),
+        "a dead *neighbour* is hidden from the walk"
+    );
+    assert!(!s.vertices().contains(&2), "and from the scan");
+    assert!(
+        s.set_props_raw(2, 1).is_err(),
+        "property writes are gated on the mirror too"
+    );
+    // Undamaged neighbours still resolve, so the walk is filtering rather than
+    // bailing out at the first dead entry.
+    assert!(s.neighbors(1, false).contains(&0));
+    assert!(s.vertex_info(3).is_some());
 }
 
 /// Multi-segment store. Every other test here fits the location registry

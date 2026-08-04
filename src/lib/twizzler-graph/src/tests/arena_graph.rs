@@ -179,6 +179,53 @@ fn arena_matches_legacy_when_an_edge_is_deleted() {
     assert!(arena.vertex_info(spokes[0]).is_some());
 }
 
+/// `arena_liveness_mirrors_the_record` already asserts exactly this for two
+/// vertices and passes, so whatever the harness hit is not covered by it. The
+/// differences this test deliberately keeps are the ones the harness has and
+/// that test does not: the calls go through `Graph` rather than `ArenaStore`,
+/// the deletions are bulk rather than two, they span several arenas, and edges
+/// exist across arena boundaries before the delete. If this passes while the
+/// harness fails, the remaining difference is scale or the intervening phases,
+/// and the next probe belongs in `gstress` rather than here.
+#[test]
+fn arena_matches_legacy_after_bulk_vertex_deletion() {
+    const N: usize = 70; // 18 arenas at ARENA_CAP = 4
+    let (mut legacy, mut arena) = pair("bulkdel");
+
+    for g in [&mut legacy, &mut arena] {
+        for i in 0..N {
+            g.add_vertex("v", &format!("v{i}"), ObjID::new(i as u128))
+                .unwrap();
+        }
+        // Chain every vertex to one well outside its own arena, so records
+        // carry cross-arena adjacency at delete time.
+        for i in 0..N - 1 {
+            g.add_edge(VertexId(i as u64), "next", VertexId(((i + 37) % N) as u64))
+                .unwrap();
+        }
+        for i in (0..N).step_by(7) {
+            g.delete_vertex(VertexId(i as u64)).unwrap();
+        }
+    }
+
+    for i in 0..N {
+        let deleted = i % 7 == 0;
+        let got = arena.vertex_info(VertexId(i as u64)).is_some();
+        assert_eq!(
+            got,
+            !deleted,
+            "v4 vertex_info for v{i}: got alive={got}, expected {}",
+            !deleted
+        );
+        assert_eq!(
+            legacy.vertex_info(VertexId(i as u64)).is_some(),
+            got,
+            "layouts disagree on v{i}"
+        );
+    }
+    assert_eq!(legacy.vertices(), arena.vertices(), "scan views agree");
+}
+
 #[test]
 fn arena_packs_vertices_and_adds_no_object_per_edge() {
     let name = "t-ab-objects";

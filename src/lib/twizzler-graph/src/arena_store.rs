@@ -7,15 +7,17 @@
 //! object — or a thousand vertices can.
 //!
 //! References are arena offsets, not `InvPtr`s. Within an arena a link is a
-//! `u64` offset resolved through [`GlobalPtr`], so intra-arena traversal needs
-//! no FOT entry and touches no second object. Neighbours in *other* arenas are
-//! named by `VertexId` and resolved through the location registry — the "A4b"
-//! reference form.
+//! `u64` offset applied to the arena's own mapping, so intra-arena traversal
+//! needs no FOT entry and touches no second object. Neighbours in *other*
+//! arenas are named by `VertexId` and resolved through the location registry —
+//! the "A4b" reference form.
+
+use core::mem::size_of;
 
 use twizzler::{
     alloc::arena::{ArenaBase, ArenaObject},
     marker::Invariant,
-    object::{ObjID, ObjectBuilder, TxObject},
+    object::{ObjID, ObjectBuilder, RawObject, TxObject},
     ptr::{GlobalPtr, InvPtr},
 };
 
@@ -98,9 +100,6 @@ pub(crate) struct AdjChunk {
 unsafe impl Invariant for AdjChunk {}
 
 /// Where a vertex lives: which arena, at what offset, and whether it is alive.
-///
-/// The duplication is real and must be maintained: `delete_vertex` is the only
-/// writer and sets both. `arena_liveness_mirrors_the_record` pins it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct VertexLoc {
@@ -260,10 +259,12 @@ impl ArenaStore {
         for id in 0..self.locs.len() as u64 {
             // Tombstoned vertices included: their property objects are exactly
             // the ones nothing else will ever free.
-            if let Some(gp) = self.vertex_ptr(id) {
-                let p = unsafe { gp.resolve() }.props_raw;
-                if p != 0 {
-                    ids.push(p);
+            if let Some(loc) = self.locs.get_ref(id as usize).map(|l| *l) {
+                if let Some(rp) = self.record_ptr(&loc) {
+                    let p = unsafe { (*rp).props_raw };
+                    if p != 0 {
+                        ids.push(p);
+                    }
                 }
             }
         }
@@ -304,21 +305,69 @@ impl ArenaStore {
         self.syncs
     }
 
-    /// Panics if `idx` is out of range — callers that may hold an untrusted
-    /// index must use [`Self::try_arena_id`].
-    fn arena_id(&self, idx: usize) -> ObjID {
-        self.open[idx].object().id()
-    }
-
     /// Bounds-checked arena lookup, for paths reading a *persisted* index.
     fn try_arena_id(&self, idx: usize) -> Option<ObjID> {
         self.open.get(idx).map(|a| a.object().id())
     }
 
+    /// A `GlobalPtr` naming a vertex record — an `(ObjID, offset)` pair, used
+    /// where one is *required* rather than resolved: `InvPtr::new` needs a
+    /// global address to build an adjacency entry against. Never resolve one
+    /// of these to touch a record; go through [`Self::record_ptr`].
     fn vertex_ptr(&self, id: u64) -> Option<GlobalPtr<ArenaVertex>> {
         let loc = self.locs.get_ref(id as usize)?;
         let aid = self.try_arena_id(loc.arena as usize)?;
         Some(GlobalPtr::new(aid, loc.off))
+    }
+
+    // --- record access: one mapping per arena --------------------------------
+    //
+    // Every read and write of an arena record goes through the two helpers
+    // below, and none through `GlobalPtr::resolve`/`resolve_mut`.
+    //
+    // `resolve` maps its object `READ`; `resolve_mut` maps it
+    // `READ | WRITE | PERSIST` (`ptr/global.rs`). Different flags, so
+    // `twz_rt_map_object` returns different mappings, and a write through one
+    // is not visible through the other. That cost us 2 858 silently-undeleted
+    // vertices on `scale:20000` — see `delete_vertex`.
+    //
+    // `ArenaObject::from_objid` already maps `READ | WRITE | PERSIST`, so the
+    // handle in `self.open` *is* the write mapping, and `lea`/`lea_mut` are
+    // plain `handle().start() + offset` against it. Reads and writes therefore
+    // land in the same pages by construction. It is also cheaper: `resolve()`
+    // calls `twz_rt_map_object` on every single access, and these do not.
+    //
+    // Both return `*mut` regardless of intent so that callers share one path;
+    // the borrow discipline is the same single-threaded-per-handle contract
+    // the rest of this file runs on.
+
+    /// Raw pointer to a vertex record, inside its arena's own mapping.
+    fn record_ptr(&self, loc: &VertexLoc) -> Option<*mut ArenaVertex> {
+        let obj = self.open.get(loc.arena as usize)?.object();
+        obj.lea_mut(loc.off as usize, size_of::<ArenaVertex>())
+            .map(|p| p as *mut ArenaVertex)
+    }
+
+    /// Raw pointer to an adjacency chunk, inside its arena's own mapping.
+    fn chunk_ptr(&self, arena: u32, off: u64) -> Option<*mut AdjChunk> {
+        let obj = self.open.get(arena as usize)?.object();
+        obj.lea_mut(off as usize, size_of::<AdjChunk>())
+            .map(|p| p as *mut AdjChunk)
+    }
+
+    /// The location entry for a vertex that is live, in one `locs` read.
+    ///
+    /// Liveness is the mirror's call, not the record's. That was forced when
+    /// record writes were invisible; it stays now that they are not, because
+    /// a *cross-arena* neighbour is still reached through `InvPtr::resolve`,
+    /// which maps `READ | INDIRECT` and so has the original problem. Reading
+    /// liveness from the mirror keeps every path on one answer.
+    fn live_loc(&self, vertex: u64) -> Option<VertexLoc> {
+        let loc = self.locs.get_ref(vertex as usize).map(|l| *l)?;
+        if loc.flags & TOMBSTONE != 0 {
+            return None;
+        }
+        Some(loc)
     }
 
     /// Add a vertex, letting the policy choose its arena.
@@ -371,15 +420,15 @@ impl ArenaStore {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
         let arena_idx = loc.arena as usize;
-        let aid = self.arena_id(arena_idx);
-        let vgp: GlobalPtr<ArenaVertex> = GlobalPtr::new(aid, loc.off);
+        let Some(vp) = self.record_ptr(&loc) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
 
-        let head = {
-            let v = unsafe { vgp.resolve() };
+        let head = unsafe {
             if out {
-                v.out_head
+                (*vp).out_head
             } else {
-                v.in_head
+                (*vp).in_head
             }
         };
 
@@ -397,13 +446,14 @@ impl ArenaStore {
 
         // Room in the head chunk? Append there and we are done.
         if head != 0 {
-            let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, head);
-            let mut c = unsafe { cgp.resolve_mut() };
-            if (c.len as usize) < ADJ_CHUNK {
-                let n = c.len as usize;
-                c.entries[n] = entry;
-                c.len += 1;
-                return Ok(());
+            if let Some(cp) = self.chunk_ptr(loc.arena, head) {
+                let c = unsafe { &mut *cp };
+                if (c.len as usize) < ADJ_CHUNK {
+                    let n = c.len as usize;
+                    c.entries[n] = entry;
+                    c.len += 1;
+                    return Ok(());
+                }
             }
         }
 
@@ -429,11 +479,15 @@ impl ArenaStore {
             })?
             .offset()
         };
-        let mut v = unsafe { vgp.resolve_mut() };
-        if out {
-            v.out_head = new_off;
-        } else {
-            v.in_head = new_off;
+        // `vp` is a raw pointer into the arena's mapping, so it survives the
+        // `&mut self` borrows `tx_for` needs above, and the mapping base does
+        // not move when the arena grows.
+        unsafe {
+            if out {
+                (*vp).out_head = new_off;
+            } else {
+                (*vp).in_head = new_off;
+            }
         }
         Ok(())
     }
@@ -453,17 +507,19 @@ impl ArenaStore {
     /// Walk `vertex`'s out (or in) chain in insertion order, calling
     /// `f(edge_id, label, neighbour_id)` for each live entry.
     fn walk_adj(&self, vertex: u64, out: bool, mut f: impl FnMut(u64, u32, u64)) {
-        let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
+        let Some(loc) = self.live_loc(vertex) else {
             return;
         };
-        let aid = self.arena_id(loc.arena as usize);
-        let vgp: GlobalPtr<ArenaVertex> = GlobalPtr::new(aid, loc.off);
-        let v = unsafe { vgp.resolve() };
-        if v.flags & TOMBSTONE != 0 {
+        let Some(vp) = self.record_ptr(&loc) else {
             return;
-        }
-        let mut off = if out { v.out_head } else { v.in_head };
-        drop(v);
+        };
+        let mut off = unsafe {
+            if out {
+                (*vp).out_head
+            } else {
+                (*vp).in_head
+            }
+        };
 
         // Bounded walk. A malformed `next` — a cycle, or an offset misread from
         // a stale on-disk layout — would otherwise spin here forever with no
@@ -474,8 +530,10 @@ impl ArenaStore {
         let max_chunks = self.locs.len() + 2;
         let mut chunks = Vec::new();
         while off != 0 {
-            let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, off);
-            let c = unsafe { cgp.resolve() };
+            let Some(cp) = self.chunk_ptr(loc.arena, off) else {
+                break;
+            };
+            let c = unsafe { &*cp };
             chunks.push((off, c.len as usize));
             off = c.next;
             if chunks.len() > max_chunks {
@@ -490,14 +548,25 @@ impl ArenaStore {
         chunks.reverse();
 
         for (coff, len) in chunks {
-            let cgp: GlobalPtr<AdjChunk> = GlobalPtr::new(aid, coff);
-            let c = unsafe { cgp.resolve() };
+            let Some(cp) = self.chunk_ptr(loc.arena, coff) else {
+                continue;
+            };
+            let c = unsafe { &*cp };
             for e in c.entries.iter().take(len) {
                 // Same-arena neighbours take `InvPtr`'s inlined local path
-                // (FOT index 0): base + offset inside this already-mapped
-                // object, no registry read and no FOT lookup.
+                // (FOT index 0): `local_resolve` masks the entry's *own*
+                // address to its object base, so because the chunk was reached
+                // through the arena's mapping, so is the neighbour. No registry
+                // read, no FOT lookup, and no second mapping.
+                //
+                // A cross-arena neighbour instead goes through
+                // `slow_resolve(READ | INDIRECT)` — a different mapping of the
+                // target arena, with the incoherence described on
+                // `delete_vertex`. Only `nb.id` is read from it, which is fixed
+                // at allocation and never written again. Do not read a
+                // mutable field of a neighbour record here.
                 let nb = unsafe { e.neighbor.resolve() };
-                if nb.flags & TOMBSTONE == 0 {
+                if self.is_alive(nb.id) {
                     f(e.edge_id, e.label, nb.id);
                 }
             }
@@ -544,13 +613,14 @@ impl ArenaStore {
     // without repeating the check.
 
     /// Run `f` on a live vertex's record, or `None` if missing/tombstoned.
+    ///
+    /// One `locs` read serves both the liveness check and the record address.
+    /// Splitting them cost a second lookup on every call — measurably, on the
+    /// `scale:20000` churn scan.
     fn with_vertex<R>(&self, vertex: u64, f: impl FnOnce(&ArenaVertex) -> R) -> Option<R> {
-        let gp = self.vertex_ptr(vertex)?;
-        let v = unsafe { gp.resolve() };
-        if v.flags & TOMBSTONE != 0 {
-            return None;
-        }
-        Some(f(&v))
+        let loc = self.live_loc(vertex)?;
+        let p = self.record_ptr(&loc)?;
+        Some(f(unsafe { &*p }))
     }
 
     /// Whether the vertex exists and is not tombstoned.
@@ -558,6 +628,37 @@ impl ArenaStore {
         self.locs
             .get_ref(vertex as usize)
             .map_or(false, |l| l.flags & TOMBSTONE == 0)
+    }
+
+    /// Diagnostic: the mirror's view of a vertex against the record's, and
+    /// where the record sits.
+    pub fn debug_liveness(&self, vertex: u64) -> String {
+        let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
+            return format!("v{vertex}: no loc entry (locs.len={})", self.locs.len());
+        };
+        let Some(p) = self.record_ptr(&loc) else {
+            return format!(
+                "v{vertex}: loc{{arena={}, off={}, flags={:#x}}} — arena index out of range \
+                 (arenas_open={})",
+                loc.arena,
+                loc.off,
+                loc.flags,
+                self.open.len()
+            );
+        };
+        let v = unsafe { &*p };
+        format!(
+            "v{vertex}: mirror_flags={:#x} (alive={}), record_flags={:#x} (alive={}), \
+             record_id={} (expected {vertex}), loc{{arena={}, off={}}}, arenas_open={}",
+            loc.flags,
+            loc.flags & TOMBSTONE == 0,
+            v.flags,
+            v.flags & TOMBSTONE == 0,
+            v.id,
+            loc.arena,
+            loc.off,
+            self.open.len()
+        )
     }
 
     /// `(label, name, target)` — the old `VertexInfo` triple.
@@ -600,14 +701,13 @@ impl ArenaStore {
     /// Point the vertex at a (possibly new) property object. Writes mapped
     /// memory; durable at [`Self::sync_all`] like every other mutation here.
     pub fn set_props_raw(&mut self, vertex: u64, raw: u128) -> Result<()> {
-        let Some(gp) = self.vertex_ptr(vertex) else {
+        let Some(loc) = self.live_loc(vertex) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
-        let mut v = unsafe { gp.resolve_mut() };
-        if v.flags & TOMBSTONE != 0 {
+        let Some(p) = self.record_ptr(&loc) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
-        }
-        v.props_raw = raw;
+        };
+        unsafe { (*p).props_raw = raw };
         Ok(())
     }
 
@@ -634,32 +734,29 @@ impl ArenaStore {
     }
 
     pub fn vertex_name(&self, vertex: u64) -> Option<String> {
-        let loc = self.locs.get_ref(vertex as usize)?;
-        let gp: GlobalPtr<ArenaVertex> =
-            GlobalPtr::new(self.arena_id(loc.arena as usize), loc.off);
-        let v = unsafe { gp.resolve() };
-        if v.flags & TOMBSTONE != 0 {
-            return None;
-        }
-        Some(v.name.as_str().to_string())
+        self.with_vertex(vertex, |v| v.name.as_str().to_string())
     }
 
-    /// Tombstone a vertex in both places: the arena record (authoritative,
-    /// and what adjacency walks see when they resolve a neighbour) and the
-    /// location registry (what scans read without resolving).
+    /// Tombstone a vertex, in the record and in the `locs` mirror.
     ///
-    /// The duplication exists for the scan path; this is its only writer, so
-    /// the two cannot drift unless someone adds a second one.
-    /// `arena_liveness_mirrors_the_record` fails loudly if they do.
+    /// `GlobalPtr::resolve` maps its object `READ`, while `GlobalPtr::resolve_mut`
+    /// maps it `READ | WRITE | PERSIST` (`ptr/global.rs`). Different flags mean
+    /// `twz_rt_map_object` hands back *different mappings*, and a write through
+    /// one is not visible through the other. Measured on `scale:20000`: after
+    /// `v.flags |= TOMBSTONE`, a fresh `resolve_mut` read the bit set and a
+    /// fresh `resolve` read it clear, identically in a stale arena and the
+    /// current one. Every reader here uses `resolve`, so the record bit was
+    /// invisible and 2 858 deleted vertices stayed live.
+    ///
+    /// So the record's bit is written and kept consistent, but `is_alive` and
+    /// [`Self::live_loc`] are what decide. Do not gate a read on the record's
+    /// `flags` — it is right today only for arenas you reached locally.
     pub fn delete_vertex(&mut self, vertex: u64) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Ok(());
         };
-        let gp: GlobalPtr<ArenaVertex> =
-            GlobalPtr::new(self.arena_id(loc.arena as usize), loc.off);
-        {
-            let mut v = unsafe { gp.resolve_mut() };
-            v.flags |= TOMBSTONE;
+        if let Some(p) = self.record_ptr(&loc) {
+            unsafe { (*p).flags |= TOMBSTONE };
         }
         // nosync: `with_mut_at` would sync the registry on every delete, which
         // measured 2.5× on the churn phase. Drained by `sync_all`'s
@@ -669,6 +766,17 @@ impl ArenaStore {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// Test-only: tombstone the mirror and leave the record alive, forcing
+    /// the disagreement that `resolve`/`resolve_mut` incoherence produced at
+    /// scale but that a small in-boot test cannot provoke on its own.
+    #[cfg(test)]
+    pub(crate) fn tombstone_mirror_only(&mut self, vertex: u64) -> Result<()> {
+        self.locs.with_mut_at_nosync(vertex as usize, |l| {
+            l.flags |= TOMBSTONE;
+            Ok(())
+        })
     }
 
     /// Closes each arena's batching transaction first. `abort()` is what makes

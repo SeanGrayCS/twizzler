@@ -10,7 +10,7 @@ crate-type = ["rlib"]
 # `clear_rustflags()`, so a `RUSTFLAGS --cfg` would clobber the `machine` cfg
 # and break the build — features are the only usable switch.
 [features]
-default = ["test-query"]
+default = ["test-all"]
 test-all = ["test-core", "test-storage", "test-query"]
 ## crud, names, adjacency, persistence — plain semantics, cheapest slice.
 test-core = []
