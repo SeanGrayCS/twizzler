@@ -278,6 +278,12 @@ pub fn run(preset: &Preset, st: &mut Stats) {
                 add_edge(&db, cl[i], "k", cl[j]);
             }
         }
+        // This is the phase that ran 215 s in silence at `scale:2000` and read
+        // as a hang. It is the densest write phase in the run — k*(k-1) edges
+        // with no batching — so on the baseline it is also the slowest.
+        if (i + 1) % 5 == 0 {
+            heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
+        }
     }
     for &i in &[0usize, k / 2, k - 1] {
         let out = out_edges(&db, cl[i], Some("k")).len();

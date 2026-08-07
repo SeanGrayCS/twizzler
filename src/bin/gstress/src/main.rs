@@ -16,9 +16,10 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-07-30a";
+pub(crate) const HARNESS_REV: &str = "2026-08-04a";
 
 mod indradb_mode;
+mod props_probe;
 mod residency;
 
 /// Print the provenance header. Every recorded result must carry this line;
@@ -320,10 +321,20 @@ impl Progress {
     }
 }
 
+/// Progress line, with a projected time to finish the phase.
+///
+/// It is a projection at the *current cumulative* rate, so a phase whose rate
+/// decays will overshoot it — the baseline's do, badly: `B:bulk` fell 26 → 13
+/// ops/s within one phase. Read it as a floor, not a promise.
 pub(crate) fn heartbeat(phase: &str, done: usize, total: usize, t: &Instant) {
     let secs = t.elapsed().as_secs_f64();
     let rate = if secs > 0.0 { done as f64 / secs } else { 0.0 };
-    println!("GSTRESS {phase}: {done}/{total} ({rate:.0} ops/s)");
+    if rate > 0.0 && total > done {
+        let eta = (total - done) as f64 / rate;
+        println!("GSTRESS {phase}: {done}/{total} ({rate:.0} ops/s, ~{eta:.0}s left)");
+    } else {
+        println!("GSTRESS {phase}: {done}/{total} ({rate:.0} ops/s)");
+    }
 }
 
 pub(crate) fn report(phase: &str, ops: usize, t: Instant) {
@@ -367,6 +378,16 @@ pub(crate) fn max_distinct_degree(n: usize) -> usize {
 
 fn main() {
     let arg1 = std::env::args().nth(1);
+
+    if arg1.as_deref() == Some("props") {
+        let n = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(30_000);
+        let with_props = std::env::args().nth(3).as_deref() != Some("none");
+        props_probe::run(n, with_props);
+        return;
+    }
 
     if arg1.as_deref() == Some("residency") {
         let arm = std::env::args().nth(2);
@@ -1129,6 +1150,11 @@ fn main() {
                 if i != j {
                     g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
                 }
+            }
+            // The bulk path above reports every 10 rows; this one reported
+            // nothing at all, which is how a 215 s phase looked like a hang.
+            if (i + 1) % 10 == 0 {
+                heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
             }
         }
     }
