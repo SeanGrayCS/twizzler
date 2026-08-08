@@ -16,7 +16,7 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-08-04c";
+pub(crate) const HARNESS_REV: &str = "2026-08-04d";
 
 mod indradb_mode;
 mod props_probe;
@@ -624,32 +624,29 @@ fn main() {
                     &scaled_preset
                 }
                 Err(_) => {
-                    println!("usage: gstress scale:<vertices> [nobulk|indradb]");
+                    println!("usage: gstress scale:<vertices> [arena:<cap>|indradb]");
                     std::process::exit(2);
                 }
             }
         }
         Some(other) => {
             println!(
-                "usage: gstress [tiny|small|medium|large|scale:<N>] [nobulk|indradb]  \
+                "usage: gstress [tiny|small|medium|large|scale:<N>] [arena:<cap>|indradb]  \
                  (got '{other}')"
             );
             println!("       gstress residency [cycle|hold|volatile] [N] [R]   (A6 probe)");
+            println!("       gstress props [N] [none]                          (A7-AC1 probe)");
             std::process::exit(2);
         }
     };
     let mode = std::env::args().nth(2);
 
-    let arena_cap: Option<usize> = mode.as_deref().and_then(|m| {
-        let rest = m.strip_prefix("arena")?;
-        Some(match rest.strip_prefix(':') {
-            Some(c) => c.parse().unwrap_or(twizzler_graph::DEFAULT_ARENA_CAP),
-            None => twizzler_graph::DEFAULT_ARENA_CAP,
-        })
-    });
-
-    let use_bulk = mode.as_deref() != Some("nobulk") && arena_cap.is_none();
-    const CHUNK: usize = 500;
+    let arena_cap: usize = mode
+        .as_deref()
+        .and_then(|m| m.strip_prefix("arena"))
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(twizzler_graph::DEFAULT_ARENA_CAP);
 
     if matches!(mode.as_deref(), Some("indradb") | Some("baseline")) {
         stamp("indradb", preset);
@@ -661,22 +658,12 @@ fn main() {
         }
         return;
     }
-    // The layout and the batching mode both belong in the stamp: a result that
-    // does not say which layout produced it cannot be compared to anything.
-    let mode_label = match arena_cap {
-        Some(c) => format!("native-arena:{c}"),
-        None if use_bulk => "native-bulk".to_string(),
-        None => "native-nobulk".to_string(),
-    };
+    let mode_label = format!("native-arena:{arena_cap}");
     stamp(&mode_label, preset);
     println!(
         "gstress: preset {} ({}) (V={} bulkE={} degCap={} churn={} chain={} clique={})",
         preset.name,
-        match arena_cap {
-            Some(c) => format!("v4 arena, cap={c}"),
-            None if use_bulk => "v3 bulk".to_string(),
-            None => "v3 nobulk".to_string(),
-        },
+        format!("v4 arena, cap={arena_cap}"),
         preset.vertices,
         preset.bulk_edges,
         preset.degree_cap,
@@ -689,16 +676,8 @@ fn main() {
     let mut next_id: u64 = 0;
 
     let setup = Instant::now();
-    let mut g = match arena_cap {
-        Some(cap) => {
-            Graph::reset_arena(GRAPH, cap).expect("reset arena graph");
-            Graph::open_or_create_arena(GRAPH, cap).expect("create arena graph")
-        }
-        None => {
-            Graph::reset(GRAPH).expect("reset gstress graph");
-            Graph::open_or_create(GRAPH).expect("create gstress graph")
-        }
-    };
+    Graph::reset_arena(GRAPH, arena_cap).expect("reset arena graph");
+    let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("create arena graph");
     let setup_secs = setup.elapsed().as_secs_f64();
     println!("GSTRESS SETUP: reset + open {setup_secs:.2}s (excluded from the run total)");
 
@@ -723,33 +702,10 @@ fn main() {
     // --- Phase A: registry rollover at the real DEFAULT_SEG_CAP -------------
     let n = preset.vertices;
     let t = Instant::now();
-    if use_bulk {
-        let mut i = 0;
-        while i < n {
-            let hi = (i + CHUNK).min(n);
-            g.bulk(|b| {
-                for j in i..hi {
-                    let v = b.add_vertex("n", &format!("v{j}"), ObjID::new(0))?;
-                    if v.0 != next_id {
-                        st.fail(format!(
-                            "vertex id drift: got {}, expected {}",
-                            v.0, next_id
-                        ));
-                    }
-                    next_id += 1;
-                }
-                Ok(())
-            })
-            .expect("bulk add_vertex");
-            heartbeat("A:rollover", hi, n, &t);
-            i = hi;
-        }
-    } else {
-        for i in 0..n {
-            add_v(&mut g, &mut st, &mut next_id, "n", &format!("v{i}"));
-            if (i + 1) % 500 == 0 {
-                heartbeat("A:rollover", i + 1, n, &t);
-            }
+    for i in 0..n {
+        add_v(&mut g, &mut st, &mut next_id, "n", &format!("v{i}"));
+        if (i + 1) % 500 == 0 {
+            heartbeat("A:rollover", i + 1, n, &t);
         }
     }
     // Boundary reads around the default segment capacity (4096) and the tail
@@ -779,33 +735,14 @@ fn main() {
     let t = Instant::now();
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(preset.bulk_edges);
-    if use_bulk {
-        let mut k = 0;
-        while k < preset.bulk_edges {
-            let hi = (k + CHUNK).min(preset.bulk_edges);
-            g.bulk(|b| {
-                for _ in k..hi {
-                    let u = rng.below(n);
-                    let v = rng.below(n);
-                    b.add_edge(VertexId(u as u64), "b", VertexId(v as u64))?;
-                    pairs.push((u as u32, v as u32));
-                }
-                Ok(())
-            })
+    for k in 0..preset.bulk_edges {
+        let u = rng.below(n);
+        let v = rng.below(n);
+        g.add_edge(VertexId(u as u64), "b", VertexId(v as u64))
             .expect("bulk add_edge");
-            heartbeat("B:bulk", hi, preset.bulk_edges, &t);
-            k = hi;
-        }
-    } else {
-        for k in 0..preset.bulk_edges {
-            let u = rng.below(n);
-            let v = rng.below(n);
-            g.add_edge(VertexId(u as u64), "b", VertexId(v as u64))
-                .expect("bulk add_edge");
-            pairs.push((u as u32, v as u32));
-            if (k + 1) % 500 == 0 {
-                heartbeat("B:bulk", k + 1, preset.bulk_edges, &t);
-            }
+        pairs.push((u as u32, v as u32));
+        if (k + 1) % 500 == 0 {
+            heartbeat("B:bulk", k + 1, preset.bulk_edges, &t);
         }
     }
     // Sampled out-degree verification (no deletes yet: expected = raw count).
@@ -823,45 +760,20 @@ fn main() {
     let t = Instant::now();
     let hub = add_v(&mut g, &mut st, &mut next_id, "hub", "hub1");
     let mut hub_deg = 0usize;
-    if use_bulk {
-        let mut i = 0;
-        while i < preset.degree_cap {
-            let hi = (i + CHUNK).min(preset.degree_cap);
-            let r = g.bulk(|b| {
-                for j in i..hi {
-                    let target = VertexId(safe_target(j, n) as u64);
-                    b.add_edge(hub, "h", target)?;
-                    hub_deg += 1;
-                }
-                Ok(())
-            });
-            if let Err(e) = r {
+    for i in 0..preset.degree_cap {
+        let target = VertexId(safe_target(i, n) as u64);
+        if i > 0 && i % 1000 == 0 {
+            heartbeat("C:degree", i, preset.degree_cap, &t);
+        }
+        match g.add_edge(hub, "h", target) {
+            Ok(_) => hub_deg += 1,
+            Err(e) => {
                 println!(
                     "GSTRESS FINDING: adjacency ceiling — hub add_edge #{} failed: {e} \
                      (A2 evidence; record on the board)",
-                    hub_deg + 1
+                    i + 1
                 );
                 break;
-            }
-            heartbeat("C:degree", hi, preset.degree_cap, &t);
-            i = hi;
-        }
-    } else {
-        for i in 0..preset.degree_cap {
-            let target = VertexId(safe_target(i, n) as u64);
-            if i > 0 && i % 1000 == 0 {
-                heartbeat("C:degree", i, preset.degree_cap, &t);
-            }
-            match g.add_edge(hub, "h", target) {
-                Ok(_) => hub_deg += 1,
-                Err(e) => {
-                    println!(
-                        "GSTRESS FINDING: adjacency ceiling — hub add_edge #{} failed: {e} \
-                         (A2 evidence; record on the board)",
-                        i + 1
-                    );
-                    break;
-                }
             }
         }
     }
@@ -875,43 +787,19 @@ fn main() {
         // this should reach a higher ceiling than the distinct-target hub (I0).
         let hub2 = add_v(&mut g, &mut st, &mut next_id, "hub", "hub2");
         let target = VertexId(1); // index 1 survives churn
-        if use_bulk {
-            let mut i = 0;
-            while i < preset.degree_cap {
-                let hi = (i + CHUNK).min(preset.degree_cap);
-                let r = g.bulk(|b| {
-                    for _ in i..hi {
-                        b.add_edge(hub2, "h2", target)?;
-                        hub2_deg += 1;
-                    }
-                    Ok(())
-                });
-                if let Err(e) = r {
+        for i in 0..preset.degree_cap {
+            if i > 0 && i % 1000 == 0 {
+                heartbeat("C:degree2", i, preset.degree_cap, &t);
+            }
+            match g.add_edge(hub2, "h2", target) {
+                Ok(_) => hub2_deg += 1,
+                Err(e) => {
                     println!(
                         "GSTRESS FINDING: same-target ceiling — hub2 add_edge #{} failed: {e} \
                          (compare with hub1; informs FOT-dedup question, I0)",
-                        hub2_deg + 1
+                        i + 1
                     );
                     break;
-                }
-                heartbeat("C:degree2", hi, preset.degree_cap, &t);
-                i = hi;
-            }
-        } else {
-            for i in 0..preset.degree_cap {
-                if i > 0 && i % 1000 == 0 {
-                    heartbeat("C:degree2", i, preset.degree_cap, &t);
-                }
-                match g.add_edge(hub2, "h2", target) {
-                    Ok(_) => hub2_deg += 1,
-                    Err(e) => {
-                        println!(
-                            "GSTRESS FINDING: same-target ceiling — hub2 add_edge #{} failed: {e} \
-                             (compare with hub1; informs FOT-dedup question, I0)",
-                            i + 1
-                        );
-                        break;
-                    }
                 }
             }
         }
@@ -977,30 +865,8 @@ fn main() {
         });
     }
     // Adds after deletes: ids continue, never reuse.
-    if use_bulk {
-        let mut i = 0;
-        while i < preset.churn_add {
-            let hi = (i + CHUNK).min(preset.churn_add);
-            g.bulk(|b| {
-                for j in i..hi {
-                    let v = b.add_vertex("c", &format!("c{j}"), ObjID::new(0))?;
-                    if v.0 != next_id {
-                        st.fail(format!(
-                            "vertex id drift: got {}, expected {}",
-                            v.0, next_id
-                        ));
-                    }
-                    next_id += 1;
-                }
-                Ok(())
-            })
-            .expect("bulk churn add");
-            i = hi;
-        }
-    } else {
-        for i in 0..preset.churn_add {
-            add_v(&mut g, &mut st, &mut next_id, "c", &format!("c{i}"));
-        }
+    for i in 0..preset.churn_add {
+        add_v(&mut g, &mut st, &mut next_id, "c", &format!("c{i}"));
     }
     report("D:churn", n + preset.churn_add, t);
 
@@ -1013,10 +879,7 @@ fn main() {
     // but dropping an unsynced graph is still throwing writes away.
     g.sync().expect("sync before reopen");
     drop(g);
-    let mut g = match arena_cap {
-        Some(cap) => Graph::open_or_create_arena(GRAPH, cap).expect("reopen arena graph"),
-        None => Graph::open_or_create(GRAPH).expect("reopen gstress graph"),
-    };
+    let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("reopen arena graph");
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {
         "reopen: deleted v7 came back".into()
     });
@@ -1043,37 +906,12 @@ fn main() {
     let t = Instant::now();
     let head = add_v(&mut g, &mut st, &mut next_id, "ch", "ch0");
     let mut prev = head;
-    if use_bulk {
-        let mut i = 1;
-        while i < preset.chain {
-            let hi = (i + CHUNK).min(preset.chain);
-            g.bulk(|b| {
-                for j in i..hi {
-                    let v = b.add_vertex("ch", &format!("ch{j}"), ObjID::new(0))?;
-                    if v.0 != next_id {
-                        st.fail(format!(
-                            "vertex id drift: got {}, expected {}",
-                            v.0, next_id
-                        ));
-                    }
-                    next_id += 1;
-                    b.add_edge(prev, "next", v)?;
-                    prev = v;
-                }
-                Ok(())
-            })
-            .expect("bulk chain");
-            heartbeat("F:chain", hi, preset.chain, &t);
-            i = hi;
-        }
-    } else {
-        for i in 1..preset.chain {
-            let v = add_v(&mut g, &mut st, &mut next_id, "ch", &format!("ch{i}"));
-            g.add_edge(prev, "next", v).expect("chain add_edge");
-            prev = v;
-            if (i + 1) % 500 == 0 {
-                heartbeat("F:chain", i + 1, preset.chain, &t);
-            }
+    for i in 1..preset.chain {
+        let v = add_v(&mut g, &mut st, &mut next_id, "ch", &format!("ch{i}"));
+        g.add_edge(prev, "next", v).expect("chain add_edge");
+        prev = v;
+        if (i + 1) % 500 == 0 {
+            heartbeat("F:chain", i + 1, preset.chain, &t);
         }
     }
     let mut cur = head;
@@ -1112,58 +950,25 @@ fn main() {
     let t = Instant::now();
     let k = preset.clique;
     let mut cl = Vec::with_capacity(k);
-    if use_bulk {
-        g.bulk(|b| {
-            for i in 0..k {
-                let v = b.add_vertex("cl", &format!("cl{i}"), ObjID::new(0))?;
-                if v.0 != next_id {
-                    st.fail(format!(
-                        "vertex id drift: got {}, expected {}",
-                        v.0, next_id
-                    ));
-                }
-                next_id += 1;
-                cl.push(v);
-            }
-            Ok(())
-        })
-        .expect("bulk clique vertices");
-        // One batch per source row keeps chunks bounded (k-1 edges each).
-        for i in 0..k {
-            g.bulk(|b| {
-                for j in 0..k {
-                    if i != j {
-                        b.add_edge(cl[i], "k", cl[j])?;
-                    }
-                }
-                Ok(())
-            })
-            .expect("bulk clique edges");
-            if (i + 1) % 10 == 0 {
-                heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
+    for i in 0..k {
+        cl.push(add_v(
+            &mut g,
+            &mut st,
+            &mut next_id,
+            "cl",
+            &format!("cl{i}"),
+        ));
+    }
+    for i in 0..k {
+        for j in 0..k {
+            if i != j {
+                g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
             }
         }
-    } else {
-        for i in 0..k {
-            cl.push(add_v(
-                &mut g,
-                &mut st,
-                &mut next_id,
-                "cl",
-                &format!("cl{i}"),
-            ));
-        }
-        for i in 0..k {
-            for j in 0..k {
-                if i != j {
-                    g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
-                }
-            }
-            // The bulk path above reports every 10 rows; this one reported
-            // nothing at all, which is how a 215 s phase looked like a hang.
-            if (i + 1) % 10 == 0 {
-                heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
-            }
+        // Reports every 10 rows — this phase used to emit nothing at all,
+        // which is how a 215 s run looked indistinguishable from a hang.
+        if (i + 1) % 10 == 0 {
+            heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
         }
     }
     for &i in &[0usize, k / 2, k - 1] {
@@ -1241,22 +1046,8 @@ fn main() {
         // `bulk` is a v3 construct and now refuses on v4 (see `Graph::bulk`).
         // The arena layout batches by construction, so the direct path here is
         // the like-for-like comparison, not a slower one.
-        if use_bulk {
-            g.bulk(|b| {
-                for j in 0..preset.degrade_batch {
-                    let v = b.add_vertex("g", &format!("g{}_{}", w, j), ObjID::new(0))?;
-                    if v.0 != next_id {
-                        st.fail(format!("vertex id drift: got {}, expected {}", v.0, next_id));
-                    }
-                    next_id += 1;
-                }
-                Ok(())
-            })
-            .expect("degrade probe batch");
-        } else {
-            for j in 0..preset.degrade_batch {
-                add_v(&mut g, &mut st, &mut next_id, "g", &format!("g{}_{}", w, j));
-            }
+        for j in 0..preset.degrade_batch {
+            add_v(&mut g, &mut st, &mut next_id, "g", &format!("g{}_{}", w, j));
         }
         gdone = base + preset.degrade_batch;
         prog.tick(gdone, gtotal);
