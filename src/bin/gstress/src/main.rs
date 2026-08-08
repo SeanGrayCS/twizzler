@@ -16,7 +16,7 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-08-04a";
+pub(crate) const HARNESS_REV: &str = "2026-08-04c";
 
 mod indradb_mode;
 mod props_probe;
@@ -685,10 +685,10 @@ fn main() {
         preset.clique
     );
 
-    let total = Instant::now();
     let mut st = Stats::new();
     let mut next_id: u64 = 0;
 
+    let setup = Instant::now();
     let mut g = match arena_cap {
         Some(cap) => {
             Graph::reset_arena(GRAPH, cap).expect("reset arena graph");
@@ -699,6 +699,11 @@ fn main() {
             Graph::open_or_create(GRAPH).expect("create gstress graph")
         }
     };
+    let setup_secs = setup.elapsed().as_secs_f64();
+    println!("GSTRESS SETUP: reset + open {setup_secs:.2}s (excluded from the run total)");
+
+    // Workload only, from here.
+    let total = Instant::now();
 
     let add_v = |g: &mut Graph, st: &mut Stats, next_id: &mut u64, label: &str, name: &str| {
         let v = g
@@ -1008,7 +1013,10 @@ fn main() {
     // but dropping an unsynced graph is still throwing writes away.
     g.sync().expect("sync before reopen");
     drop(g);
-    let mut g = Graph::open_or_create(GRAPH).expect("reopen gstress graph");
+    let mut g = match arena_cap {
+        Some(cap) => Graph::open_or_create_arena(GRAPH, cap).expect("reopen arena graph"),
+        None => Graph::open_or_create(GRAPH).expect("reopen gstress graph"),
+    };
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {
         "reopen: deleted v7 came back".into()
     });
@@ -1285,6 +1293,16 @@ fn main() {
             g.arena_sync_count(),
             next_id * 3 + preset.bulk_edges as u64
         );
+        let (policy, actual) = g.arena_vertex_counts();
+        println!("GSTRESS ARENA DIST policy: {policy:?}");
+        println!("GSTRESS ARENA DIST locs:   {actual:?}");
+        if policy != actual {
+            let (ps, as_): (usize, usize) = (policy.iter().sum(), actual.iter().sum());
+            println!(
+                "GSTRESS ARENA DIST MISMATCH: the placement policy and the location \
+                 registry disagree (totals {ps} vs {as_}) — cap is not controlling rollover"
+            );
+        }
     }
     if st.fails > 0 {
         st.report_suppressed();

@@ -96,11 +96,20 @@ pub fn run(preset: &Preset, st: &mut Stats) {
         preset.clique
     );
 
-    let total = Instant::now();
+    // Setup timed separately and excluded from the run total, matching the
+    // native arm — `reset_db` tears down the previous run's store, which is not
+    // this run's workload. See the note in `main.rs`: on the native side that
+    // teardown reached ~50 s while every phase timer showed no change.
+    let setup = Instant::now();
     TwizzlerDatastore::reset_db(GRAPH).expect("reset baseline datastore");
     let db = TwizzlerDatastore::open_db(GRAPH).expect("open baseline datastore");
     db.index_property(ident(P_NAME)).expect("index name");
     let mut names = Names(HashMap::new());
+    let setup_secs = setup.elapsed().as_secs_f64();
+    println!("GSTRESS SETUP: reset + open {setup_secs:.2}s (excluded from the run total)");
+
+    // Workload only, from here.
+    let total = Instant::now();
 
     // --- Phase A: bulk vertex creation ------------------------------------
     let n = preset.vertices;

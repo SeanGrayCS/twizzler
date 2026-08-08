@@ -1,10 +1,23 @@
+//! Property ceiling probe: how many vertices can carry a property before the
+//! pager gives out?
+//!
+//! Vertex records are packed into arenas, but properties are not: the
+//! property store keeps a lazily-created side object per element, so every
+//! vertex carrying a property costs one persistent Twizzler object — the
+//! thing the arena layout exists to avoid.
+//!
+//! Not a unit test, because frame exhaustion blocks the allocating thread
+//! rather than returning an error — there is nothing to assert on. The
+//! measurement is the console output, and the last count printed before a
+//! stall is the ceiling.
+//!
+//! Arms — run each in its own boot:
+//!
 //!   gstress props [N]        # N vertices, one property on every one
 //!   gstress props [N] none   # control: the same N vertices, no properties
 //!
-//! The control is not optional. Without it, a stall cannot be attributed to
-//! property objects rather than to vertex count. v4 is known to reach 55 101
-//! vertices without properties, so if the hypothesis holds the two arms should
-//! diverge by roughly 3×.
+//! The control is not optional: without it a stall cannot be attributed to
+//! property objects rather than to vertex count.
 
 use std::time::Instant;
 
@@ -15,6 +28,9 @@ use crate::{heartbeat, HARNESS_REV};
 
 const GRAPH: &str = "gstress-props";
 
+/// Predicted ceiling, printed so the operator can watch it being crossed (or
+/// not): ~2.37 M usable frames / ~149 frames per reference-free persistent
+/// object. The number under test, not an input.
 const PREDICTED_CEILING: usize = 15_900;
 
 pub fn run(n: usize, with_props: bool) {
@@ -36,9 +52,18 @@ pub fn run(n: usize, with_props: bool) {
         PREDICTED_CEILING
     );
 
+    // Setup sits outside the timer and is reported: on a dirty image the
+    // reset must reclaim every property object a previous with-props run left
+    // behind, which can take a long time. Clear the image before this probe;
+    // if this line is not ~0, that is why.
+    let setup = Instant::now();
     Graph::reset_arena(GRAPH, twizzler_graph::DEFAULT_ARENA_CAP).expect("reset_arena");
     let mut g =
         Graph::open_or_create_arena(GRAPH, twizzler_graph::DEFAULT_ARENA_CAP).expect("open");
+    println!(
+        "GSTRESS SETUP: reset + open {:.2}s (excluded from the run total)",
+        setup.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     let mut made = 0usize;
