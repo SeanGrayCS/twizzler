@@ -13,14 +13,9 @@
 
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
-    collections::{
-        hachage::{PersistentHashMap, PersistentHashMapBase},
-        vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
-    },
-    error::TwzError,
+    collections::hachage::{PersistentHashMap, PersistentHashMapBase},
     marker::{BaseType, Invariant},
     object::{MapFlags, ObjID, Object, ObjectBuilder, TypedObject},
-    ptr::InvPtr,
 };
 use twizzler_rt_abi::error::ArgumentError;
 
@@ -32,7 +27,7 @@ use crate::{
     props::{self, PropValue},
     reclaim,
     segvec::SegVec,
-    vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView},
+    vertex::{Labels, VertexId, VertexInfo, VertexRef, VertexView},
 };
 
 pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
@@ -138,28 +133,28 @@ pub struct Graph {
     edges: SegVec<EdgeRef>,
     labels: SegVec<LabelEntry>,
     vindex: VIndex,
-    store: Option<ArenaStore>,
+    /// Vertices and adjacency. `verts` is a vestigial empty registry awaiting
+    /// stage 5 of the v3 retirement.
+    store: ArenaStore,
 }
 
 impl Graph {
     pub fn is_arena(&self) -> bool {
-        self.store.is_some()
+        true
     }
 
     pub fn arena_count(&self) -> usize {
-        self.store.as_ref().map_or(0, |s| s.arena_count())
+        self.store.arena_count()
     }
 
     pub fn arena_sync_count(&self) -> usize {
-        self.store.as_ref().map_or(0, |s| s.sync_count())
+        self.store.sync_count()
     }
 
     /// Diagnostic pass-through to [`ArenaStore::arena_vertex_counts`]:
     /// `(policy view, ground truth)` vertices per arena.
     pub fn arena_vertex_counts(&self) -> (Vec<usize>, Vec<usize>) {
-        self.store
-            .as_ref()
-            .map_or_else(|| (Vec::new(), Vec::new()), |s| s.arena_vertex_counts())
+        self.store.arena_vertex_counts()
     }
 }
 
@@ -240,12 +235,7 @@ impl Graph {
                         let r = root.base();
                         (r.arena_dir_raw, r.arena_locs_raw)
                     };
-                    Some(ArenaStore::open(
-                        dir,
-                        locs,
-                        Box::new(FillTo { cap: arena_cap }),
-                        cap,
-                    )?)
+                    ArenaStore::open(dir, locs, Box::new(FillTo { cap: arena_cap }), cap)?
                 };
                 return Ok(Graph {
                     root_id: node.id.into(),
@@ -268,12 +258,8 @@ impl Graph {
         let edges = SegVec::create(cap)?;
         let labels = SegVec::create(cap)?;
         let vindex = VIndex::new_persist()?;
-        let store = Some(ArenaStore::create(
-            Box::new(FillTo { cap: arena_cap }),
-            cap,
-        )?);
-        let (arena_dir_raw, arena_locs_raw) =
-            store.as_ref().map_or((0, 0), |s| s.ids());
+        let store = ArenaStore::create(Box::new(FillTo { cap: arena_cap }), cap)?;
+        let (arena_dir_raw, arena_locs_raw) = store.ids();
 
         let root = ObjectBuilder::<GraphRoot>::default()
             .persist(true)
@@ -534,11 +520,8 @@ impl Graph {
             labels.dir_raw(),
             vindex.object().id().raw(),
         );
-        let store = Some(ArenaStore::create(
-            Box::new(FillTo { cap: arena_cap }),
-            cap,
-        )?);
-        let (arena_dir_raw, arena_locs_raw) = store.as_ref().map_or((0, 0), |s| s.ids());
+        let store = ArenaStore::create(Box::new(FillTo { cap: arena_cap }), cap)?;
+        let (arena_dir_raw, arena_locs_raw) = store.ids();
 
         // Rewrite the root transactionally so the change is synced to the
         // backing store; a raw write would be lost on reboot.
@@ -563,58 +546,9 @@ impl Graph {
     pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
         let lbl = self.intern_label(label)?;
 
-        // VERSION 4: one arena allocation, shared with `cap-1` other vertices,
-        // instead of three whole objects (vertex + two adjacency `VecObject`s).
-        if self.store.is_some() {
-            let id = {
-                let store = self.store.as_mut().expect("arena graph");
-                store.add_vertex(lbl, name, target.raw())?
-            };
-            self.vindex.insert(
-                VKey {
-                    label: lbl,
-                    name: NameKey::new(name),
-                },
-                id,
-            )?;
-            return Ok(VertexId(id));
-        }
-
-        let id = self.verts.len() as u64;
-
-        // Per-vertex adjacency lists, split by direction.
-        let out_adj: VecObject<AdjEntry, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let in_adj: VecObject<AdjEntry, VecObjectAlloc> =
-            VecObject::new(ObjectBuilder::default().persist(true))?;
-        let out_raw = out_adj.object().id().raw();
-        let in_raw = in_adj.object().id().raw();
-
-        let vobj = ObjectBuilder::<Vertex>::default()
-            .persist(true)
-            .build(Vertex {
-                id,
-                label: lbl,
-                name: NameKey::new(name),
-                target_raw: target.raw(),
-                props_raw: 0,
-                flags: 0,
-                out_raw,
-                in_raw,
-            })?;
-
-        self.verts.push(VertexRef {
-            id,
-            label: lbl,
-            name: NameKey::new(name),
-            target_raw: target.raw(),
-            props_raw: 0,
-            flags: 0,
-            vobj_raw: vobj.id().raw(),
-            out_raw,
-            in_raw,
-        })?;
-
+        // One arena allocation, shared with `cap-1` other vertices, instead of
+        // the three whole objects v3 used (vertex + two adjacency `VecObject`s).
+        let id = self.store.add_vertex(lbl, name, target.raw())?;
         self.vindex.insert(
             VKey {
                 label: lbl,
@@ -625,107 +559,27 @@ impl Graph {
         Ok(VertexId(id))
     }
 
-    /// Add a typed edge `from -> to`: create the edge object (endpoints as
-    /// invariant pointers), append to `from`'s outgoing list and `to`'s incoming
-    /// list.
+    /// Add a typed edge `from -> to`: append an adjacency entry to `from`'s
+    /// outgoing chain and `to`'s incoming chain. The edge itself is only a
+    /// registry row — v3's separate edge object is gone.
     pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
         let lbl = self.intern_label(label)?;
 
-        // VERSION 4: no edge object at all. The adjacency entry carries the
-        // edge id and label, and its `InvPtr` neighbour costs no FOT entry when
-        // both endpoints share an arena.
-        if self.store.is_some() {
-            let id = self.edges.len() as u64;
-            {
-                let store = self.store.as_mut().expect("arena graph");
-                if !store.is_alive(from.0) || !store.is_alive(to.0) {
-                    return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
-                }
-                store.add_edge(from.0, to.0, id, lbl)?;
-            }
-            self.edges.push_nosync(EdgeRef {
-                id,
-                label: lbl,
-                from_id: from.0,
-                to_id: to.0,
-                eobj_raw: 0, // no edge object on this layout
-                props_raw: 0,
-                flags: 0,
-            })?;
-            return Ok(EdgeId(id));
-        }
-        let (from_vobj, from_out, _from_in) = self
-            .vertex_locs(from)
-            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-        let (to_vobj, _to_out, to_in) = self
-            .vertex_locs(to)
-            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-
-        let fobj =
-            Object::<Vertex>::map(ObjID::new(from_vobj), MapFlags::READ | MapFlags::PERSIST)?;
-        let tobj = Object::<Vertex>::map(ObjID::new(to_vobj), MapFlags::READ | MapFlags::PERSIST)?;
-
+        // No edge object at all. The adjacency entry carries the edge id and
+        // label, and its `InvPtr` neighbour costs no FOT entry when both
+        // endpoints share an arena.
         let id = self.edges.len() as u64;
-
-        // The edge object: both endpoints are invariant pointers.
-        let eobj = ObjectBuilder::<Edge>::default()
-            .persist(true)
-            .build_inplace(|tx| {
-                let e = Edge {
-                    id,
-                    label: lbl,
-                    from_id: from.0,
-                    to_id: to.0,
-                    from: InvPtr::new(&tx, fobj.base_ref())?,
-                    to: InvPtr::new(&tx, tobj.base_ref())?,
-                    props_raw: 0,
-                    flags: 0,
-                };
-                tx.write(e)
-            })?;
-
-        // `from` outgoing list: neighbor is `to`.
-        {
-            let mut adj = VecObject::<AdjEntry, VecObjectAlloc>::from(Object::<
-                TwzVec<AdjEntry, VecObjectAlloc>,
-            >::map(
-                ObjID::new(from_out),
-                rw(),
-            )?);
-            adj.push_ctor(|place| {
-                let a = AdjEntry {
-                    label: lbl,
-                    edge: InvPtr::new(&place, eobj.base_ref())?,
-                    neighbor: InvPtr::new(&place, tobj.base_ref())?,
-                };
-                Ok(place.write(a))
-            })?;
+        if !self.store.is_alive(from.0) || !self.store.is_alive(to.0) {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-
-        // `to` incoming list: neighbor is `from`.
-        {
-            let mut adj = VecObject::<AdjEntry, VecObjectAlloc>::from(Object::<
-                TwzVec<AdjEntry, VecObjectAlloc>,
-            >::map(
-                ObjID::new(to_in), rw()
-            )?);
-            adj.push_ctor(|place| {
-                let a = AdjEntry {
-                    label: lbl,
-                    edge: InvPtr::new(&place, eobj.base_ref())?,
-                    neighbor: InvPtr::new(&place, fobj.base_ref())?,
-                };
-                Ok(place.write(a))
-            })?;
-        }
-
-        self.edges.push(EdgeRef {
+        self.store.add_edge(from.0, to.0, id, lbl)?;
+        self.edges.push_nosync(EdgeRef {
             id,
             label: lbl,
             from_id: from.0,
             to_id: to.0,
-            eobj_raw: eobj.id().raw(),
-            props_raw: 0, // v3 keeps the id in the edge object itself
+            eobj_raw: 0, // no edge object on this layout
+            props_raw: 0,
             flags: 0,
         })?;
         Ok(EdgeId(id))
@@ -751,73 +605,44 @@ impl Graph {
         if !self.is_vertex_alive(id) {
             return None;
         }
-        // On v4 there are no per-direction adjacency objects to name: the
-        // collectors branch on `is_arena` and walk the arena's chunk chain, so
-        // these two are unused. They stay zero rather than becoming an
-        // `Option`, which would add a match to every v3 read for no gain.
-        if self.store.is_some() {
-            return Some(VertexView {
-                graph: self,
-                id,
-                out_raw: 0,
-                in_raw: 0,
-            });
-        }
-        let (_vobj, out_raw, in_raw) = self.vertex_locs(id)?;
+        // `out_raw`/`in_raw` are vestigial: there are no per-direction adjacency
+        // objects to name, and the collectors walk the arena's chunk chain
+        // instead. They stay on `VertexView` only until stage 5 removes them.
         Some(VertexView {
             graph: self,
             id,
-            out_raw,
-            in_raw,
+            out_raw: 0,
+            in_raw: 0,
         })
     }
 
     /// Convenience: outgoing/incoming/both neighbors of `id` (no predicate).
     pub fn out_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
-        if self.store.is_some() {
-            return self.arena_neighbors(id, labels, true, false);
-        }
-        self.vertex_view(id)
-            .map(|v| v.out_neighbors(labels))
-            .unwrap_or_default()
+        self.arena_neighbors(id, labels, true, false)
     }
     pub fn in_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
-        if self.store.is_some() {
-            return self.arena_neighbors(id, labels, false, true);
-        }
-        self.vertex_view(id)
-            .map(|v| v.in_neighbors(labels))
-            .unwrap_or_default()
+        self.arena_neighbors(id, labels, false, true)
     }
     pub fn both_neighbors(&self, id: VertexId, labels: Labels) -> Vec<VertexId> {
-        if self.store.is_some() {
-            return self.arena_neighbors(id, labels, true, true);
-        }
-        self.vertex_view(id)
-            .map(|v| v.both_neighbors(labels))
-            .unwrap_or_default()
+        self.arena_neighbors(id, labels, true, true)
     }
 
     // --- arena seams for the DSL (`vertex.rs`) ------------------------------
 
-    /// `(edge_id, edge_label, neighbour_id)` in traversal order, or empty on
-    /// v3. `VertexView` uses this instead of mapping adjacency objects.
+    /// `(edge_id, edge_label, neighbour_id)` in traversal order. `VertexView`
+    /// uses this instead of mapping adjacency objects.
     pub(crate) fn arena_adjacency(
         &self,
         id: VertexId,
         out: bool,
         inc: bool,
     ) -> Vec<(u64, u32, u64)> {
-        let Some(store) = self.store.as_ref() else {
-            return Vec::new();
-        };
         // The store hides tombstoned *vertices* but knows nothing about the
         // edge registry, so a deleted edge would still yield its neighbour.
-        // v3 filters on `is_edge_alive` per entry; this is where v4 has to do
-        // the same, since `Graph` owns the registry. Missing it would diverge
-        // only on deletes — a bug that shows up as a wrong query result long
-        // after the change that caused it.
-        store
+        // Filtering it out has to happen here, since `Graph` owns the registry.
+        // Missing it would diverge only on deletes — a bug that shows up as a
+        // wrong query result long after the change that caused it.
+        self.store
             .adjacency(id.0, out, inc)
             .into_iter()
             .filter(|(eid, _, _)| self.is_edge_alive(EdgeId(*eid)))
@@ -827,12 +652,11 @@ impl Graph {
     /// A neighbour's `(label, name)` for predicate evaluation — no `String`
     /// allocation, since most candidates are filtered out.
     pub(crate) fn arena_vertex_key(&self, id: u64) -> Option<(u32, NameKey)> {
-        self.store.as_ref()?.vertex_key(id)
+        self.store.vertex_key(id)
     }
 
-    /// An edge's label and endpoints from the registry, which both layouts
-    /// share. Used to build `EdgeHandle`s without an edge *object*, which v4
-    /// does not have.
+    /// An edge's label and endpoints from the registry. Used to build
+    /// `EdgeHandle`s without an edge *object*, which this layout does not have.
     pub(crate) fn edge_endpoints(&self, e: EdgeId) -> Option<(u32, VertexId, VertexId)> {
         let r = self.edges.get_ref(e.0 as usize)?;
         if r.id != e.0 || r.flags & TOMBSTONE != 0 {
@@ -861,18 +685,7 @@ impl Graph {
 
     /// All live vertex ids in the graph. Linear scan.
     pub fn vertices(&self) -> Vec<VertexId> {
-        if let Some(store) = &self.store {
-            return store.vertices().into_iter().map(VertexId).collect();
-        }
-        let mut out = Vec::new();
-        for i in 0..self.verts.len() {
-            if let Some(r) = self.verts.get_ref(i) {
-                if r.flags & TOMBSTONE == 0 {
-                    out.push(VertexId(r.id));
-                }
-            }
-        }
-        out
+        self.store.vertices().into_iter().map(VertexId).collect()
     }
 
     /// An edge's label and endpoints by id, or `None` if the edge is deleted.
@@ -891,29 +704,16 @@ impl Graph {
 
     /// Delete a vertex (tombstone). Its incident edges become hidden too, since
     /// an edge is alive only while both endpoints are. No-op if already gone.
+    ///
+    /// v3 additionally freed the vertex's two adjacency objects and its property
+    /// object here. v4 has no per-vertex adjacency objects at all, and the
+    /// property object is deliberately left named by the tombstoned record: it
+    /// is unreachable through the graph but still allocated, so
+    /// `owned_object_ids` must keep reporting it or nothing will ever free it.
     pub fn delete_vertex(&mut self, id: VertexId) -> Result<()> {
-        if let Some(store) = self.store.as_mut() {
-            store.delete_vertex(id.0)?;
-            return Ok(());
-        }
-        let idx = id.0 as usize;
-        if idx >= self.verts.len() {
-            return Ok(());
-        }
-        let freeable = self.verts.with_mut_at(idx, |r| {
-            if r.id != id.0 || r.flags & TOMBSTONE != 0 {
-                return Ok(Vec::new()); // unknown id, or already deleted
-            }
-            r.flags |= TOMBSTONE;
-            let ids = vec![r.out_raw, r.in_raw, r.props_raw];
-            // Clear the ids in the same transaction that sets the tombstone, so
-            // the record never names an object that no longer exists.
-            r.out_raw = 0;
-            r.in_raw = 0;
-            r.props_raw = 0;
-            Ok(ids)
-        })?;
-        let _ = freeable;
+        // `?` rather than a bare tail: the store speaks `TwzError`, the graph
+        // API speaks `GraphError`.
+        self.store.delete_vertex(id.0)?;
         Ok(())
     }
 
@@ -923,30 +723,19 @@ impl Graph {
         if idx >= self.edges.len() {
             return Ok(());
         }
-        let eobj_raw = self.edges.with_mut_at(idx, |r| {
-            if r.id != id.0 || r.flags & TOMBSTONE != 0 {
-                return Ok(0);
+        self.edges.with_mut_at(idx, |r| {
+            if r.id == id.0 && r.flags & TOMBSTONE == 0 {
+                r.flags |= TOMBSTONE;
             }
-            r.flags |= TOMBSTONE;
-            Ok(r.eobj_raw)
+            Ok(())
         })?;
-        if eobj_raw != 0 {
-            // The property id lives in the edge object, not the registry.
-            if let Ok(eo) =
-                Object::<Edge>::map(ObjID::new(eobj_raw), MapFlags::READ | MapFlags::PERSIST)
-            {
-                reclaim::delete_raw(eo.base().props_raw);
-            }
-        }
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn owned_object_ids(&self) -> Vec<u128> {
         let mut ids = Vec::new();
-        if let Some(store) = self.store.as_ref() {
-            ids.extend(store.owned_object_ids());
-        }
+        ids.extend(self.store.owned_object_ids());
         // Edges: no object to map, and the property id lives in the mirror.
         ids.extend(self.edges.object_ids());
         for i in 0..self.edges.len() {
@@ -965,7 +754,7 @@ impl Graph {
 
     #[cfg(test)]
     pub(crate) fn vertex_props_raw(&self, v: VertexId) -> Option<u128> {
-        self.store.as_ref().and_then(|s| s.props_raw(v.0))
+        self.store.props_raw(v.0)
     }
 
     #[cfg(test)]
@@ -974,35 +763,16 @@ impl Graph {
     }
 
     /// Set a property on a vertex; errors if it is missing or tombstoned.
-    /// Creates the vertex's property object on first use and records it in
-    /// the registry mirror (`VertexRef.props_raw`).
+    /// Creates the vertex's property object on first use and records its id in
+    /// the vertex's arena record.
     pub fn set_vertex_prop(&mut self, v: VertexId, key: &str, val: PropValue) -> Result<()> {
         if !self.is_vertex_alive(v) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        if self.store.is_some() {
-            let cur = self
-                .store
-                .as_ref()
-                .and_then(|s| s.props_raw(v.0))
-                .unwrap_or(0);
-            let new_raw = props::set_in(cur, key, val)?;
-            if new_raw != cur {
-                self.store
-                    .as_mut()
-                    .expect("arena graph")
-                    .set_props_raw(v.0, new_raw)?;
-            }
-            return Ok(());
-        }
-        let idx = v.0 as usize;
-        let cur = self.verts.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
+        let cur = self.store.props_raw(v.0).unwrap_or(0);
         let new_raw = props::set_in(cur, key, val)?;
         if new_raw != cur {
-            self.verts.with_mut_at(idx, |r| {
-                r.props_raw = new_raw;
-                Ok(())
-            })?;
+            self.store.set_props_raw(v.0, new_raw)?;
         }
         Ok(())
     }
@@ -1012,11 +782,7 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return None;
         }
-        if let Some(store) = &self.store {
-            return props::get_in(store.props_raw(v.0)?, key);
-        }
-        let raw = self.verts.get_ref(v.0 as usize)?.props_raw;
-        props::get_in(raw, key)
+        props::get_in(self.store.props_raw(v.0)?, key)
     }
 
     /// All of a vertex's properties in insertion order (empty if dead/unset).
@@ -1024,47 +790,22 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return Vec::new();
         }
-        if let Some(store) = &self.store {
-            return store.props_raw(v.0).map_or(Vec::new(), props::list_in);
-        }
-        match self.verts.get_ref(v.0 as usize) {
-            Some(r) => props::list_in(r.props_raw),
-            None => Vec::new(),
-        }
+        self.store.props_raw(v.0).map_or(Vec::new(), props::list_in)
     }
 
     /// Set a property on an edge; errors if it is missing, tombstoned, or has
-    /// a dead endpoint. Edge props live in the edge *object* (`EdgeRef` has
-    /// no `props_raw` field; see `props.rs`).
+    /// a dead endpoint. The property-object id lives in the edge registry,
+    /// since there is no edge object to hold it.
     pub fn set_edge_prop(&mut self, e: EdgeId, key: &str, val: PropValue) -> Result<()> {
         if !self.is_edge_alive(e) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        // VERSION 4 keeps the property-object id in the registry, since there
-        // is no edge object to hold it.
-        if self.store.is_some() {
-            let idx = e.0 as usize;
-            let cur = self.edges.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
-            let new_raw = props::set_in(cur, key, val)?;
-            if new_raw != cur {
-                self.edges.with_mut_at(idx, |r| {
-                    r.props_raw = new_raw;
-                    Ok(())
-                })?;
-            }
-            return Ok(());
-        }
-        let eobj_raw = self
-            .edges
-            .get_ref(e.0 as usize)
-            .map(|r| r.eobj_raw)
-            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-        let mut eo = Object::<Edge>::map(ObjID::new(eobj_raw), rw())?;
-        let cur = eo.base().props_raw;
+        let idx = e.0 as usize;
+        let cur = self.edges.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
         let new_raw = props::set_in(cur, key, val)?;
         if new_raw != cur {
-            eo.with_tx(|tx| {
-                tx.base_mut().props_raw = new_raw;
+            self.edges.with_mut_at(idx, |r| {
+                r.props_raw = new_raw;
                 Ok(())
             })?;
         }
@@ -1076,17 +817,7 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return None;
         }
-        if self.store.is_some() {
-            return props::get_in(self.edges.get_ref(e.0 as usize)?.props_raw, key);
-        }
-        let eobj_raw = self.edges.get_ref(e.0 as usize)?.eobj_raw;
-        let eo = Object::<Edge>::map(
-            ObjID::new(eobj_raw),
-            MapFlags::READ | MapFlags::PERSIST,
-        )
-        .ok()?;
-        let raw = eo.base().props_raw;
-        props::get_in(raw, key)
+        props::get_in(self.edges.get_ref(e.0 as usize)?.props_raw, key)
     }
 
     /// All of an edge's properties in insertion order (empty if dead/unset).
@@ -1094,41 +825,20 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return Vec::new();
         }
-        let Some(r) = self.edges.get_ref(e.0 as usize) else {
-            return Vec::new();
-        };
-        if self.store.is_some() {
-            return props::list_in(r.props_raw);
+        match self.edges.get_ref(e.0 as usize) {
+            Some(r) => props::list_in(r.props_raw),
+            None => Vec::new(),
         }
-        let eobj_raw = r.eobj_raw;
-        drop(r);
-        let Ok(eo) = Object::<Edge>::map(
-            ObjID::new(eobj_raw),
-            MapFlags::READ | MapFlags::PERSIST,
-        ) else {
-            return Vec::new();
-        };
-        let raw = eo.base().props_raw;
-        props::list_in(raw)
     }
 
     /// Whether a vertex exists and is not tombstoned.
     pub(crate) fn is_vertex_alive(&self, id: VertexId) -> bool {
-        if let Some(store) = &self.store {
-            return store.is_alive(id.0);
-        }
-        match self.verts.get_ref(id.0 as usize) {
-            Some(r) if r.id == id.0 => r.flags & TOMBSTONE == 0,
-            _ => false,
-        }
+        self.store.is_alive(id.0)
     }
 
-    /// Make the arena layout durable — one sync per arena plus the registries.
-    /// A no-op on v3, where every write already synced as it went.
+    /// Make the graph durable — one sync per arena plus the registries.
     pub fn sync(&mut self) -> Result<()> {
-        if let Some(store) = self.store.as_mut() {
-            store.sync_all()?;
-        }
+        self.store.sync_all()?;
         self.edges.flush()?;
         self.labels.flush()?;
         Ok(())
@@ -1150,51 +860,28 @@ impl Graph {
         let Some(lbl) = self.find_label(label) else {
             return Vec::new();
         };
-        if let Some(store) = &self.store {
-            return store
-                .vertices_by_label(lbl)
-                .into_iter()
-                .map(VertexId)
-                .collect();
-        }
-        let mut out = Vec::new();
-        for i in 0..self.verts.len() {
-            if let Some(r) = self.verts.get_ref(i) {
-                if r.flags & TOMBSTONE == 0 && r.label == lbl {
-                    out.push(VertexId(r.id));
-                }
-            }
-        }
-        out
+        self.store
+            .vertices_by_label(lbl)
+            .into_iter()
+            .map(VertexId)
+            .collect()
     }
 
     /// Read back a vertex's data from the registry, or `None` if it is deleted.
     /// O(1): ids are append indices, so the record is at position `id`.
     pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
-        if let Some(store) = &self.store {
-            let (lbl, name, target) = store.vertex_info(id.0)?;
-            return Some(VertexInfo {
-                label: self.label_name(lbl).unwrap_or_default(),
-                name,
-                target: ObjID::new(target),
-            });
-        }
-        let r = self.verts.get_ref(id.0 as usize)?;
-        if r.id != id.0 || r.flags & TOMBSTONE != 0 {
-            return None;
-        }
+        let (lbl, name, target) = self.store.vertex_info(id.0)?;
         Some(VertexInfo {
-            label: self.label_name(r.label).unwrap_or_default(),
-            name: r.name.as_str().to_string(),
-            target: ObjID::new(r.target_raw),
+            label: self.label_name(lbl).unwrap_or_default(),
+            name,
+            target: ObjID::new(target),
         })
     }
 
     /// Diagnostic, temporary — pass-through to
-    /// [`ArenaStore::debug_liveness`]. `None` on v3, which has no
-    /// record/mirror split to disagree about.
+    /// [`ArenaStore::debug_liveness`].
     pub fn debug_liveness(&self, id: VertexId) -> Option<String> {
-        Some(self.store.as_ref()?.debug_liveness(id.0))
+        Some(self.store.debug_liveness(id.0))
     }
 
 
@@ -1217,9 +904,6 @@ impl Graph {
     // --- private lookup helpers ---
 
     /// O(1): ids are append indices, so the record is at position `id`.
-    fn vertex_locs(&self, v: VertexId) -> Option<(u128, u128, u128)> {
-        vertex_locs_in(&self.verts, v)
-    }
 
     // The content-keyed lookups below are linear scans (where a hachage index
     // would later go): find_label by name, find_vertex by (label, name), and
@@ -1266,7 +950,7 @@ fn find_label_in(labels: &SegVec<LabelEntry>, name: &str) -> Option<u32> {
     None
 }
 
-/// Vertex object/adjacency locations by id. O(1): ids are append indices.
+#[allow(dead_code)]
 fn vertex_locs_in(verts: &SegVec<VertexRef>, v: VertexId) -> Option<(u128, u128, u128)> {
     let r = verts.get_ref(v.0 as usize)?;
     if r.id != v.0 {

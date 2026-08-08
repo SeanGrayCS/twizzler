@@ -13,9 +13,8 @@
 //! `VertexRef` is the registry mirror for enumeration and key lookup.
 
 use twizzler::{
-    collections::vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
     marker::{BaseType, Invariant},
-    object::{MapFlags, ObjID, Object},
+    object::ObjID,
     ptr::InvPtr,
 };
 
@@ -209,14 +208,6 @@ impl<'a> VertexView<'a> {
 
     // --- internals -----------------------------------------------------------
 
-    fn lists(&self, which: Which) -> Vec<u128> {
-        match which {
-            Which::Out => vec![self.out_raw],
-            Which::In => vec![self.in_raw],
-            Which::Both => vec![self.out_raw, self.in_raw],
-        }
-    }
-
     /// Which direction(s) `which` selects, as `(out, in)`.
     fn dirs(which: Which) -> (bool, bool) {
         match which {
@@ -234,60 +225,26 @@ impl<'a> VertexView<'a> {
     ) -> Vec<VertexId> {
         let filter = self.graph.resolve_labels(labels);
 
-        // VERSION 4: adjacency is a chunk chain inside the vertex's arena, so
-        // there is no per-direction object to map and no `InvPtr` to resolve
-        // for a neighbour in the same arena. Liveness of both the source and
-        // each neighbour is already applied by the store's walk.
-        if self.graph.is_arena() {
-            let (o, i) = Self::dirs(which);
-            let mut out = Vec::new();
-            for (_, elabel, nb) in self.graph.arena_adjacency(self.id, o, i) {
-                if !label_matches(&filter, elabel) {
-                    continue;
-                }
-                let Some((label, name)) = self.graph.arena_vertex_key(nb) else {
-                    continue;
-                };
-                let h = VertexHandle {
-                    id: VertexId(nb),
-                    label,
-                    name,
-                };
-                if pred(&h) {
-                    out.push(h.id);
-                }
-            }
-            return out;
-        }
-
+        // Adjacency is a chunk chain inside the vertex's arena, so there is no
+        // per-direction object to map and no `InvPtr` to resolve for a
+        // neighbour in the same arena. Liveness of the source, each neighbour
+        // and each edge is already applied by `Graph::arena_adjacency`.
+        let (o, i) = Self::dirs(which);
         let mut out = Vec::new();
-        for raw in self.lists(which) {
-            let Ok(obj) = Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(
-                ObjID::new(raw),
-                MapFlags::READ | MapFlags::PERSIST,
-            ) else {
+        for (_, elabel, nb) in self.graph.arena_adjacency(self.id, o, i) {
+            if !label_matches(&filter, elabel) {
+                continue;
+            }
+            let Some((label, name)) = self.graph.arena_vertex_key(nb) else {
                 continue;
             };
-            let adj = VecObject::from(obj);
-            for i in 0..adj.len() {
-                if let Some(e) = adj.get_ref(i) {
-                    if !label_matches(&filter, e.label) {
-                        continue;
-                    }
-                    let edge = unsafe { e.edge.resolve() };
-                    if !self.graph.is_edge_alive(EdgeId(edge.id)) {
-                        continue;
-                    }
-                    let nb = unsafe { e.neighbor.resolve() };
-                    let h = VertexHandle {
-                        id: VertexId(nb.id),
-                        label: nb.label,
-                        name: nb.name,
-                    };
-                    if pred(&h) {
-                        out.push(h.id);
-                    }
-                }
+            let h = VertexHandle {
+                id: VertexId(nb),
+                label,
+                name,
+            };
+            if pred(&h) {
+                out.push(h.id);
             }
         }
         out
@@ -301,55 +258,21 @@ impl<'a> VertexView<'a> {
     ) -> Vec<EdgeId> {
         let filter = self.graph.resolve_labels(labels);
 
-        // VERSION 4: the adjacency entry carries the edge id and label, and the
-        // endpoints come from the shared registry — there is no edge *object*
-        // on this layout to resolve them from.
-        if self.graph.is_arena() {
-            let (o, i) = Self::dirs(which);
-            let mut out = Vec::new();
-            for (eid, elabel, _) in self.graph.arena_adjacency(self.id, o, i) {
-                if !label_matches(&filter, elabel) {
-                    continue;
-                }
-                let Some((label, from, to)) = self.graph.edge_endpoints(EdgeId(eid)) else {
-                    continue;
-                };
-                let h = EdgeHandle::new(EdgeId(eid), label, from, to);
-                if pred(&h) {
-                    out.push(h.id());
-                }
-            }
-            return out;
-        }
-
+        // The adjacency entry carries the edge id and label, and the endpoints
+        // come from the shared registry — there is no edge *object* on this
+        // layout to resolve them from.
+        let (o, i) = Self::dirs(which);
         let mut out = Vec::new();
-        for raw in self.lists(which) {
-            let Ok(obj) = Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(
-                ObjID::new(raw),
-                MapFlags::READ | MapFlags::PERSIST,
-            ) else {
+        for (eid, elabel, _) in self.graph.arena_adjacency(self.id, o, i) {
+            if !label_matches(&filter, elabel) {
+                continue;
+            }
+            let Some((label, from, to)) = self.graph.edge_endpoints(EdgeId(eid)) else {
                 continue;
             };
-            let adj = VecObject::from(obj);
-            for i in 0..adj.len() {
-                if let Some(e) = adj.get_ref(i) {
-                    if !label_matches(&filter, e.label) {
-                        continue;
-                    }
-                    let edge = unsafe { e.edge.resolve() };
-                    if !self.graph.is_edge_alive(EdgeId(edge.id)) {
-                        continue;
-                    }
-                    let h = EdgeHandle::new(
-                        EdgeId(edge.id),
-                        edge.label,
-                        VertexId(edge.from_id),
-                        VertexId(edge.to_id),
-                    );
-                    if pred(&h) {
-                        out.push(h.id());
-                    }
-                }
+            let h = EdgeHandle::new(EdgeId(eid), label, from, to);
+            if pred(&h) {
+                out.push(h.id());
             }
         }
         out
