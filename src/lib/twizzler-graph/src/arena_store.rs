@@ -283,6 +283,27 @@ impl ArenaStore {
         self.policy.name()
     }
 
+    /// Diagnostic: vertices per arena as the placement policy sees them
+    /// (`stats`), beside the same counts recomputed from the location
+    /// registry (ground truth). Returns `(policy, actual)`.
+    ///
+    /// `place` decides rollover from `stats` alone, so if the two columns
+    /// disagree the cap is not doing what it says. `ArenaStore::open` rebuilds
+    /// `stats` from `locs` and counts tombstoned vertices as live, so the
+    /// harness's mid-run `E:reopen` is the first place to look.
+    pub fn arena_vertex_counts(&self) -> (Vec<usize>, Vec<usize>) {
+        let policy: Vec<usize> = self.stats.iter().map(|s| s.vertices).collect();
+        let mut actual = vec![0usize; self.open.len()];
+        for i in 0..self.locs.len() {
+            if let Some(l) = self.locs.get_ref(i) {
+                if let Some(c) = actual.get_mut(l.arena as usize) {
+                    *c += 1;
+                }
+            }
+        }
+        (policy, actual)
+    }
+
     fn new_arena(&mut self) -> Result<usize> {
         let arena = ArenaObject::new(ObjectBuilder::default().persist(true))?;
         let raw = arena.object().id().raw();

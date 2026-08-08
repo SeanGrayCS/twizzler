@@ -74,7 +74,13 @@ const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 /// object size limit while amortizing segment creation.
 pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
 
-pub const DEFAULT_ARENA_CAP: usize = 4096;
+/// Default vertices packed per arena on the VERSION 4 layout.
+///
+/// The benefit saturates once the interconnected set fits in one arena:
+/// 16384 and 65536 were indistinguishable on every metric, because both held
+/// all 6 001 phase-A vertices in a single arena. Cap only matters up to the
+/// working set being connected.
+pub const DEFAULT_ARENA_CAP: usize = 16384;
 
 /// Read/write/persist map flags for reopening mutable registries.
 fn rw() -> MapFlags {
@@ -150,6 +156,14 @@ impl Graph {
 
     pub fn arena_sync_count(&self) -> usize {
         self.store.as_ref().map_or(0, |s| s.sync_count())
+    }
+
+    /// Diagnostic pass-through to [`ArenaStore::arena_vertex_counts`]:
+    /// `(policy view, ground truth)` vertices per arena. Empty on v3.
+    pub fn arena_vertex_counts(&self) -> (Vec<usize>, Vec<usize>) {
+        self.store
+            .as_ref()
+            .map_or_else(|| (Vec::new(), Vec::new()), |s| s.arena_vertex_counts())
     }
 }
 
