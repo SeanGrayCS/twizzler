@@ -36,18 +36,9 @@ pub(crate) const TEST_ARENA_CAP: usize = 64;
 
 /// Clear any existing graph of this name, then open a clean one on the arena
 /// layout (the current format).
-///
-/// Use [`fresh_v3`] only where the *old layout itself* is under test.
 // Each slice uses only some of these helpers; the unused ones are not dead.
 #[allow(dead_code)]
 pub(crate) fn fresh(name: &str) -> Graph {
     Graph::reset_arena(name, TEST_ARENA_CAP).expect("reset arena graph");
     Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("create arena graph")
-}
-
-/// A clean graph on the legacy v3 layout.
-#[allow(dead_code)]
-pub(crate) fn fresh_v3(name: &str) -> Graph {
-    Graph::reset(name).expect("reset graph");
-    Graph::open_or_create(name).expect("create graph")
 }

@@ -1,7 +1,7 @@
-//! Arena graphs are reset with [`Graph::reset_arena`] rather than
-//! [`Graph::reset`]: the disk image survives between QEMU runs, and a plain
-//! reset would rebuild a leftover graph as v3, so the second run of this file
-//! would silently be testing v3 against v3 and passing.
+//! `Graph` on the arena layout: read paths, mutation, and packing.
+//!
+//! Graphs here use a deliberately tiny `ARENA_CAP` so a handful of inserts
+//! crosses an arena boundary; that is the seam most likely to break.
 
 use twizzler::object::ObjID;
 
@@ -9,17 +9,17 @@ use crate::{Graph, Labels, PropValue, VertexId};
 
 const ARENA_CAP: usize = 4;
 
-/// A clean graph on each layout, under distinct names.
-fn pair(tag: &str) -> (Graph, Graph) {
-    let legacy_name = format!("t-ab-v3-{tag}");
-    let arena_name = format!("t-ab-v4-{tag}");
-    Graph::reset(&legacy_name).expect("reset v3");
-    Graph::reset_arena(&arena_name, ARENA_CAP).expect("reset v4");
-    let legacy = Graph::open_or_create(&legacy_name).expect("open v3");
-    let arena = Graph::open_or_create_arena(&arena_name, ARENA_CAP).expect("open v4");
-    assert!(!legacy.is_arena(), "control must be on the v3 layout");
-    assert!(arena.is_arena(), "subject must be on the v4 layout");
-    (legacy, arena)
+/// A clean arena graph.
+///
+/// Uses [`Graph::reset_arena`] rather than [`Graph::reset`] deliberately: the
+/// disk image survives between QEMU runs, and a plain reset would rebuild a
+/// leftover graph in whatever format it already had.
+fn fresh_arena(tag: &str) -> Graph {
+    let name = format!("t-ab-{tag}");
+    Graph::reset_arena(&name, ARENA_CAP).expect("reset v4");
+    let g = Graph::open_or_create_arena(&name, ARENA_CAP).expect("open v4");
+    assert!(g.is_arena(), "subject must be on the arena layout");
+    g
 }
 
 /// A hub with four labelled spokes, plus a chain among the spokes. Returns the
@@ -43,187 +43,212 @@ fn build(g: &mut Graph) -> (VertexId, Vec<VertexId>) {
 }
 
 #[test]
-fn arena_matches_legacy_on_every_read_path() {
-    let (mut legacy, mut arena) = pair("reads");
-    let (hub_a, spokes_a) = build(&mut legacy);
-    let (hub_b, spokes_b) = build(&mut arena);
-    assert_eq!(hub_a, hub_b, "ids are append indices on both layouts");
-    assert_eq!(spokes_a, spokes_b);
+fn arena_read_paths_return_the_expected_shape() {
+    let mut g = fresh_arena("reads");
+    let (hub, spokes) = build(&mut g);
 
-    // Whole-graph enumeration.
-    assert_eq!(legacy.vertices(), arena.vertices());
-    assert_eq!(
-        legacy.vertices_by_label("spoke"),
-        arena.vertices_by_label("spoke")
-    );
-    assert_eq!(legacy.vertices_by_label("hub"), arena.vertices_by_label("hub"));
-    assert!(arena.vertices_by_label("nonesuch").is_empty());
+    // Whole-graph enumeration, in insertion order.
+    let all: Vec<VertexId> = std::iter::once(hub).chain(spokes.iter().copied()).collect();
+    assert_eq!(g.vertices(), all);
+    assert_eq!(g.vertices_by_label("spoke"), spokes);
+    assert_eq!(g.vertices_by_label("hub"), vec![hub]);
+    assert!(g.vertices_by_label("nonesuch").is_empty());
 
     // Per-vertex records, including the target ObjID the arena record absorbed.
-    for v in std::iter::once(hub_a).chain(spokes_a.iter().copied()) {
-        let l = legacy.vertex_info(v).expect("v3 info");
-        let a = arena.vertex_info(v).expect("v4 info");
-        assert_eq!((l.label, l.name, l.target), (a.label, a.name, a.target));
+    let h = g.vertex_info(hub).expect("hub info");
+    assert_eq!((h.label.as_str(), h.name.as_str()), ("hub", "h"));
+    assert_eq!(h.target, ObjID::new(0));
+    for (i, &s) in spokes.iter().enumerate() {
+        let info = g.vertex_info(s).expect("spoke info");
+        assert_eq!(info.label, "spoke");
+        assert_eq!(info.name, format!("s{i}"));
+        assert_eq!(
+            info.target,
+            ObjID::new(7 + i as u128),
+            "the arena record carries target_raw inline"
+        );
     }
 
     // Name lookup through the index.
-    for name in ["h", "s0", "s3"] {
-        let lbl = if name == "h" { "hub" } else { "spoke" };
-        assert_eq!(legacy.find_vertex(lbl, name), arena.find_vertex(lbl, name));
+    assert_eq!(g.find_vertex("hub", "h"), Some(hub));
+    for (i, &s) in spokes.iter().enumerate() {
+        assert_eq!(g.find_vertex("spoke", &format!("s{i}")), Some(s));
     }
-    assert_eq!(arena.find_vertex("spoke", "missing"), None);
+    assert_eq!(g.find_vertex("spoke", "missing"), None);
+    assert_eq!(g.find_vertex("nonesuch", "h"), None, "label is part of the key");
 
-    // Adjacency, unfiltered and filtered, in both directions.
-    for v in std::iter::once(hub_a).chain(spokes_a.iter().copied()) {
-        assert_eq!(
-            legacy.out_neighbors(v, Labels::any()),
-            arena.out_neighbors(v, Labels::any()),
-            "out-neighbours of {v:?}"
-        );
-        assert_eq!(
-            legacy.in_neighbors(v, Labels::any()),
-            arena.in_neighbors(v, Labels::any()),
-            "in-neighbours of {v:?}"
-        );
-        assert_eq!(
-            legacy.both_neighbors(v, Labels::any()),
-            arena.both_neighbors(v, Labels::any()),
-            "both-neighbours of {v:?} — including out-then-in ordering"
-        );
+    // Adjacency. The hub points at every spoke; the spokes form a chain.
+    assert_eq!(g.out_neighbors(hub, Labels::any()), spokes);
+    assert!(g.in_neighbors(hub, Labels::any()).is_empty());
+    for (i, &s) in spokes.iter().enumerate() {
+        let out = g.out_neighbors(s, Labels::any());
+        let expected_out: Vec<VertexId> = spokes.get(i + 1).copied().into_iter().collect();
+        assert_eq!(out, expected_out, "chain step from s{i}");
+
+        // Hub first (added in the spoke loop), then the chain predecessor.
+        let mut expected_in = vec![hub];
+        if i > 0 {
+            expected_in.push(spokes[i - 1]);
+        }
+        assert_eq!(g.in_neighbors(s, Labels::any()), expected_in, "in of s{i}");
+
+        // `both` is out-then-in, and that ordering is part of the contract.
+        let mut expected_both = expected_out.clone();
+        expected_both.extend(expected_in);
+        assert_eq!(g.both_neighbors(s, Labels::any()), expected_both);
     }
-    for filter in [
-        Labels::these(&["even"]),
-        Labels::these(&["odd"]),
-        Labels::these(&["even", "odd"]),
-        Labels::these(&["next"]),
-        Labels::these(&["absent"]),
-    ] {
-        assert_eq!(
-            legacy.out_neighbors(hub_a, filter),
-            arena.out_neighbors(hub_a, filter)
-        );
-    }
+
+    // Label filters, including one that matches nothing.
+    assert_eq!(
+        g.out_neighbors(hub, Labels::these(&["even"])),
+        vec![spokes[0], spokes[2]]
+    );
+    assert_eq!(
+        g.out_neighbors(hub, Labels::these(&["odd"])),
+        vec![spokes[1], spokes[3]]
+    );
+    assert_eq!(
+        g.out_neighbors(hub, Labels::these(&["even", "odd"])),
+        spokes,
+        "a multi-label filter unions, preserving insertion order"
+    );
+    assert!(g.out_neighbors(hub, Labels::these(&["next"])).is_empty());
+    assert!(g.out_neighbors(hub, Labels::these(&["absent"])).is_empty());
+}
+
+/// Properties and tombstones — the paths most likely to break, since the arena
+/// record holds `props_raw` inline where v3 kept it in a registry mirror.
+#[test]
+fn arena_properties_and_vertex_deletes() {
+    let mut g = fresh_arena("mutate");
+    let (hub, spokes) = build(&mut g);
+
+    g.set_vertex_prop(hub, "age", PropValue::I64(30)).unwrap();
+    g.set_vertex_prop(hub, "ok", PropValue::Bool(true)).unwrap();
+    g.set_vertex_prop(spokes[1], "age", PropValue::I64(7))
+        .unwrap();
+
+    assert_eq!(g.get_vertex_prop(hub, "age"), Some(PropValue::I64(30)));
+    assert_eq!(g.get_vertex_prop(hub, "ok"), Some(PropValue::Bool(true)));
+    assert_eq!(g.get_vertex_prop(hub, "absent"), None);
+    assert_eq!(g.get_vertex_prop(spokes[1], "age"), Some(PropValue::I64(7)));
+    assert_eq!(
+        g.vertex_props(hub).len(),
+        2,
+        "both keys, and no leakage from the other vertex's property object"
+    );
+
+    g.delete_vertex(spokes[1]).unwrap();
+
+    assert!(g.vertex_info(spokes[1]).is_none());
+    assert_eq!(g.find_vertex("spoke", "s1"), None);
+    assert_eq!(
+        g.vertices(),
+        vec![hub, spokes[0], spokes[2], spokes[3]],
+        "the tombstoned spoke leaves a gap rather than renumbering"
+    );
+    assert_eq!(
+        g.out_neighbors(hub, Labels::any()),
+        vec![spokes[0], spokes[2], spokes[3]],
+        "A4-F2: a dead *neighbour* is hidden from the hub's adjacency"
+    );
+    assert!(
+        g.out_neighbors(spokes[0], Labels::any()).is_empty(),
+        "s0's only out-edge pointed at the deleted s1"
+    );
+    assert!(g.vertex_props(spokes[1]).is_empty());
+    assert!(g.get_vertex_prop(spokes[1], "age").is_none());
+}
+
+/// Edge deletion. The arena store hides tombstoned *vertices* but knows nothing
+/// about the edge registry, so without an explicit `is_edge_alive` filter in
+/// `Graph` a deleted edge would still yield its neighbour — a wrong answer
+/// visible only after a delete.
+#[test]
+fn arena_hides_a_deleted_edge() {
+    let mut g = fresh_arena("deledge");
+    let (hub, spokes) = build(&mut g);
+
+    let e0 = g
+        .vertex_view(hub)
+        .expect("hub view")
+        .out_edges(Labels::any())
+        .first()
+        .copied()
+        .expect("hub has an outgoing edge");
+    let info = g.edge_info(e0).expect("edge 0 is live");
+    assert_eq!((info.from, info.to), (hub, spokes[0]));
+
+    g.delete_edge(e0).unwrap();
+
+    assert!(g.edge_info(e0).is_none());
+    assert_eq!(
+        g.out_neighbors(hub, Labels::any()),
+        spokes[1..].to_vec(),
+        "the deleted edge's neighbour is dropped from the hub"
+    );
+    assert!(
+        g.in_neighbors(spokes[0], Labels::any()).is_empty(),
+        "and from the far side's inbound list"
+    );
+
+    // The endpoints themselves survive — deleting an edge is not deleting a
+    // vertex, which is the mistake the tombstone semantics invite.
+    assert_eq!(
+        g.vertices(),
+        std::iter::once(hub).chain(spokes.iter().copied()).collect::<Vec<_>>()
+    );
+    assert!(g.vertex_info(spokes[0]).is_some());
 }
 
 #[test]
-fn arena_matches_legacy_on_properties_and_deletes() {
-    let (mut legacy, mut arena) = pair("mutate");
-    let (hub, spokes) = build(&mut legacy);
-    build(&mut arena);
+fn arena_survives_bulk_vertex_deletion() {
+    const N: usize = 70;
+    let mut g = fresh_arena("bulkdel");
 
-    for g in [&mut legacy, &mut arena] {
-        g.set_vertex_prop(hub, "age", PropValue::I64(30)).unwrap();
-        g.set_vertex_prop(hub, "ok", PropValue::Bool(true)).unwrap();
-        g.set_vertex_prop(spokes[1], "age", PropValue::I64(7))
+    for i in 0..N {
+        g.add_vertex("v", &format!("v{i}"), ObjID::new(i as u128))
             .unwrap();
     }
-
-    assert_eq!(
-        legacy.get_vertex_prop(hub, "age"),
-        arena.get_vertex_prop(hub, "age")
-    );
-    assert_eq!(legacy.vertex_props(hub), arena.vertex_props(hub));
-    assert_eq!(
-        legacy.get_vertex_prop(hub, "absent"),
-        arena.get_vertex_prop(hub, "absent")
-    );
-
-    legacy.delete_vertex(spokes[1]).unwrap();
-    arena.delete_vertex(spokes[1]).unwrap();
-
-    assert!(legacy.vertex_info(spokes[1]).is_none());
-    assert!(arena.vertex_info(spokes[1]).is_none());
-    assert_eq!(legacy.vertices(), arena.vertices());
-    assert_eq!(
-        legacy.find_vertex("spoke", "s1"),
-        arena.find_vertex("spoke", "s1")
-    );
-    assert_eq!(
-        legacy.out_neighbors(hub, Labels::any()),
-        arena.out_neighbors(hub, Labels::any()),
-        "the deleted spoke is hidden from the hub on both layouts"
-    );
-    assert_eq!(
-        legacy.vertex_props(spokes[1]),
-        arena.vertex_props(spokes[1])
-    );
-    assert!(arena.get_vertex_prop(spokes[1], "age").is_none());
-}
-
-#[test]
-fn arena_matches_legacy_when_an_edge_is_deleted() {
-    let (mut legacy, mut arena) = pair("deledge");
-    let (hub, spokes) = build(&mut legacy);
-    build(&mut arena);
-
-    // The hub->spokes[0] edge is edge id 0 on both layouts (append indices).
-    let e0 = crate::EdgeId(0);
-    assert_eq!(legacy.edge_info(e0).is_some(), arena.edge_info(e0).is_some());
-
-    legacy.delete_edge(e0).unwrap();
-    arena.delete_edge(e0).unwrap();
-
-    assert!(legacy.edge_info(e0).is_none());
-    assert!(arena.edge_info(e0).is_none());
-    assert_eq!(
-        legacy.out_neighbors(hub, Labels::any()),
-        arena.out_neighbors(hub, Labels::any()),
-        "the deleted edge's neighbour is dropped on both layouts"
-    );
-    assert_eq!(
-        legacy.in_neighbors(spokes[0], Labels::any()),
-        arena.in_neighbors(spokes[0], Labels::any())
-    );
-    // The endpoints themselves survive.
-    assert_eq!(legacy.vertices(), arena.vertices());
-    assert!(arena.vertex_info(spokes[0]).is_some());
-}
-
-/// `arena_liveness_mirrors_the_record` already asserts exactly this for two
-/// vertices and passes, so whatever the harness hit is not covered by it. The
-/// differences this test deliberately keeps are the ones the harness has and
-/// that test does not: the calls go through `Graph` rather than `ArenaStore`,
-/// the deletions are bulk rather than two, they span several arenas, and edges
-/// exist across arena boundaries before the delete. If this passes while the
-/// harness fails, the remaining difference is scale or the intervening phases,
-/// and the next probe belongs in `gstress` rather than here.
-#[test]
-fn arena_matches_legacy_after_bulk_vertex_deletion() {
-    const N: usize = 70; // 18 arenas at ARENA_CAP = 4
-    let (mut legacy, mut arena) = pair("bulkdel");
-
-    for g in [&mut legacy, &mut arena] {
-        for i in 0..N {
-            g.add_vertex("v", &format!("v{i}"), ObjID::new(i as u128))
-                .unwrap();
-        }
-        // Chain every vertex to one well outside its own arena, so records
-        // carry cross-arena adjacency at delete time.
-        for i in 0..N - 1 {
-            g.add_edge(VertexId(i as u64), "next", VertexId(((i + 37) % N) as u64))
-                .unwrap();
-        }
-        for i in (0..N).step_by(7) {
-            g.delete_vertex(VertexId(i as u64)).unwrap();
-        }
+    // Chain every vertex to one well outside its own arena, so records carry
+    // cross-arena adjacency at delete time.
+    for i in 0..N - 1 {
+        g.add_edge(VertexId(i as u64), "next", VertexId(((i + 37) % N) as u64))
+            .unwrap();
+    }
+    for i in (0..N).step_by(7) {
+        g.delete_vertex(VertexId(i as u64)).unwrap();
     }
 
     for i in 0..N {
         let deleted = i % 7 == 0;
-        let got = arena.vertex_info(VertexId(i as u64)).is_some();
+        let got = g.vertex_info(VertexId(i as u64)).is_some();
         assert_eq!(
             got,
             !deleted,
-            "v4 vertex_info for v{i}: got alive={got}, expected {}",
+            "vertex_info for v{i}: got alive={got}, expected {}",
             !deleted
         );
-        assert_eq!(
-            legacy.vertex_info(VertexId(i as u64)).is_some(),
-            got,
-            "layouts disagree on v{i}"
+    }
+    let expected: Vec<VertexId> = (0..N)
+        .filter(|i| i % 7 != 0)
+        .map(|i| VertexId(i as u64))
+        .collect();
+    assert_eq!(g.vertices(), expected, "the scan agrees with the bookkeeping");
+
+    // A dead vertex is hidden from its *neighbours'* lists too — the direction
+    // that only breaks after a delete.
+    for i in (0..N).step_by(7).take(4) {
+        let src = (i + N - 37) % N;
+        if src % 7 == 0 || src >= N - 1 {
+            continue;
+        }
+        assert!(
+            !g.out_neighbors(VertexId(src as u64), Labels::any())
+                .contains(&VertexId(i as u64)),
+            "v{src} still lists deleted v{i}"
         );
     }
-    assert_eq!(legacy.vertices(), arena.vertices(), "scan views agree");
 }
 
 #[test]
@@ -288,8 +313,14 @@ fn destroy_frees_the_graph_and_refuses_reopen() {
         let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
         let (hub, spokes) = build(&mut g);
         g.set_vertex_prop(hub, "k", PropValue::I64(1)).unwrap();
-        g.set_edge_prop(crate::EdgeId(0), "w", PropValue::I64(2))
-            .unwrap();
+        let e0 = g
+            .vertex_view(hub)
+            .expect("hub view")
+            .out_edges(Labels::any())
+            .first()
+            .copied()
+            .expect("hub has an outgoing edge");
+        g.set_edge_prop(e0, "w", PropValue::I64(2)).unwrap();
         assert!(!spokes.is_empty());
         g.sync().unwrap();
         g.arena_count()

@@ -87,7 +87,7 @@ fn stale_v2_root_detected_and_resettable() {
     use naming::{static_naming_factory, GetFlags};
     use twizzler::object::{MapFlags, Object, ObjectBuilder};
 
-    use crate::graph::{GraphRoot, MAGIC, VERSION};
+    use crate::graph::{GraphRoot, MAGIC, VERSION_ARENA};
 
     let name = "t-stalev2";
     let path = format!("data/{name}");
@@ -127,7 +127,7 @@ fn stale_v2_root_detected_and_resettable() {
     match Graph::open_or_create(name) {
         Err(GraphError::StaleVersion { found, expected }) => {
             assert_eq!(found, 2);
-            assert_eq!(expected, VERSION);
+            assert_eq!(expected, VERSION_ARENA);
         }
         Ok(_) => panic!("expected StaleVersion, but the stale graph opened"),
         Err(e) => panic!("expected StaleVersion, got {e:?}"),

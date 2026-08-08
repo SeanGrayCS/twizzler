@@ -63,7 +63,7 @@ pub(crate) const VERSION_ARENA: u32 = 7;
 
 /// Whether this build understands a graph in the given on-disk format.
 fn version_supported(v: u32) -> bool {
-    v == VERSION || v == VERSION_ARENA
+    v == VERSION_ARENA
 }
 const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
@@ -138,14 +138,10 @@ pub struct Graph {
     edges: SegVec<EdgeRef>,
     labels: SegVec<LabelEntry>,
     vindex: VIndex,
-    /// `Some` on a VERSION 4 graph: vertices and adjacency live here instead of
-    /// in `verts` and per-vertex objects. When set, `verts` stays empty and
-    /// every vertex path defers to the store.
     store: Option<ArenaStore>,
 }
 
 impl Graph {
-    /// Whether this graph uses the arena layout (VERSION 4).
     pub fn is_arena(&self) -> bool {
         self.store.is_some()
     }
@@ -159,7 +155,7 @@ impl Graph {
     }
 
     /// Diagnostic pass-through to [`ArenaStore::arena_vertex_counts`]:
-    /// `(policy view, ground truth)` vertices per arena. Empty on v3.
+    /// `(policy view, ground truth)` vertices per arena.
     pub fn arena_vertex_counts(&self) -> (Vec<usize>, Vec<usize>) {
         self.store
             .as_ref()
@@ -169,9 +165,10 @@ impl Graph {
 
 impl Graph {
     /// Open the graph registered at `data/<name>`, or create and register a
-    /// fresh one. If an existing graph has an incompatible format
-    /// (magic/version mismatch), this returns [`GraphError::StaleVersion`] and
-    /// leaves the existing graph intact; use [`Graph::reset`] to discard it.
+    /// fresh one at [`DEFAULT_ARENA_CAP`]. If an existing graph has an
+    /// incompatible format (magic/version mismatch — which now includes every
+    /// v3 graph) this returns [`GraphError::StaleVersion`] and leaves the
+    /// existing graph intact; use [`Graph::reset`] to discard it.
     pub fn open_or_create(name: &str) -> Result<Graph> {
         Self::open_or_create_with_capacity(name, DEFAULT_SEG_CAP)
     }
@@ -182,13 +179,16 @@ impl Graph {
     /// segment geometry must stay uniform for the graph's lifetime. (Small
     /// capacities let tests force segment rollover cheaply.)
     pub fn open_or_create_with_capacity(name: &str, cap: usize) -> Result<Graph> {
-        Self::open_inner(name, cap, None)
+        Self::open_inner(name, cap, DEFAULT_ARENA_CAP)
     }
 
-    /// Open or create a graph on the arena layout (VERSION 4), packing
-    /// `arena_cap` vertices per object.
+    /// Open or create a graph packing `arena_cap` vertices per arena object.
+    ///
+    /// The name is now redundant (every graph is an arena graph); it stays to
+    /// avoid churning ~40 call sites, and should become
+    /// `open_or_create_with_arena_cap` when something else touches them.
     pub fn open_or_create_arena(name: &str, arena_cap: usize) -> Result<Graph> {
-        Self::open_inner(name, DEFAULT_SEG_CAP, Some(arena_cap))
+        Self::open_inner(name, DEFAULT_SEG_CAP, arena_cap)
     }
 
     /// [`Graph::open_or_create_arena`] with an explicit registry segment
@@ -198,22 +198,18 @@ impl Graph {
         cap: usize,
         arena_cap: usize,
     ) -> Result<Graph> {
-        Self::open_inner(name, cap, Some(arena_cap))
+        Self::open_inner(name, cap, arena_cap)
     }
 
-    /// `arena` is `Some(cap)` to *create* a VERSION 4 graph; it does not affect
-    /// opening an existing one.
-    fn open_inner(name: &str, cap: usize, arena: Option<usize>) -> Result<Graph> {
+    /// Every graph created here is VERSION 4; `arena_cap` sets placement at
+    /// creation and is ignored (see above) when opening an existing graph.
+    fn open_inner(name: &str, cap: usize, arena_cap: usize) -> Result<Graph> {
         if cap == 0 || cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        if matches!(arena, Some(0)) {
+        if arena_cap == 0 {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        // Packing is what the arena layout buys, so an arena graph reopened
-        // without a stated cap still needs one for future inserts; the store's
-        // existing contents are unaffected by the choice.
-        let arena_cap = arena.unwrap_or(DEFAULT_ARENA_CAP);
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
 
@@ -237,9 +233,9 @@ impl Graph {
                 let cap = seg_cap as usize;
                 let vbacking: Object<PersistentHashMapBase<VKey, u64>> =
                     Object::map(ObjID::new(vindex_raw), rw())?;
-                // The *stored* version decides the layout, not the caller: a
-                // graph opened by name must come back the way it was written.
-                let store = if version == VERSION_ARENA {
+                // `version_supported` above already rejected anything but
+                // VERSION_ARENA, so there is exactly one layout to open.
+                let store = {
                     let (dir, locs) = {
                         let r = root.base();
                         (r.arena_dir_raw, r.arena_locs_raw)
@@ -250,8 +246,6 @@ impl Graph {
                         Box::new(FillTo { cap: arena_cap }),
                         cap,
                     )?)
-                } else {
-                    None
                 };
                 return Ok(Graph {
                     root_id: node.id.into(),
@@ -263,9 +257,10 @@ impl Graph {
                 });
             }
             // Incompatible/stale format: do NOT touch the existing graph.
+            // A v3 graph lands here now — deliberately, see `version_supported`.
             return Err(GraphError::StaleVersion {
                 found: version,
-                expected: VERSION,
+                expected: VERSION_ARENA,
             });
         }
 
@@ -273,13 +268,10 @@ impl Graph {
         let edges = SegVec::create(cap)?;
         let labels = SegVec::create(cap)?;
         let vindex = VIndex::new_persist()?;
-        let store = match arena {
-            Some(_) => Some(ArenaStore::create(
-                Box::new(FillTo { cap: arena_cap }),
-                cap,
-            )?),
-            None => None,
-        };
+        let store = Some(ArenaStore::create(
+            Box::new(FillTo { cap: arena_cap }),
+            cap,
+        )?);
         let (arena_dir_raw, arena_locs_raw) =
             store.as_ref().map_or((0, 0), |s| s.ids());
 
@@ -287,11 +279,7 @@ impl Graph {
             .persist(true)
             .build(GraphRoot {
                 magic: MAGIC,
-                version: if arena.is_some() {
-                    VERSION_ARENA
-                } else {
-                    VERSION
-                },
+                version: VERSION_ARENA,
                 seg_cap: cap as u32,
                 verts_raw: verts.dir_raw(),
                 edges_raw: edges.dir_raw(),
@@ -343,24 +331,23 @@ impl Graph {
         Self::reset_inner(name, Some(cap))
     }
 
-    /// Discard a graph and rebuild it empty on the arena layout
-    /// (VERSION 4), packing `arena_cap` vertices per object.
+    /// Discard a graph and rebuild it empty, packing `arena_cap` vertices per
+    /// arena object.
     ///
-    /// Arena tests need this to be idempotent across runs: the disk image
-    /// survives between QEMU invocations, so a graph left behind by an earlier
-    /// run would otherwise be re-opened in whatever format it was written in,
-    /// and a plain [`Graph::reset`] would rebuild it as v3. Unbinding the name
-    /// is not an option — `data/` names cannot be removed on this build — so
-    /// the root is rewritten in place, exactly as `reset` does.
+    /// Tests need this to be idempotent across runs: the disk image survives
+    /// between QEMU invocations, so a graph left behind by an earlier run would
+    /// otherwise be re-opened in whatever format it was written in. Unbinding
+    /// the name is not an option — `data/` names cannot be removed on this
+    /// build — so the root is rewritten in place, exactly as `reset` does.
     pub fn reset_arena(name: &str, arena_cap: usize) -> Result<()> {
         if arena_cap == 0 {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        Self::reset_inner_fmt(name, None, Some(arena_cap))
+        Self::reset_inner_fmt(name, None, arena_cap)
     }
 
     fn reset_inner(name: &str, cap: Option<usize>) -> Result<()> {
-        Self::reset_inner_fmt(name, cap, None)
+        Self::reset_inner_fmt(name, cap, DEFAULT_ARENA_CAP)
     }
 
     /// The name is not unbound, because `data/` entries cannot be removed
@@ -401,7 +388,7 @@ impl Graph {
             // read correctly.
             return Err(GraphError::StaleVersion {
                 found: version,
-                expected: VERSION,
+                expected: VERSION_ARENA,
             });
         }
 
@@ -452,8 +439,13 @@ impl Graph {
         Ok(reclaim::delete_all(ids))
     }
 
-    /// `arena` is `Some(cap)` to rebuild on VERSION 4, `None` for VERSION 3.
-    fn reset_inner_fmt(name: &str, cap: Option<usize>, arena: Option<usize>) -> Result<()> {
+    /// Rebuild empty on VERSION 4, packing `arena_cap` vertices per arena.
+    ///
+    /// The *outgoing* graph may still be v3 — a disk image outlives the code
+    /// that wrote it — so the inventory below keeps its v3 arm even though
+    /// nothing creates v3 any more. That arm is what stops a stale image from
+    /// leaking a graph's worth of objects on the first reset after the upgrade.
+    fn reset_inner_fmt(name: &str, cap: Option<usize>, arena_cap: usize) -> Result<()> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
         let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
@@ -479,11 +471,7 @@ impl Graph {
         if !is_graph {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        let cap = cap.unwrap_or(if old_version == VERSION && old_cap != 0 {
-            old_cap as usize
-        } else {
-            DEFAULT_SEG_CAP
-        });
+        let cap = cap.unwrap_or(DEFAULT_SEG_CAP);
 
         let old_ids = {
             let (v, e, l, x, ad, al) = {
@@ -546,10 +534,10 @@ impl Graph {
             labels.dir_raw(),
             vindex.object().id().raw(),
         );
-        let store = match arena {
-            Some(ac) => Some(ArenaStore::create(Box::new(FillTo { cap: ac }), cap)?),
-            None => None,
-        };
+        let store = Some(ArenaStore::create(
+            Box::new(FillTo { cap: arena_cap }),
+            cap,
+        )?);
         let (arena_dir_raw, arena_locs_raw) = store.as_ref().map_or((0, 0), |s| s.ids());
 
         // Rewrite the root transactionally so the change is synced to the
@@ -557,18 +545,12 @@ impl Graph {
         root.with_tx(|tx| {
             let mut b = tx.base_mut();
             b.magic = MAGIC;
-            b.version = if arena.is_some() {
-                VERSION_ARENA
-            } else {
-                VERSION
-            };
+            b.version = VERSION_ARENA;
             b.seg_cap = cap as u32;
             b.verts_raw = verts_raw;
             b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
             b.vindex_raw = vindex_raw;
-            // Zero on a v3 rebuild: a v3 root must not name arenas it does not
-            // own, and a previous v4 incarnation would have left ids here.
             b.arena_dir_raw = arena_dir_raw;
             b.arena_locs_raw = arena_locs_raw;
             Ok(())
@@ -961,27 +943,34 @@ impl Graph {
 
     #[cfg(test)]
     pub(crate) fn owned_object_ids(&self) -> Vec<u128> {
-        inventory(
-            &self.verts,
-            &self.edges,
-            &self.labels,
-            self.vindex.object().id().raw(),
-        )
+        let mut ids = Vec::new();
+        if let Some(store) = self.store.as_ref() {
+            ids.extend(store.owned_object_ids());
+        }
+        // Edges: no object to map, and the property id lives in the mirror.
+        ids.extend(self.edges.object_ids());
+        for i in 0..self.edges.len() {
+            if let Some(r) = self.edges.get_ref(i) {
+                if r.props_raw != 0 {
+                    ids.push(r.props_raw);
+                }
+            }
+        }
+        // `verts` is vestigial on v4 but still allocated, and still freed.
+        ids.extend(self.verts.object_ids());
+        ids.extend(self.labels.object_ids());
+        ids.push(self.vindex.object().id().raw());
+        ids
     }
 
     #[cfg(test)]
-    pub(crate) fn vertex_object_ids(&self, v: VertexId) -> Option<(u128, u128, u128, u128)> {
-        let r = self.verts.get_ref(v.0 as usize)?;
-        Some((r.vobj_raw, r.out_raw, r.in_raw, r.props_raw))
+    pub(crate) fn vertex_props_raw(&self, v: VertexId) -> Option<u128> {
+        self.store.as_ref().and_then(|s| s.props_raw(v.0))
     }
 
     #[cfg(test)]
-    pub(crate) fn edge_object_ids(&self, e: EdgeId) -> Option<(u128, u128)> {
-        let eobj_raw = self.edges.get_ref(e.0 as usize)?.eobj_raw;
-        let eo =
-            Object::<Edge>::map(ObjID::new(eobj_raw), MapFlags::READ | MapFlags::PERSIST).ok()?;
-        let props_raw = eo.base().props_raw;
-        Some((eobj_raw, props_raw))
+    pub(crate) fn edge_props_raw(&self, e: EdgeId) -> Option<u128> {
+        self.edges.get_ref(e.0 as usize).map(|r| r.props_raw)
     }
 
     /// Set a property on a vertex; errors if it is missing or tombstoned.
@@ -1314,6 +1303,11 @@ fn edge_registry_ids(edges_raw: u128, cap: usize) -> Vec<u128> {
     ids
 }
 
+/// v3 layouts only. The edge loop below assumes `EdgeRef::eobj_raw` names a
+/// real `Edge` object; v4 leaves it 0, so running this on a v4 graph pushes null
+/// ids and maps object id 0. Its only callers are the outgoing-graph walks,
+/// which reach it exclusively through the `VERSION` match arms. v4 callers use
+/// [`edge_registry_ids`] and [`ArenaStore::owned_object_ids`] instead.
 fn inventory(
     verts: &SegVec<VertexRef>,
     edges: &SegVec<EdgeRef>,

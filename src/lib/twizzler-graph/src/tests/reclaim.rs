@@ -13,7 +13,7 @@
 
 use twizzler::object::ObjID;
 
-use super::fresh_v3 as fresh;
+use super::{fresh, TEST_ARENA_CAP};
 use crate::{Graph, Labels, PropValue};
 
 #[test]
@@ -32,56 +32,72 @@ fn inventory_covers_everything_the_graph_owns() {
     assert!(ids.iter().all(|r| *r != 0), "no null ids in the inventory");
     assert!(!ids.contains(&g.root_id().raw()), "root is not owned");
 
-    // Both vertices contribute an object, two adjacency lists, and (for `a`) a
-    // property object; the edge contributes its object and its properties.
-    for v in [a, b] {
-        let (vobj, out_raw, in_raw, _props) = g.vertex_object_ids(v).expect("vertex record");
-        for id in [vobj, out_raw, in_raw] {
-            assert!(ids.contains(&id), "vertex {v:?} object {id:x} inventoried");
-        }
-    }
-    let (.., a_props) = g.vertex_object_ids(a).unwrap();
+    // Property objects are the only per-entity objects left in v4, and the only
+    // ones a reclaim pass could orphan.
+    let a_props = g.vertex_props_raw(a).expect("vertex record");
     assert!(a_props != 0 && ids.contains(&a_props), "vertex props");
+    assert_eq!(g.vertex_props_raw(b), Some(0), "b has no properties");
 
-    let (eobj, e_props) = g.edge_object_ids(e).expect("edge record");
-    assert!(ids.contains(&eobj), "edge object");
+    let e_props = g.edge_props_raw(e).expect("edge record");
     assert!(e_props != 0 && ids.contains(&e_props), "edge props");
 
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len(), "inventory contains no duplicates");
+
+    // Fill the first arena and spill into a second. Exactly one new id should
+    // appear: the new arena. Anything else means the inventory is tracking
+    // something it should not, and a miss means arenas are invisible to
+    // reclaim — the bug this rewrite exists to close.
+    let before = ids.len();
+    assert_eq!(g.arena_count(), 1, "two vertices fit in one arena");
+    for i in 0..TEST_ARENA_CAP {
+        g.add_vertex("n", &format!("f{i}"), ObjID::new(0)).unwrap();
+    }
+    assert_eq!(g.arena_count(), 2, "spilled into a second arena");
+    assert_eq!(
+        g.owned_object_ids().len(),
+        before + 1,
+        "the second arena, and only it, joins the inventory"
+    );
 }
 
+/// The property object is deliberately kept in the inventory. It is
+/// unreachable through the graph but still allocated, and `owned_object_ids`
+/// is what a reclaim pass would act on: dropping it here is precisely how a
+/// tombstoned vertex's properties would leak forever.
 #[test]
-fn delete_vertex_releases_adjacency_and_prop_ids() {
+fn delete_vertex_releases_prop_ids() {
     let mut g = fresh("t-reclaim-delv");
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
     let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
     g.add_edge(a, "knows", b).unwrap();
     g.set_vertex_prop(a, "age", PropValue::I64(30)).unwrap();
 
-    let (vobj, out_raw, in_raw, props_raw) = g.vertex_object_ids(a).expect("vertex record");
-    assert!(out_raw != 0 && in_raw != 0 && props_raw != 0);
+    let props_raw = g.vertex_props_raw(a).expect("vertex record");
+    assert!(props_raw != 0, "property object exists before the delete");
 
     g.delete_vertex(a).unwrap();
 
-    let (vobj_after, out_after, in_after, props_after) =
-        g.vertex_object_ids(a).expect("record survives as a tombstone");
-    assert_eq!(out_after, 0, "out-adjacency id released");
-    assert_eq!(in_after, 0, "in-adjacency id released");
-    assert_eq!(props_after, 0, "property id released");
-    assert_eq!(
-        vobj_after, vobj,
-        "vertex object id retained: still referenced by adjacency entries and \
-         edge endpoints (see A5 in docs/tasks.md)"
+    // The record survives as a tombstone — neighbours' adjacency entries still
+    // point into it, and traversal resolves those before checking liveness —
+    // but it no longer names the property object.
+    assert!(
+        g.vertex_info(a).is_none(),
+        "tombstoned vertex reads as absent"
     );
+    assert_eq!(
+        g.vertex_props_raw(a),
+        None,
+        "a tombstoned record is not reachable through the liveness mirror"
+    );
+    assert_eq!(g.get_vertex_prop(a, "age"), None, "properties unreadable");
 
-    // The released objects drop out of the inventory, so a reclaim pass over a
-    // graph containing tombstones cannot double-target them.
-    let ids = g.owned_object_ids();
-    assert!(!ids.contains(&out_raw) && !ids.contains(&in_raw));
-    assert!(!ids.contains(&props_raw));
+    assert!(
+        g.owned_object_ids().contains(&props_raw),
+        "the orphaned property object stays inventoried so reclaim can free it"
+    );
 }
 
 #[test]
@@ -151,9 +167,14 @@ fn reset_leaves_a_working_empty_graph() {
         g.root_id()
     };
 
-    Graph::reset(name).expect("reset");
+    // Explicit caps, not `reset`/`open_or_create`: those default to
+    // `DEFAULT_ARENA_CAP` (16 384), and an arena is sized by its cap, so the
+    // convenience constructors would allocate a production-sized arena inside
+    // the shared test boot for a graph that holds one vertex.
+    Graph::reset_arena(name, TEST_ARENA_CAP).expect("reset");
 
-    let mut g = Graph::open_or_create(name).expect("reopen after reset");
+    let mut g =
+        Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("reopen after reset");
     assert_eq!(g.root_id(), root, "reset keeps the graph's identity");
     assert!(g.vertices().is_empty());
     assert_eq!(g.find_vertex("n", "a"), None);
