@@ -11,12 +11,10 @@
 //! `vertices_by_label` is still a scan. Adjacency is held per-vertex (see
 //! `vertex.rs`), not in the registries.
 
-use std::collections::HashMap;
-
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
     collections::{
-        hachage::{PHMsession, PersistentHashMap, PersistentHashMapBase},
+        hachage::{PersistentHashMap, PersistentHashMapBase},
         vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
     },
     error::TwzError,
@@ -33,7 +31,7 @@ use crate::{
     name::NameKey,
     props::{self, PropValue},
     reclaim,
-    segvec::{vec_new_nosync, vec_push_ctor_nosync, SegVec},
+    segvec::SegVec,
     vertex::{AdjEntry, Labels, Vertex, VertexId, VertexInfo, VertexRef, VertexView},
 };
 
@@ -80,6 +78,8 @@ pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
 /// 16384 and 65536 were indistinguishable on every metric, because both held
 /// all 6 001 phase-A vertices in a single arena. Cap only matters up to the
 /// working set being connected.
+///
+/// # This value is PROVISIONAL
 pub const DEFAULT_ARENA_CAP: usize = 16384;
 
 /// Read/write/persist map flags for reopening mutable registries.
@@ -317,15 +317,6 @@ impl Graph {
     /// The graph root's ObjID.
     pub fn root_id(&self) -> ObjID {
         self.root_id
-    }
-
-    #[cfg(test)]
-    pub(crate) fn registry_segments(&self) -> (usize, usize, usize) {
-        (
-            self.verts.segments(),
-            self.edges.segments(),
-            self.labels.segments(),
-        )
     }
 
     /// Reset a graph to empty, reusing its registration. No-op if no such graph
@@ -1271,34 +1262,9 @@ impl Graph {
         Ok(id)
     }
 
-    pub fn bulk<R>(&mut self, f: impl FnOnce(&mut BulkSession<'_>) -> Result<R>) -> Result<R> {
-        if self.store.is_some() {
-            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
-        }
-        let Graph {
-            verts,
-            edges,
-            labels,
-            vindex,
-            ..
-        } = self;
-        let mut s = BulkSession {
-            verts,
-            edges,
-            labels,
-            vsession: vindex.write_session()?,
-            created_verts: Vec::new(),
-            created_edges: Vec::new(),
-            adj: HashMap::new(),
-            vmaps: HashMap::new(),
-        };
-        let r = f(&mut s)?;
-        s.finish()?;
-        Ok(r)
-    }
 }
 
-// --- shared lookup helpers (Graph + BulkSession) ---------------------------
+// --- shared lookup helpers -------------------------------------------------
 
 /// Label lookup by name over the label registry.
 fn find_label_in(labels: &SegVec<LabelEntry>, name: &str) -> Option<u32> {
@@ -1309,18 +1275,6 @@ fn find_label_in(labels: &SegVec<LabelEntry>, name: &str) -> Option<u32> {
         }
     }
     None
-}
-
-fn intern_label_nosync(labels: &mut SegVec<LabelEntry>, name: &str) -> Result<u32> {
-    if let Some(id) = find_label_in(labels, name) {
-        return Ok(id);
-    }
-    let id = labels.len() as u32;
-    labels.push_nosync(LabelEntry {
-        id,
-        name: NameKey::new(name),
-    })?;
-    Ok(id)
 }
 
 /// Vertex object/adjacency locations by id. O(1): ids are append indices.
@@ -1428,208 +1382,4 @@ fn old_inventory(
         return Vec::new();
     };
     inventory(&verts, &edges, &labels, vindex_raw)
-}
-
-/// A batched-insert session; see [`Graph::bulk`]. Mirrors the semantics of
-/// [`Graph::add_vertex`]/[`Graph::add_edge`] exactly, with durability
-/// deferred to one sync per touched object when the batch closes.
-pub struct BulkSession<'a> {
-    verts: &'a mut SegVec<VertexRef>,
-    edges: &'a mut SegVec<EdgeRef>,
-    labels: &'a mut SegVec<LabelEntry>,
-    /// Index write session: one tx over the table, synced once on drop.
-    vsession: PHMsession<'a, VKey, u64>,
-    /// Vertex/edge objects created without their initial sync.
-    created_verts: Vec<Object<Vertex>>,
-    created_edges: Vec<Object<Edge>>,
-    /// Adjacency lists touched this batch: cached handles (no per-edge
-    /// remapping), each synced once at finish.
-    adj: HashMap<u128, VecObject<AdjEntry, VecObjectAlloc>>,
-    vmaps: HashMap<u128, Object<Vertex>>,
-}
-
-impl BulkSession<'_> {
-    /// Batched [`Graph::add_vertex`].
-    pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
-        let lbl = intern_label_nosync(self.labels, label)?;
-        let id = self.verts.len() as u64;
-
-        let out_adj: VecObject<AdjEntry, VecObjectAlloc> =
-            vec_new_nosync(ObjectBuilder::default().persist(true))?;
-        let in_adj: VecObject<AdjEntry, VecObjectAlloc> =
-            vec_new_nosync(ObjectBuilder::default().persist(true))?;
-        let out_raw = out_adj.object().id().raw();
-        let in_raw = in_adj.object().id().raw();
-        // Cache the handles: created nosync (dirty from birth), and they may
-        // receive edge pushes later in this batch.
-        self.adj.insert(out_raw, out_adj);
-        self.adj.insert(in_raw, in_adj);
-
-        // Create the vertex object without its initial sync: the ctor aborts
-        // the tx (public API; suppresses sync-on-drop, no rollback exists —
-        // see segvec.rs nosync-primitives note), and finish() syncs it once.
-        let vobj = ObjectBuilder::<Vertex>::default()
-            .persist(true)
-            .build_inplace(|tx| {
-                let mut done = tx.write(Vertex {
-                    id,
-                    label: lbl,
-                    name: NameKey::new(name),
-                    target_raw: target.raw(),
-                    props_raw: 0,
-                    flags: 0,
-                    out_raw,
-                    in_raw,
-                })?;
-                done.abort();
-                Ok(done)
-            })?;
-
-        self.verts.push_nosync(VertexRef {
-            id,
-            label: lbl,
-            name: NameKey::new(name),
-            target_raw: target.raw(),
-            props_raw: 0,
-            flags: 0,
-            vobj_raw: vobj.id().raw(),
-            out_raw,
-            in_raw,
-        })?;
-        self.created_verts.push(vobj);
-
-        self.vsession.insert(
-            VKey {
-                label: lbl,
-                name: NameKey::new(name),
-            },
-            id,
-        )?;
-        Ok(VertexId(id))
-    }
-
-    /// Batched [`Graph::add_edge`].
-    pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
-        let lbl = intern_label_nosync(self.labels, label)?;
-        let (from_vobj, from_out, _from_in) = vertex_locs_in(self.verts, from)
-            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-        let (to_vobj, _to_out, to_in) =
-            vertex_locs_in(self.verts, to).ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-
-        let fobj = Self::vmap_handle(&mut self.vmaps, from_vobj)?;
-        let tobj = Self::vmap_handle(&mut self.vmaps, to_vobj)?;
-
-        let id = self.edges.len() as u64;
-        let eobj = ObjectBuilder::<Edge>::default()
-            .persist(true)
-            .build_inplace(|tx| {
-                let e = Edge {
-                    id,
-                    label: lbl,
-                    from_id: from.0,
-                    to_id: to.0,
-                    from: InvPtr::new(&tx, fobj.base_ref())?,
-                    to: InvPtr::new(&tx, tobj.base_ref())?,
-                    props_raw: 0,
-                    flags: 0,
-                };
-                // abort = suppress sync-on-drop (public API; no rollback
-                // exists — see the nosync-primitives note in segvec.rs).
-                let mut done = tx.write(e)?;
-                done.abort();
-                Ok(done)
-            })?;
-
-        {
-            let adj = Self::adj_handle(&mut self.adj, from_out)?;
-            vec_push_ctor_nosync(adj, |place| {
-                let a = AdjEntry {
-                    label: lbl,
-                    edge: InvPtr::new(&place, eobj.base_ref())?,
-                    neighbor: InvPtr::new(&place, tobj.base_ref())?,
-                };
-                Ok(place.write(a))
-            })?;
-        }
-        {
-            let adj = Self::adj_handle(&mut self.adj, to_in)?;
-            vec_push_ctor_nosync(adj, |place| {
-                let a = AdjEntry {
-                    label: lbl,
-                    edge: InvPtr::new(&place, eobj.base_ref())?,
-                    neighbor: InvPtr::new(&place, fobj.base_ref())?,
-                };
-                Ok(place.write(a))
-            })?;
-        }
-
-        self.edges.push_nosync(EdgeRef {
-            id,
-            label: lbl,
-            from_id: from.0,
-            to_id: to.0,
-            eobj_raw: eobj.id().raw(),
-            props_raw: 0, // v3 keeps the id in the edge object itself
-            flags: 0,
-        })?;
-        self.created_edges.push(eobj);
-        Ok(EdgeId(id))
-    }
-
-    /// Cached endpoint vertex handle, mapped read-only on first touch.
-    /// Returns a clone of the handle (cheap: reference-counted), which keeps
-    /// borrows simple across the adjacency pushes below.
-    fn vmap_handle(
-        vmaps: &mut HashMap<u128, Object<Vertex>>,
-        raw: u128,
-    ) -> Result<Object<Vertex>> {
-        use std::collections::hash_map::Entry;
-        Ok(match vmaps.entry(raw) {
-            Entry::Occupied(o) => o.get().clone(),
-            Entry::Vacant(v) => v
-                .insert(Object::<Vertex>::map(
-                    ObjID::new(raw),
-                    MapFlags::READ | MapFlags::PERSIST,
-                )?)
-                .clone(),
-        })
-    }
-
-    /// Cached adjacency handle, mapping the object on first touch.
-    fn adj_handle(
-        adj: &mut HashMap<u128, VecObject<AdjEntry, VecObjectAlloc>>,
-        raw: u128,
-    ) -> Result<&mut VecObject<AdjEntry, VecObjectAlloc>> {
-        use std::collections::hash_map::Entry;
-        Ok(match adj.entry(raw) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                v.insert(VecObject::from(
-                    Object::<TwzVec<AdjEntry, VecObjectAlloc>>::map(ObjID::new(raw), rw())?,
-                ))
-            }
-        })
-    }
-
-    /// Close the batch: one sync per touched object. Referents first (vertex
-    /// and edge objects), then referrers (adjacency lists holding `InvPtr`s),
-    /// then the registries; the index table syncs when `vsession` drops.
-    fn finish(self) -> Result<()> {
-        // Safety (for each `as_mut().sync()`): the engine is single-threaded
-        // per graph handle; nothing else mutates these objects concurrently.
-        for o in &self.created_verts {
-            unsafe { o.as_mut()?.sync()? };
-        }
-        for o in &self.created_edges {
-            unsafe { o.as_mut()?.sync()? };
-        }
-        for v in self.adj.values() {
-            unsafe { v.object().as_mut()?.sync()? };
-        }
-        self.verts.flush()?;
-        self.edges.flush()?;
-        self.labels.flush()?;
-        drop(self.vsession); // one sync of the index table
-        Ok(())
-    }
 }

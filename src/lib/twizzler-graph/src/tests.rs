@@ -12,8 +12,6 @@ mod adjacency;
 mod arena;
 #[cfg(feature = "test-storage")]
 mod arena_graph;
-#[cfg(feature = "test-storage")]
-mod bulk;
 #[cfg(feature = "test-core")]
 mod crud;
 #[cfg(feature = "test-query")]
@@ -26,8 +24,6 @@ mod persistence;
 mod props;
 #[cfg(feature = "test-storage")]
 mod reclaim;
-#[cfg(feature = "test-storage")]
-mod segmentation;
 
 /// Vertices per arena for the general suite. Large on purpose.
 ///
@@ -49,25 +45,9 @@ pub(crate) fn fresh(name: &str) -> Graph {
     Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("create arena graph")
 }
 
-/// A clean graph on the legacy v3 layout, for tests of v3 internals that
-/// have no v4 equivalent: registry segmentation (`segmentation`), per-vertex object
-/// inventory (`reclaim`), and `BulkSession` (`bulk`), whose batching the arena
-/// store does internally instead.
-///
-/// Equivalence between the layouts is covered by `tests/arena_graph.rs`, which
-/// runs one workload through both and compares — not by having the whole suite
-/// sit on the old format.
+/// A clean graph on the legacy v3 layout.
 #[allow(dead_code)]
 pub(crate) fn fresh_v3(name: &str) -> Graph {
     Graph::reset(name).expect("reset graph");
     Graph::open_or_create(name).expect("create graph")
-}
-
-/// Like `fresh`, but with a forced registry segment capacity, so segmentation
-/// tests can trigger rollover with a handful of inserts. v3 — registry
-/// segmentation is a v3 concern; v4 segments the location registry instead.
-#[allow(dead_code)]
-pub(crate) fn fresh_cap(name: &str, cap: usize) -> Graph {
-    Graph::reset_with_capacity(name, cap).expect("reset graph");
-    Graph::open_or_create_with_capacity(name, cap).expect("create graph")
 }

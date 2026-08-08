@@ -14,14 +14,12 @@
 //! for the life of the graph. Directory entries are raw `ObjID`s (no
 //! `InvPtr`s), so the directory itself has no FOT pressure.
 
-use std::mem::MaybeUninit;
-
 use twizzler::{
     collections::vec::{Vec as TwzVec, VecObject, VecObjectAlloc},
     error::TwzError,
     marker::{Invariant, StoreCopy},
     object::{MapFlags, ObjID, Object, ObjectBuilder},
-    ptr::{Ref, RefMut},
+    ptr::Ref,
 };
 use twizzler_rt_abi::error::ArgumentError;
 
@@ -35,21 +33,6 @@ where
 {
     let mut tx = v.object().as_tx()?;
     tx.base_mut().push(val)?;
-    tx.abort();
-    Ok(())
-}
-
-/// `VecObject::push_ctor` with the sync-on-drop suppressed.
-pub(crate) fn vec_push_ctor_nosync<T, F>(
-    v: &mut VecObject<T, VecObjectAlloc>,
-    ctor: F,
-) -> Result<()>
-where
-    T: Invariant,
-    F: FnOnce(RefMut<MaybeUninit<T>>) -> Result<RefMut<T>>,
-{
-    let mut tx = v.object().as_tx()?;
-    tx.base_mut().push_ctor(ctor)?;
     tx.abort();
     Ok(())
 }

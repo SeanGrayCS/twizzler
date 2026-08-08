@@ -25,9 +25,12 @@ use crate::{
     name::NameKey,
 };
 
-/// Public vertex id (an append index).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VertexId(pub u64);
+/// A re-export, not `type VertexId = RecordId`. A type alias binds only the
+/// *type* namespace, so `VertexId(id)` — the tuple-struct constructor, which
+/// lives in the value namespace — fails to resolve (E0423, 28 sites). `use ...
+/// as` imports every namespace the path resolves in, so both the type and the
+/// constructor come across.
+pub use crate::record::RecordId as VertexId;
 
 /// Label filter for traversal: any label, or a specific set (so one query can
 /// span multiple relation types).

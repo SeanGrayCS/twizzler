@@ -330,6 +330,26 @@ fn liveness_reads_come_from_the_mirror_not_the_record() {
     assert!(s.vertex_info(3).is_some());
 }
 
+/// CANARY — the load-bearing assumption of every `nosync` path in the crate.
+#[test]
+fn tx_abort_does_not_roll_back() {
+    use twizzler::object::{ObjectBuilder, TypedObject};
+
+    let obj = ObjectBuilder::default().build(1u32).expect("build");
+    let mut tx = obj.as_tx().expect("as_tx");
+    let mut base = tx.base_mut();
+    *base = 7;
+    drop(base);
+    tx.abort();
+    drop(tx);
+    assert_eq!(
+        *obj.base(),
+        7,
+        "TxObject::abort rolled back a write — upstream tx semantics changed; \
+         every nosync path in the engine is now unsound. See A3 in docs/tasks.md."
+    );
+}
+
 /// Multi-segment store. Every other test here fits the location registry
 /// and the arena directory in one segment each, which is why two bugs reached
 /// `gstress scale:20000` before anything caught them: deletes had no effect,

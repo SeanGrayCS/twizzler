@@ -259,22 +259,25 @@ fn arena_packs_vertices_and_adds_no_object_per_edge() {
     assert_eq!(g.arena_sync_count(), 3, "one sync per arena, not per record");
 }
 
+/// Ids are append indices and continue without gaps — the invariant that
+/// `bulk_is_refused_on_the_arena_layout` used to guard from the other side.
 #[test]
-fn bulk_is_refused_on_the_arena_layout() {
-    let name = "t-ab-bulk";
+fn arena_ids_are_gapless_append_indices() {
+    let name = "t-ab-ids";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
     let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
+
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
-
-    let r = g.bulk(|b| b.add_vertex("n", "b", ObjID::new(0)));
-    assert!(r.is_err(), "bulk on v4 must error, not silently misplace");
-
-    // The refusal leaves the graph untouched — no half-written vertex, and the
-    // next real insert still gets the next id.
     assert_eq!(g.vertices(), vec![a]);
     let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
-    assert_eq!(b.0, a.0 + 1, "ids continue normally after a refused bulk");
+    assert_eq!(b.0, a.0 + 1, "ids continue without gaps");
     assert_eq!(g.find_vertex("n", "b"), Some(b));
+
+    // A delete tombstones rather than freeing the id, so the next insert does
+    // not reuse it. `gstress` asserts the same property as "vertex id drift".
+    g.delete_vertex(a).unwrap();
+    let c = g.add_vertex("n", "c", ObjID::new(0)).unwrap();
+    assert_eq!(c.0, b.0 + 1, "a deleted id is never reused");
 }
 
 #[test]

@@ -15,9 +15,13 @@ use twizzler::{
 
 use crate::vertex::{Vertex, VertexId};
 
-/// Public edge id (an append index).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EdgeId(pub u64);
+/// Until the layout lands, `EdgeId(n)` built by value is a latent bug — it
+/// compiles under either regime but means different records. Capture what
+/// `add_edge` returns instead. See `record.rs`.
+///
+/// Re-exported rather than aliased so the tuple-struct constructor resolves;
+/// see the note on `VertexId`.
+pub use crate::record::RecordId as EdgeId;
 
 /// An edge object: both endpoints are invariant pointers.
 #[repr(C)]
