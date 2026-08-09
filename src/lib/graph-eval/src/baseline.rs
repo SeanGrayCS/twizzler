@@ -122,6 +122,72 @@ fn set_u64(db: &Db, id: Uuid, key: &str, value: u64) {
     .expect("set u64 property");
 }
 
+// --- mutation and scan (see the matching section in `native.rs`) -----------
+
+/// Every person's name, sorted — the oracle for `native::all_people`.
+///
+/// IndraDB has no label registry, so "all of type X" is a full vertex scan
+/// filtered by `v.t`. That asymmetry is the point of having both: whatever the
+/// native engine does to make its scan cheap must not change the answer.
+pub fn all_people(db: &Db) -> Vec<String> {
+    let want = ident(PERSON);
+    let Ok(out) = db.get(indradb::AllVertexQuery) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = match out.last() {
+        Some(QueryOutputValue::Vertices(vs)) => vs
+            .iter()
+            .filter(|v| v.t == want)
+            .map(|v| vstr(db, v.id, P_NAME))
+            .collect(),
+        _ => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// Delete a person.
+///
+/// **IndraDB cascades; our engine tombstones.** IndraDB removes the incident
+/// edges outright (`delete_vertex_cascades_to_edges`), while `twizzler-graph`
+/// leaves them in place and hides them, since an edge is alive only while both
+/// endpoints are. The two disagree about what is *stored* and must still agree
+/// about every answer — which is exactly the equivalence worth asserting.
+pub fn delete_person(db: &Db, name: &str) -> bool {
+    match by_name(db, PERSON, name) {
+        Some(id) => {
+            db.delete(SpecificVertexQuery::single(id))
+                .expect("delete vertex");
+            true
+        }
+        None => false,
+    }
+}
+
+/// Delete the `knows` edge between two people, in whichever direction it was
+/// stored. Returns whether one was found.
+pub fn delete_knows(db: &Db, a: &str, b: &str) -> bool {
+    let (Some(av), Some(bv)) = (by_name(db, PERSON, a), by_name(db, PERSON, b)) else {
+        return false;
+    };
+    let want = ident(KNOWS);
+    let found = out_edges(db, av, KNOWS)
+        .into_iter()
+        .chain(out_edges(db, bv, KNOWS))
+        .find(|e| {
+            e.t == want && ((e.outbound_id == av && e.inbound_id == bv)
+                || (e.outbound_id == bv && e.inbound_id == av))
+        });
+    match found {
+        Some(e) => {
+            db.delete(SpecificEdgeQuery::single(e))
+                .expect("delete edge");
+            true
+        }
+        None => false,
+    }
+}
+
 // --- reads -----------------------------------------------------------------
 
 /// Find a vertex by the fixture's stable name, restricted to a type.

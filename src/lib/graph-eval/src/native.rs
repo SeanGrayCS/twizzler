@@ -101,6 +101,59 @@ fn u64_prop(g: &Graph, v: VertexId, key: &str) -> u64 {
     }
 }
 
+// --- mutation and scan, for the pre-v5 equivalence surface -----------------
+//
+// Neither of these is an LDBC read. They exist because A7 (the v5 record
+// format) changes exactly this surface and nothing was checking it against the
+// baseline: edges become records living in `locs` beside vertices, so `vertices()`
+// has to start excluding them, and a tombstoned edge-record begins sharing a
+// code path with a tombstoned vertex. Both are cheap to pin *now*, against an
+// oracle that does not change, and expensive to reconstruct afterwards.
+
+/// Every person's name, sorted. The sort is the point: neither engine promises
+/// scan order, so comparing unsorted would assert something neither guarantees
+/// and would break on an unrelated placement change.
+pub fn all_people(g: &Graph) -> Vec<String> {
+    let mut names: Vec<String> = g
+        .vertices_by_label(PERSON)
+        .into_iter()
+        .filter_map(|v| g.vertex_info(v).map(|i| i.name))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Delete a person. Incident edges become unreachable rather than being
+/// removed — an edge is alive only while both endpoints are.
+pub fn delete_person(g: &mut Graph, name: &str) -> Result<()> {
+    let v = find(g, PERSON, name)?;
+    g.delete_vertex(v)
+}
+
+/// Delete the `knows` edge between two people, in whichever direction it was
+/// stored. Returns whether one was found.
+pub fn delete_knows(g: &mut Graph, a: &str, b: &str) -> Result<bool> {
+    let av = find(g, PERSON, a)?;
+    let bv = find(g, PERSON, b)?;
+    let target = g
+        .vertex_view(av)
+        .map(|view| view.both_edges(Labels::these(&[KNOWS])))
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| {
+            g.edge_info(*e)
+                .map(|i| i.from == bv || i.to == bv)
+                .unwrap_or(false)
+        });
+    match target {
+        Some(e) => {
+            g.delete_edge(e)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// IS1 — profile of a person.
 pub fn is1_profile(g: &Graph, person: &str) -> Option<Profile> {
     let v = g.find_vertex(PERSON, person)?;
