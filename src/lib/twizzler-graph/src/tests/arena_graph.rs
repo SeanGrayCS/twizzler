@@ -17,9 +17,7 @@ const ARENA_CAP: usize = 4;
 fn fresh_arena(tag: &str) -> Graph {
     let name = format!("t-ab-{tag}");
     Graph::reset_arena(&name, ARENA_CAP).expect("reset v4");
-    let g = Graph::open_or_create_arena(&name, ARENA_CAP).expect("open v4");
-    assert!(g.is_arena(), "subject must be on the arena layout");
-    g
+    Graph::open_or_create_arena(&name, ARENA_CAP).expect("open v4")
 }
 
 /// A hub with four labelled spokes, plus a chain among the spokes. Returns the
@@ -350,7 +348,6 @@ fn destroy_frees_the_graph_and_refuses_reopen() {
     // future boot too.
     Graph::reset_arena(name, ARENA_CAP).expect("rebuild after destroy");
     let g = Graph::open_or_create(name).expect("reopen after rebuild");
-    assert!(g.is_arena());
     assert!(g.vertices().is_empty());
 }
 
@@ -378,7 +375,7 @@ fn destroy_cycles_do_not_accumulate() {
 }
 
 #[test]
-fn arena_graph_reopens_in_its_own_format() {
+fn graph_reopens_by_name_with_contents_intact() {
     let name = "t-ab-reopen";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
     let ids = {
@@ -389,9 +386,7 @@ fn arena_graph_reopens_in_its_own_format() {
         (hub, spokes)
     };
 
-    // Re-opened through the *plain* constructor: the root's version decides.
     let g = Graph::open_or_create(name).expect("reopen by name");
-    assert!(g.is_arena(), "stored format governs, not the constructor");
     assert_eq!(g.vertex_info(ids.0).unwrap().name, "h");
     assert_eq!(g.out_neighbors(ids.0, Labels::any()).len(), 4);
     assert_eq!(g.get_vertex_prop(ids.0, "k"), Some(PropValue::I64(1)));

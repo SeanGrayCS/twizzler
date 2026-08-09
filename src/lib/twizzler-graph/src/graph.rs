@@ -8,8 +8,7 @@
 //! object; lookups by id index them directly (ids are append indices, and
 //! segments are uniformly sized, so id -> (segment, offset) is O(1)). The
 //! `(label, name) -> vertex` point lookup uses a persistent `hachage` index.
-//! `vertices_by_label` is still a scan. Adjacency is held per-vertex (see
-//! `vertex.rs`), not in the registries.
+//! `vertices_by_label` is still a scan.
 
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
@@ -21,7 +20,7 @@ use twizzler_rt_abi::error::ArgumentError;
 
 use crate::{
     arena_store::{ArenaStore, FillTo},
-    edge::{Edge, EdgeId, EdgeInfo, EdgeRef},
+    edge::{EdgeId, EdgeInfo, EdgeRef},
     error::{GraphError, Result},
     name::NameKey,
     props::{self, PropValue},
@@ -43,16 +42,24 @@ pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
 /// (must not be touched).
 pub(crate) const MAGIC_DESTROYED: u64 = MAGIC ^ 0xFFFF_FFFF_FFFF_FFFF;
 
-/// On-disk format 5: segmented registries, one vertex object plus two adjacency
-/// objects per vertex, one object per edge.
+/// On-disk format 5 ("v3"): segmented registries, one vertex object plus two
+/// adjacency objects per vertex, one object per edge.
+///
+/// 1. The number 5 is burned. Version numbers must never be recycled — a
+///    future layout reusing 5 would be read as v3 by any build still carrying
+///    this guard, which is the misread-as-garbage failure the whole scheme
+///    exists to prevent.
+/// 2. It documents what `version_supported` is rejecting when an old image
+///    turns up.
 ///
 /// The disk image survives between QEMU runs, which is what turns "I changed a
 /// struct" into "the next boot hangs". Any change to a persisted record's
 /// layout — size, field order, or alignment — must bump this, so the guard
 /// rejects the old graph loudly instead of misreading it.
+#[allow(dead_code)] // see above: reserved, not obsolete
 pub(crate) const VERSION: u32 = 5;
 
-/// On-disk format 6: vertices and adjacency live in packed arenas
+/// On-disk format 7 ("v4"): vertices and adjacency live in packed arenas
 /// ([`ArenaStore`]) instead of three objects per vertex plus one per edge.
 pub(crate) const VERSION_ARENA: u32 = 7;
 
@@ -126,22 +133,28 @@ unsafe impl Invariant for VKey {}
 /// Persistent index from (label, name) to vertex id.
 type VIndex = PersistentHashMap<VKey, u64>;
 
-/// An open graph: the root id, the registries, and the vertex index.
+/// An open graph: the root id, the registries, the vertex index, and the store.
 pub struct Graph {
     root_id: ObjID,
+    /// Vestigial, and genuinely unread — the `dead_code` warning this raises
+    /// is deliberate. Do not silence it; it is the reminder that this field
+    /// still needs removing.
+    ///
+    /// Vertices live in `store`; this registry is always empty. It is still
+    /// *allocated* because `GraphRoot.verts_raw` is a persisted field, and still
+    /// *inventoried* so `reset`/`destroy` free its objects rather than orphaning
+    /// them — but both go through raw ids, not this handle. The only code that
+    /// touches the handle is `owned_object_ids`, which is `#[cfg(test)]`, so a
+    /// normal build reads it nowhere.
     verts: SegVec<VertexRef>,
     edges: SegVec<EdgeRef>,
     labels: SegVec<LabelEntry>,
     vindex: VIndex,
-    /// Vertices and adjacency. `verts` is a vestigial empty registry awaiting
-    /// stage 5 of the v3 retirement.
+    /// Vertices and adjacency — the whole graph, in packed arenas.
     store: ArenaStore,
 }
 
 impl Graph {
-    pub fn is_arena(&self) -> bool {
-        true
-    }
 
     pub fn arena_count(&self) -> usize {
         self.store.arena_count()
@@ -378,30 +391,29 @@ impl Graph {
             });
         }
 
-        let mut ids = match version {
-            VERSION => inventory_raw(v, e, l, x, cap),
-            _ => {
-                let mut ids = Vec::new();
-                if let Ok(store) = ArenaStore::open(
-                    ad,
-                    al,
-                    Box::new(FillTo {
-                        cap: DEFAULT_ARENA_CAP,
-                    }),
-                    cap,
-                ) {
-                    ids.extend(store.owned_object_ids());
-                }
-                ids.extend(edge_registry_ids(e, cap));
-                if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
-                    ids.extend(sv.object_ids());
-                }
-                if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
-                    ids.extend(sv.object_ids());
-                }
-                ids.push(x);
-                ids
+        // `version_supported` above admits only `VERSION_ARENA`, so there is one
+        // layout to walk.
+        let mut ids = {
+            let mut ids = Vec::new();
+            if let Ok(store) = ArenaStore::open(
+                ad,
+                al,
+                Box::new(FillTo {
+                    cap: DEFAULT_ARENA_CAP,
+                }),
+                cap,
+            ) {
+                ids.extend(store.owned_object_ids());
             }
+            ids.extend(edge_registry_ids(e, cap));
+            if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
+                ids.extend(sv.object_ids());
+            }
+            if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
+                ids.extend(sv.object_ids());
+            }
+            ids.push(x);
+            ids
         };
         // Guard against a double-free: an id reachable two ways (a shared
         // property object, say) would otherwise be deleted twice.
@@ -475,8 +487,6 @@ impl Graph {
                 // A destroyed root already freed everything and zeroed its
                 // registry ids; walking them would chase freed objects.
                 _ if was_destroyed => Vec::new(),
-                // v3: three objects per vertex, one per edge, plus registries.
-                VERSION if old_cap != 0 => old_inventory(v, e, l, x, old_cap as usize),
                 // v4: arenas plus registries. The `verts` registry exists but
                 // is unused, and is freed with the rest.
                 VERSION_ARENA if old_cap != 0 => {
@@ -605,15 +615,7 @@ impl Graph {
         if !self.is_vertex_alive(id) {
             return None;
         }
-        // `out_raw`/`in_raw` are vestigial: there are no per-direction adjacency
-        // objects to name, and the collectors walk the arena's chunk chain
-        // instead. They stay on `VertexView` only until stage 5 removes them.
-        Some(VertexView {
-            graph: self,
-            id,
-            out_raw: 0,
-            in_raw: 0,
-        })
+        Some(VertexView { graph: self, id })
     }
 
     /// Convenience: outgoing/incoming/both neighbors of `id` (no predicate).
@@ -884,7 +886,6 @@ impl Graph {
         Some(self.store.debug_liveness(id.0))
     }
 
-
     /// Resolve a [`Labels`] filter to label ids. `None` means "any".
     pub(crate) fn resolve_labels(&self, labels: Labels) -> Option<Vec<u32>> {
         match labels {
@@ -950,23 +951,6 @@ fn find_label_in(labels: &SegVec<LabelEntry>, name: &str) -> Option<u32> {
     None
 }
 
-#[allow(dead_code)]
-fn vertex_locs_in(verts: &SegVec<VertexRef>, v: VertexId) -> Option<(u128, u128, u128)> {
-    let r = verts.get_ref(v.0 as usize)?;
-    if r.id != v.0 {
-        return None;
-    }
-    Some((r.vobj_raw, r.out_raw, r.in_raw))
-}
-
-/// Every object a graph owns, given its open registries: the per-vertex
-/// objects (vertex, both adjacency lists, properties), the per-edge objects
-/// (edge, properties), and the three registries plus the vertex index.
-///
-/// Tombstoned records are included deliberately — their objects are exactly
-/// the ones nobody will ever free otherwise. The graph root is *not* included:
-/// `reset` retains and repoints it, and it is the name-registered identity of
-/// the graph.
 /// The edge registry's own objects plus every edge property object.
 ///
 /// v4 keeps `props_raw` in `EdgeRef`, so this needs no edge *objects* — which
@@ -985,79 +969,4 @@ fn edge_registry_ids(edges_raw: u128, cap: usize) -> Vec<u128> {
         }
     }
     ids
-}
-
-/// v3 layouts only. The edge loop below assumes `EdgeRef::eobj_raw` names a
-/// real `Edge` object; v4 leaves it 0, so running this on a v4 graph pushes null
-/// ids and maps object id 0. Its only callers are the outgoing-graph walks,
-/// which reach it exclusively through the `VERSION` match arms. v4 callers use
-/// [`edge_registry_ids`] and [`ArenaStore::owned_object_ids`] instead.
-fn inventory(
-    verts: &SegVec<VertexRef>,
-    edges: &SegVec<EdgeRef>,
-    labels: &SegVec<LabelEntry>,
-    vindex_raw: u128,
-) -> Vec<u128> {
-    let mut ids = Vec::new();
-    for i in 0..verts.len() {
-        if let Some(r) = verts.get_ref(i) {
-            ids.extend([r.vobj_raw, r.out_raw, r.in_raw]);
-            if r.props_raw != 0 {
-                ids.push(r.props_raw);
-            }
-        }
-    }
-    for i in 0..edges.len() {
-        if let Some(r) = edges.get_ref(i) {
-            ids.push(r.eobj_raw);
-            if let Ok(eo) = Object::<Edge>::map(
-                ObjID::new(r.eobj_raw),
-                MapFlags::READ | MapFlags::PERSIST,
-            ) {
-                let p = eo.base().props_raw;
-                if p != 0 {
-                    ids.push(p);
-                }
-            }
-        }
-    }
-    ids.extend(verts.object_ids());
-    ids.extend(edges.object_ids());
-    ids.extend(labels.object_ids());
-    ids.push(vindex_raw);
-    ids
-}
-
-/// [`inventory`] for a graph we only have raw ids for (the outgoing graph in
-/// `reset`). Opens the old registries just long enough to walk them, then
-/// drops the handles so the ids can be deleted. Anything that fails to open is
-/// skipped rather than guessed at.
-/// [`inventory`] for a v3 graph known only by its raw registry ids. Named apart
-/// from `old_inventory` because `destroy` uses it on the *current* graph, not
-/// an outgoing one.
-fn inventory_raw(
-    verts_raw: u128,
-    edges_raw: u128,
-    labels_raw: u128,
-    vindex_raw: u128,
-    cap: usize,
-) -> Vec<u128> {
-    old_inventory(verts_raw, edges_raw, labels_raw, vindex_raw, cap)
-}
-
-fn old_inventory(
-    verts_raw: u128,
-    edges_raw: u128,
-    labels_raw: u128,
-    vindex_raw: u128,
-    cap: usize,
-) -> Vec<u128> {
-    let (Ok(verts), Ok(edges), Ok(labels)) = (
-        SegVec::<VertexRef>::open(verts_raw, cap),
-        SegVec::<EdgeRef>::open(edges_raw, cap),
-        SegVec::<LabelEntry>::open(labels_raw, cap),
-    ) else {
-        return Vec::new();
-    };
-    inventory(&verts, &edges, &labels, vindex_raw)
 }

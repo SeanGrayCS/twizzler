@@ -1,10 +1,11 @@
 //! A property-graph database engine on Twizzler objects.
 //!
-//! A vertex is its own persistent object owning adjacency lists of invariant
-//! pointers to its incident edges and neighbors; an edge is its own persistent
-//! object holding an `InvPtr<Vertex>` to each endpoint. Traversal from a vertex
-//! is O(degree) pointer-chasing, with no global scan or index lookup. A `Graph`
-//! root owns the vertex/edge/label registries and is registered under the
+//! Vertices are fixed-size records packed into shared *arena* objects, with
+//! adjacency held as a chunk chain in the same arena; an edge is a registry row
+//! with no object of its own. Traversal from a vertex is O(degree) and stays
+//! inside one mapping whenever the neighbour shares an arena — index-free
+//! adjacency with no global scan and no index lookup. A `Graph` root owns the
+//! edge/label registries and the arena store, and is registered under the
 //! pager-backed `data/` namespace, so a graph re-opens by name.
 
 mod edge;

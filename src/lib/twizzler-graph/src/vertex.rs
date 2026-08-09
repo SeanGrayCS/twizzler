@@ -1,25 +1,20 @@
 //! Vertices and vertex-centric traversal.
 //!
-//! Each vertex is its own persistent object owning two adjacency lists,
-//! outgoing and incoming, each a `VecObject<AdjEntry>` of invariant pointers to
-//! incident edges and neighbors. Direction is structural: `out_*`/`in_*` read
-//! one list, `both_*` reads both. Traversal is O(degree) pointer-chasing.
+//! A vertex is a fixed-size record inside a shared *arena* object, and its
+//! adjacency is a chunk chain in the same arena — see `arena_store.rs`.
+//! Traversal is O(degree) and, for neighbours in the same arena, stays within
+//! one mapping: no `InvPtr` resolution and no FOT entry. Direction is
+//! structural: `out_*`/`in_*` read one direction, `both_*` reads both.
 //!
 //! The traversal API mirrors Gremlin: `out_neighbors`/`in_neighbors`/`both_neighbors`
 //! and `out_edges`/`in_edges`/`both_edges`, each with a label filter, plus
 //! `_where` variants taking a user predicate over a [`VertexHandle`]/[`EdgeHandle`]
 //! (e.g. to skip already-visited vertices during recursive traversal).
-//!
-//! `VertexRef` is the registry mirror for enumeration and key lookup.
 
-use twizzler::{
-    marker::{BaseType, Invariant},
-    object::ObjID,
-    ptr::InvPtr,
-};
+use twizzler::{marker::Invariant, object::ObjID};
 
 use crate::{
-    edge::{Edge, EdgeHandle, EdgeId},
+    edge::{EdgeHandle, EdgeId},
     graph::Graph,
     name::NameKey,
 };
@@ -55,35 +50,8 @@ enum Which {
     Both,
 }
 
-/// One adjacency entry: invariant pointers to an incident edge and the neighbor
-/// vertex. Direction is implied by which list (out vs in) the entry lives in.
-#[repr(C)]
-pub(crate) struct AdjEntry {
-    pub(crate) label: u32,
-    pub(crate) edge: InvPtr<Edge>,
-    pub(crate) neighbor: InvPtr<Vertex>,
-}
-unsafe impl Invariant for AdjEntry {}
-
-/// A vertex's persistent object: identity, label, properties, and the ObjIDs of
-/// its outgoing and incoming adjacency lists.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(crate) struct Vertex {
-    pub(crate) id: u64,
-    pub(crate) label: u32,
-    pub(crate) name: NameKey,
-    pub(crate) target_raw: u128,
-    pub(crate) props_raw: u128, // reserved (0 = none)
-    pub(crate) flags: u32,      // reserved (bit 0 = tombstone)
-    pub(crate) out_raw: u128,   // ObjID of outgoing adjacency VecObject
-    pub(crate) in_raw: u128,    // ObjID of incoming adjacency VecObject
-}
-unsafe impl Invariant for Vertex {}
-impl BaseType for Vertex {}
-
-/// Registry mirror of a vertex (enumeration / key lookup). Carries the adjacency
-/// ObjIDs so traversal needs no vertex-object map.
+/// Vestigial. The v3 vertex registry row. Nothing writes one: vertices live
+/// in [`crate::arena_store::ArenaStore`] and `Graph::verts` is always empty.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct VertexRef {
@@ -126,13 +94,13 @@ impl VertexHandle {
     }
 }
 
-/// A handle for vertex-centric traversal: a vertex id plus the locations of its
-/// outgoing/incoming adjacency lists, bound to a graph.
+/// A handle for vertex-centric traversal: a vertex id bound to a graph.
+///
+/// *v3 also carried the ObjIDs of the two adjacency lists; the arena layout has
+/// no such objects, so the walk goes through `Graph::arena_adjacency`.*
 pub struct VertexView<'a> {
     pub(crate) graph: &'a Graph,
     pub(crate) id: VertexId,
-    pub(crate) out_raw: u128,
-    pub(crate) in_raw: u128,
 }
 
 impl<'a> VertexView<'a> {

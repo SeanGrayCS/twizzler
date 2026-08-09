@@ -1,19 +1,16 @@
 //! Edges.
 //!
-//! An edge is its own persistent object holding an `InvPtr` to each endpoint
-//! vertex, so per-vertex adjacency lists can point at it and following an edge
-//! is a pointer dereference. `EdgeRef` is the registry mirror for enumeration
-//! and id lookup. `EdgeHandle` is the element passed to user filter predicates.
+//! An edge has no object of its own. `EdgeRef` — the registry row — *is* the
+//! edge: it carries the label, both endpoint ids, the property-object id and the
+//! tombstone bit. Traversal reaches an edge through an adjacency entry in the
+//! source vertex's arena, which stores the edge id inline, so following an edge
+//! is an index into the registry rather than a pointer chase.
 //!
-//! `props_raw` and `flags` are reserved (0 now): an `ObjID` of a side property
-//! object, and a tombstone bit for deletes.
+//! `EdgeHandle` is the element passed to user filter predicates.
 
-use twizzler::{
-    marker::{BaseType, Invariant},
-    ptr::InvPtr,
-};
+use twizzler::marker::Invariant;
 
-use crate::vertex::{Vertex, VertexId};
+use crate::vertex::VertexId;
 
 /// Until the layout lands, `EdgeId(n)` built by value is a latent bug — it
 /// compiles under either regime but means different records. Capture what
@@ -23,22 +20,8 @@ use crate::vertex::{Vertex, VertexId};
 /// see the note on `VertexId`.
 pub use crate::record::RecordId as EdgeId;
 
-/// An edge object: both endpoints are invariant pointers.
-#[repr(C)]
-pub(crate) struct Edge {
-    pub(crate) id: u64,
-    pub(crate) label: u32,
-    pub(crate) from_id: u64,
-    pub(crate) to_id: u64,
-    pub(crate) from: InvPtr<Vertex>,
-    pub(crate) to: InvPtr<Vertex>,
-    pub(crate) props_raw: u128, // reserved (0 = none)
-    pub(crate) flags: u32,      // reserved (bit 0 = tombstone)
-}
-unsafe impl Invariant for Edge {}
-impl BaseType for Edge {}
-
-/// Registry mirror of an edge (enumeration / id lookup; not used for traversal).
+/// The edge itself: label, endpoints, properties, tombstone. Lives in the edge
+/// registry; there is no separate edge object to mirror.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct EdgeRef {
