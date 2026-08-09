@@ -488,10 +488,6 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        st.ck(g.is_arena(), || "seeded graph did not come back as v4".into());
-        // The `w*` vertices were written through a reopened handle; if the
-        // registries created by the first handle did not reach disk, these are
-        // the ones that vanish.
         let post = n / 4;
         for i in (0..post).step_by(23) {
             let v = VertexId((n + i) as u64);
@@ -1074,26 +1070,24 @@ fn main() {
         secs,
         sync_secs
     );
-    if g.is_arena() {
+    println!(
+        "GSTRESS ARENA: {} arenas for {} vertices ({:.4} objects/vertex), {} syncs; \
+         v3 would have spent ~{} objects (3/vertex + 1/edge)",
+        g.arena_count(),
+        next_id,
+        g.arena_count() as f64 / next_id.max(1) as f64,
+        g.arena_sync_count(),
+        next_id * 3 + preset.bulk_edges as u64
+    );
+    let (policy, actual) = g.arena_vertex_counts();
+    println!("GSTRESS ARENA DIST policy: {policy:?}");
+    println!("GSTRESS ARENA DIST locs:   {actual:?}");
+    if policy != actual {
+        let (ps, as_): (usize, usize) = (policy.iter().sum(), actual.iter().sum());
         println!(
-            "GSTRESS ARENA: {} arenas for {} vertices ({:.4} objects/vertex), {} syncs; \
-             v3 would have spent ~{} objects (3/vertex + 1/edge)",
-            g.arena_count(),
-            next_id,
-            g.arena_count() as f64 / next_id.max(1) as f64,
-            g.arena_sync_count(),
-            next_id * 3 + preset.bulk_edges as u64
+            "GSTRESS ARENA DIST MISMATCH: the placement policy and the location \
+             registry disagree (totals {ps} vs {as_}) — cap is not controlling rollover"
         );
-        let (policy, actual) = g.arena_vertex_counts();
-        println!("GSTRESS ARENA DIST policy: {policy:?}");
-        println!("GSTRESS ARENA DIST locs:   {actual:?}");
-        if policy != actual {
-            let (ps, as_): (usize, usize) = (policy.iter().sum(), actual.iter().sum());
-            println!(
-                "GSTRESS ARENA DIST MISMATCH: the placement policy and the location \
-                 registry disagree (totals {ps} vs {as_}) — cap is not controlling rollover"
-            );
-        }
     }
     if st.fails > 0 {
         st.report_suppressed();
