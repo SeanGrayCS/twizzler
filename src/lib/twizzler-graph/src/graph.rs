@@ -59,13 +59,33 @@ pub(crate) const MAGIC_DESTROYED: u64 = MAGIC ^ 0xFFFF_FFFF_FFFF_FFFF;
 #[allow(dead_code)] // see above: reserved, not obsolete
 pub(crate) const VERSION: u32 = 5;
 
-/// On-disk format 7 ("v4"): vertices and adjacency live in packed arenas
-/// ([`ArenaStore`]) instead of three objects per vertex plus one per edge.
-pub(crate) const VERSION_ARENA: u32 = 7;
+/// On-disk format 8 (the arena layout): vertices and adjacency live in
+/// packed arenas ([`ArenaStore`]) instead of three objects per vertex plus one
+/// per edge.
+pub(crate) const VERSION_ARENA: u32 = 8;
 
-/// Whether this build understands a graph in the given on-disk format.
+/// Kept because a v7 graph is still reclaimable: the two formats differ only
+/// in a trailing root field, and every arena, registry and property object sits
+/// exactly where it did. See [`version_reclaimable`].
+pub(crate) const VERSION_ARENA_NOCAP: u32 = 7;
+
+/// Whether this build can *operate* on a graph in the given on-disk format —
+/// read it, write it, hand it to a caller.
+///
+/// Strict on purpose: misreading a layout yields garbage rather than an error.
 fn version_supported(v: u32) -> bool {
     v == VERSION_ARENA
+}
+
+/// Whether this build can *free* a graph in the given format — deliberately
+/// broader than [`version_supported`].
+///
+/// Reading and reclaiming are different questions. Reading needs every field
+/// to mean what the code thinks it means. Reclaiming only needs to find the
+/// object ids, so a predecessor format qualifies whenever its *object graph* is
+/// unchanged, whatever happened to the interpretation of individual records.
+fn version_reclaimable(v: u32) -> bool {
+    v == VERSION_ARENA || v == VERSION_ARENA_NOCAP
 }
 const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
@@ -103,11 +123,13 @@ pub(crate) struct GraphRoot {
     pub(crate) edges_raw: u128,
     pub(crate) labels_raw: u128,
     pub(crate) vindex_raw: u128,
-    /// VERSION 4 only: the [`ArenaStore`]'s arena directory and location
-    /// registry. Both zero in a v3 graph, and only read when `version` says 4 —
-    /// appended at the end so a v3 root stays byte-compatible.
+    /// The [`ArenaStore`]'s arena directory and location registry.
     pub(crate) arena_dir_raw: u128,
     pub(crate) arena_locs_raw: u128,
+    /// Read on open in preference to the caller's argument. `seg_cap` above is
+    /// the precedent: geometry that must stay uniform for the graph's lifetime
+    /// belongs in the root.
+    pub(crate) arena_cap: u32,
 }
 unsafe impl Invariant for GraphRoot {}
 impl BaseType for GraphRoot {}
@@ -215,7 +237,7 @@ impl Graph {
         if cap == 0 || cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        if arena_cap == 0 {
+        if arena_cap == 0 || arena_cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
         let mut namer = static_naming_factory().expect("naming service available");
@@ -244,11 +266,23 @@ impl Graph {
                 // `version_supported` above already rejected anything but
                 // VERSION_ARENA, so there is exactly one layout to open.
                 let store = {
-                    let (dir, locs) = {
+                    let (dir, locs, stored_cap) = {
                         let r = root.base();
-                        (r.arena_dir_raw, r.arena_locs_raw)
+                        (r.arena_dir_raw, r.arena_locs_raw, r.arena_cap)
                     };
-                    ArenaStore::open(dir, locs, Box::new(FillTo { cap: arena_cap }), cap)?
+                    let cap_for_placement = if stored_cap == 0 {
+                        DEFAULT_ARENA_CAP
+                    } else {
+                        stored_cap as usize
+                    };
+                    ArenaStore::open(
+                        dir,
+                        locs,
+                        Box::new(FillTo {
+                            cap: cap_for_placement,
+                        }),
+                        cap,
+                    )?
                 };
                 return Ok(Graph {
                     root_id: node.id.into(),
@@ -286,6 +320,7 @@ impl Graph {
                 vindex_raw: vindex.object().id().raw(),
                 arena_dir_raw,
                 arena_locs_raw,
+                arena_cap: arena_cap as u32,
             })?;
 
         let _ = namer.remove(&path);
@@ -339,7 +374,7 @@ impl Graph {
     /// the name is not an option — `data/` names cannot be removed on this
     /// build — so the root is rewritten in place, exactly as `reset` does.
     pub fn reset_arena(name: &str, arena_cap: usize) -> Result<()> {
-        if arena_cap == 0 {
+        if arena_cap == 0 || arena_cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
         Self::reset_inner_fmt(name, None, arena_cap)
@@ -382,9 +417,15 @@ impl Graph {
             // are zeroed, so there is nothing left to chase.
             return Ok(0);
         }
-        if !version_supported(version) || cap == 0 {
-            // Refuse rather than delete objects named by a layout we cannot
-            // read correctly.
+        // `version_reclaimable`, not `version_supported`: destroy's job is to
+        // free what the graph owns, and that only needs the object graph to be
+        // walkable. Refusing here on a merely-outdated format would strand the
+        // graph forever — the name cannot be unbound on this build, so nothing
+        // would ever come back to free it.
+        if !version_reclaimable(version) || cap == 0 {
+            // Still refuse a format whose objects we cannot locate: deleting ids
+            // read out of a layout we do not understand is how a live graph gets
+            // destroyed.
             return Err(GraphError::StaleVersion {
                 found: version,
                 expected: VERSION_ARENA,
@@ -431,6 +472,7 @@ impl Graph {
             b.vindex_raw = 0;
             b.arena_dir_raw = 0;
             b.arena_locs_raw = 0;
+            b.arena_cap = 0;
             Ok(())
         })?;
 
@@ -487,9 +529,13 @@ impl Graph {
                 // A destroyed root already freed everything and zeroed its
                 // registry ids; walking them would chase freed objects.
                 _ if was_destroyed => Vec::new(),
-                // v4: arenas plus registries. The `verts` registry exists but
-                // is unused, and is freed with the rest.
-                VERSION_ARENA if old_cap != 0 => {
+                // Arenas plus registries. The `verts` registry exists but is
+                // unused, and is freed with the rest. Matches any *reclaimable*
+                // format, not just the current one — see `version_reclaimable`.
+                //
+                // Bound as `ver`, not `v`: `v` is already the verts registry id
+                // in this scope, and a match binding would shadow it.
+                ver if version_reclaimable(ver) && old_cap != 0 => {
                     let cap = old_cap as usize;
                     let mut ids = Vec::new();
                     if let Ok(store) = ArenaStore::open(
@@ -546,6 +592,7 @@ impl Graph {
             b.vindex_raw = vindex_raw;
             b.arena_dir_raw = arena_dir_raw;
             b.arena_locs_raw = arena_locs_raw;
+            b.arena_cap = arena_cap as u32;
             Ok(())
         })?;
 
@@ -969,4 +1016,81 @@ fn edge_registry_ids(edges_raw: u128, cap: usize) -> Vec<u128> {
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the format guards and the geometry validation.
+    //!
+    //! Pure functions and early-return argument checks only — nothing here
+    //! creates an object, so these cost the shared boot nothing. The
+    //! behavioural counterparts live in `tests/arena_graph.rs`.
+
+    use super::*;
+
+    /// Reading is gated strictly: exactly one format, and no predecessor.
+    #[test]
+    fn only_the_current_format_is_readable() {
+        assert!(version_supported(VERSION_ARENA));
+        assert!(!version_supported(VERSION_ARENA_NOCAP), "v7 is not readable");
+        assert!(!version_supported(VERSION), "v3 is not readable");
+        for v in [0, 1, 2, 3, 4, 6, 9, 99, u32::MAX] {
+            assert!(!version_supported(v), "version {v} must not be readable");
+        }
+    }
+
+    /// Freeing is gated on whether the *object graph* is walkable, which is a
+    /// weaker condition — v7 differs from v8 only by a trailing root field.
+    #[test]
+    fn a_predecessor_with_the_same_object_graph_is_reclaimable() {
+        assert!(version_reclaimable(VERSION_ARENA));
+        assert!(
+            version_reclaimable(VERSION_ARENA_NOCAP),
+            "v7 must stay reclaimable: same arenas, same registries, same \
+             property objects — only GraphRoot grew a trailing field"
+        );
+    }
+
+    #[test]
+    fn v3_is_not_reclaimable() {
+        assert!(!version_reclaimable(VERSION));
+        for v in [0, 1, 2, 3, 4, 6, 9, 99, u32::MAX] {
+            assert!(!version_reclaimable(v), "version {v} must not be freed");
+        }
+    }
+
+    /// The invariant that the 7 → 8 bump broke. Anything this build can
+    /// read, it must also be able to free — otherwise opening a graph and then
+    /// resetting it leaks the very objects it was just using. Asserting the
+    /// relationship rather than two enumerations is what makes this survive the
+    /// next bump: a new format added to `version_supported` alone fails here.
+    #[test]
+    fn everything_readable_is_also_reclaimable() {
+        for v in 0..=32u32 {
+            assert!(
+                !version_supported(v) || version_reclaimable(v),
+                "version {v} is readable but not reclaimable — a reset would \
+                 leak a graph this build had open"
+            );
+        }
+    }
+
+    #[test]
+    fn arena_cap_is_rejected_outside_the_persisted_range() {
+        let too_big = u32::MAX as usize + 1;
+        assert!(Graph::open_or_create_arena("t-cap-guard", 0).is_err());
+        assert!(Graph::open_or_create_arena("t-cap-guard", too_big).is_err());
+        assert!(Graph::reset_arena("t-cap-guard", 0).is_err());
+        assert!(Graph::reset_arena("t-cap-guard", too_big).is_err());
+        assert!(Graph::open_or_create_arena_with_capacity("t-cap-guard", 4, 0).is_err());
+    }
+
+    /// The registry segment capacity has the same persisted-as-`u32` constraint.
+    #[test]
+    fn seg_cap_is_rejected_outside_the_persisted_range() {
+        assert!(Graph::open_or_create_with_capacity("t-seg-guard", 0).is_err());
+        assert!(
+            Graph::open_or_create_with_capacity("t-seg-guard", u32::MAX as usize + 1).is_err()
+        );
+    }
 }

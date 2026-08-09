@@ -374,6 +374,119 @@ fn destroy_cycles_do_not_accumulate() {
     assert!(freed_each[0] > 0);
 }
 
+/// A stale-but-walkable format is still reclaimed, not leaked.
+///
+/// `version_supported` gates *reading* a graph and is strict, because misreading
+/// a layout yields garbage. Freeing one is a different question: it only needs
+/// the object ids to be findable. v7 and v8 differ solely in a trailing
+/// `GraphRoot` field that no inventory walk reads, so every arena, registry and
+/// property object of a v7 graph is exactly where v8's walker expects it.
+///
+/// This exists because the 7 → 8 bump silently turned that into a leak — the
+/// inventory arm matched `VERSION_ARENA` by name, so changing the constant
+/// stopped it matching. Nothing failed; the graph was simply abandoned. A
+/// version bump must never quietly become a storage leak.
+///
+/// The graph is built normally and then *downgraded* by rewriting its root's
+/// version, which is the only way to get a previous-format graph out of a build
+/// that can no longer write one.
+#[test]
+fn a_previous_arena_format_is_still_reclaimed_on_destroy() {
+    use naming::{static_naming_factory, GetFlags};
+    use twizzler::object::{MapFlags, Object};
+
+    use crate::graph::{GraphRoot, VERSION_ARENA_NOCAP};
+
+    let name = "t-ab-reclaim-old";
+    Graph::reset_arena(name, ARENA_CAP).expect("reset");
+    let owned = {
+        let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open");
+        let (hub, spokes) = build(&mut g);
+        g.set_vertex_prop(hub, "k", PropValue::I64(1)).unwrap();
+        g.set_vertex_prop(spokes[0], "k", PropValue::I64(2)).unwrap();
+        g.sync().unwrap();
+        g.owned_object_ids().len()
+    };
+    assert!(owned > 0, "the graph owns something to reclaim");
+
+    // Downgrade the root in place: same objects, previous format.
+    let path = format!("data/{name}");
+    let mut namer = static_naming_factory().expect("naming service available");
+    let node = namer.get(&path, GetFlags::FOLLOW_SYMLINK).expect("registered");
+    let mut root = Object::<GraphRoot>::map(
+        node.id.into(),
+        MapFlags::READ | MapFlags::WRITE | MapFlags::PERSIST,
+    )
+    .expect("map root");
+    root.with_tx(|tx| {
+        tx.base_mut().version = VERSION_ARENA_NOCAP;
+        Ok(())
+    })
+    .expect("downgrade");
+
+    // Reading it must still refuse — that guard is meant to be strict.
+    assert!(
+        Graph::open_or_create(name).is_err(),
+        "a previous format must not open"
+    );
+
+    // Freeing it must still work.
+    let freed = Graph::destroy(name).expect("destroy a previous-format graph");
+    assert_eq!(
+        freed, owned,
+        "every object the graph owned was freed, not leaked"
+    );
+    assert_eq!(Graph::destroy(name).expect("second destroy"), 0);
+}
+
+/// The load-bearing assertion is about where new records go, not where old
+/// ones are. Existing records never move regardless, so an implementation that
+/// persisted nothing would still pass a test that only re-read old placement.
+#[test]
+fn arena_cap_survives_a_reopen_that_does_not_supply_one() {
+    let name = "t-ab-cap-persist";
+    Graph::reset_arena(name, ARENA_CAP).expect("reset");
+
+    let before = {
+        let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open");
+        for i in 0..10 {
+            g.add_vertex("n", &format!("v{i}"), ObjID::new(0))
+                .expect("add");
+        }
+        g.sync().expect("sync");
+        // `FillTo` packs `cap` per arena before opening another: 4 + 4 + 2.
+        assert_eq!(g.arena_count(), 3, "10 vertices at cap 4 fill 3 arenas");
+        g.arena_vertex_counts().1
+    };
+
+    // Reopened through the constructor that supplies no cap.
+    let mut g = Graph::open_or_create(name).expect("reopen without a cap");
+    assert_eq!(
+        g.arena_vertex_counts().1,
+        before,
+        "existing records do not move on reopen"
+    );
+
+    // The third arena holds 2 of 4. Four more inserts must fill it and then
+    // roll into a fourth. Under the defect the store reopens at
+    // DEFAULT_ARENA_CAP (16384), so all four land in arena 2 and the count
+    // stays at 3 — which is exactly the silent relayout being pinned here.
+    for i in 10..14 {
+        g.add_vertex("n", &format!("w{i}"), ObjID::new(0))
+            .expect("add after reopen");
+    }
+    assert_eq!(
+        g.arena_count(),
+        4,
+        "inserts after reopen must follow the persisted cap, not DEFAULT_ARENA_CAP"
+    );
+    assert_eq!(
+        g.arena_vertex_counts().1,
+        vec![4, 4, 4, 2],
+        "placement policy is continuous across the reopen"
+    );
+}
+
 #[test]
 fn graph_reopens_by_name_with_contents_intact() {
     let name = "t-ab-reopen";

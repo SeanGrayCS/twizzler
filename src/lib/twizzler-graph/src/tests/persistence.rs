@@ -118,6 +118,7 @@ fn stale_v2_root_detected_and_resettable() {
                 vindex_raw: 0,
                 arena_dir_raw: 0,
                 arena_locs_raw: 0,
+                arena_cap: 0,
             })
             .unwrap();
         namer.put(&path, root.id()).unwrap();
