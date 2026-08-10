@@ -22,6 +22,7 @@ use twizzler::{
 };
 
 use crate::name::NameKey;
+use crate::props::PropValue;
 use crate::segvec::SegVec;
 
 type Result<T> = core::result::Result<T, twizzler::error::TwzError>;
@@ -33,25 +34,147 @@ pub const ADJ_CHUNK: usize = 8;
 /// `flags` bit 0: record is deleted.
 const TOMBSTONE: u32 = 1;
 
-/// A vertex, allocated inside an arena. `out_head`/`in_head` are arena
-/// offsets (0 = empty), not pointers.
+/// Mirrored into `VertexLoc.flags` beside `TOMBSTONE`, and that is the whole
+/// point. With edges as records, `locs` holds both, so `vertices()` has to
+/// exclude edges — and if the only place that fact lived were the record, the
+/// scan would have to resolve every record to answer. That is precisely the
+/// 3.2× cold regression the liveness mirror was built to remove, traded against
+/// its measured 5.2× warm gain. Keeping the bit in the mirror makes scan cost
+/// independent of how wide records get, which matters more once records carry
+/// inline properties.
+///
+/// It follows that is-edge must not also be expressible as a property, or
+/// there are two sources of truth for it.
+#[allow(dead_code)] // wired up with the record format
+const IS_EDGE: u32 = 2;
+
+/// `flags` bit 2/3: the record's inline out-/in-adjacency slot is occupied.
+///
+/// One slot each way, not two. Two would cover degree-2 vertices as well, but
+/// the case that matters is the edge record, which is exactly degree-1, and
+/// every extra slot widens *every* record including the vertices that spill to
+/// chunks anyway.
+const HAS_INLINE_OUT: u32 = 4;
+const HAS_INLINE_IN: u32 = 8;
+
+/// 48 bytes, of which 8 are padding. `PropValue` contains a `u128` variant,
+/// so it aligns to 16 and the `u32` key cannot share its first word. The waste
+/// is recorded rather than optimised: shrinking it means either dropping
+/// `ObjId(u128)` from `PropValue` or splitting keys into a parallel array, and
+/// both are format decisions that should be made against a measurement rather
+/// than against this comment.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(crate) struct PropSlot {
+    pub(crate) key_id: u32,
+    pub(crate) _pad: u32,
+    pub(crate) val: PropValue,
+}
+unsafe impl Invariant for PropSlot {}
+
+/// Hand-written rather than derived, to exclude `_pad`.
+///
+/// Two slots are equal when they *mean* the same thing. A derived `PartialEq`
+/// would compare the padding word, making equality depend on bytes nothing
+/// reads — and the only thing keeping that word zero is the allocation-time
+/// zeroing, which `add_record` deliberately does not rely on for correctness
+/// (see the note there about the transaction's mapping). Deriving would quietly
+/// promote padding from "never read" to "load-bearing in tests".
+impl PartialEq for PropSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_id == other.key_id && self.val == other.val
+    }
+}
+
+/// Header of a record's data-property block, followed by `cap` [`PropSlot`]s
+/// of which `len` are live.
+///
+/// This block is the thing that may move, and it is the only one. It has
+/// exactly one referent — `ArenaRecordHead::data_props`, a single `u64` — so
+/// growing it is: allocate a bigger block, copy, write one field. No inbound
+/// `InvPtr` names it, which is precisely why data properties can be added after
+/// insert while inline traversal slots cannot.
+///
+/// 16 bytes, which is both `PropSlot`'s alignment and the arena's minimum, so
+/// the slots that follow need no padding.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub(crate) struct ArenaVertex {
+pub(crate) struct DataBlockHead {
+    pub(crate) len: u16,
+    pub(crate) cap: u16,
+    pub(crate) _pad: [u8; 12],
+}
+unsafe impl Invariant for DataBlockHead {}
+
+/// Bytes occupied by a data-property block with room for `cap` entries.
+pub(crate) const fn data_block_size(cap: u16) -> usize {
+    size_of::<DataBlockHead>() + cap as usize * size_of::<PropSlot>()
+}
+
+/// Bytes occupied by a record carrying `nprops` inline traversal properties.
+#[allow(dead_code)] // wired up with the record format
+pub(crate) const fn record_size(nprops: u16) -> usize {
+    size_of::<ArenaRecordHead>() + nprops as usize * size_of::<PropSlot>()
+}
+
+
+/// Self-describing on purpose: there is no schema. The record carries
+/// `nprops`, so its extent is derivable from its own bytes and nothing external
+/// has to be consulted to read it. That is what let the earlier schema-typed
+/// draft (declared types, a `SegVec<TypeDef>`, type ids in `flags`) be dropped:
+/// it fixed size per *declared type* where this fixes it per *record*, needing
+/// no declaration step and wasting no slots.
+///
+/// Size is fixed at insert and the record never moves. This is forced by
+/// pointer topology, not chosen: a record has O(in-degree) inbound
+/// `AdjRef.neighbor` `InvPtr`s, each holding its offset, so relocating it means
+/// rewriting all of them with durability ordering to get right. Data properties
+/// escape this because their block has exactly one referent — `data_props`,
+/// a single `u64` that can be repointed in place. *Many referents ⇒ immovable;
+/// one referent ⇒ freely movable.*
+// Not `Copy`, unlike every other record type here: it embeds `AdjRef`s,
+// whose `InvPtr` carries a FOT index that means something only inside its own
+// object. Copying a head between arenas would silently mis-resolve, which is
+// the same reason `AdjRef` and `AdjChunk` are not `Copy`.
+#[repr(C)]
+#[allow(dead_code)] // wired up with the record format
+pub(crate) struct ArenaRecordHead {
     pub(crate) id: u64,
-    pub(crate) label: u32,
     pub(crate) flags: u32,
+    pub(crate) label: u32,
+    /// Inline traversal slots. `u16` bounds a record at 65 535 of them, far
+    /// above the ~11 000-vertex property ceiling this format exists to remove.
+    pub(crate) nprops: u16,
+    pub(crate) _pad: u16,
+    /// A tombstoned record cannot simply be overwritten: inbound
+    /// `AdjRef.neighbor` `InvPtr`s still hold its offset, and `walk_adj`
+    /// resolves the pointer *before* checking liveness. Reusing the bytes with
+    /// no invalidation would make a stale pointer resolve to a live record with
+    /// a valid id — the liveness check passes and traversal returns a neighbour
+    /// that was never connected. Silent, and worse than the `resolve`/
+    /// `resolve_mut` incoherence because nothing faults.
+    ///
+    /// Every `AdjRef` records the generation it expects, so a stale entry
+    /// mismatches and is skipped. Belongs to the slot, not the record: a
+    /// reused slot's new record has a different id *and* a higher generation.
+    ///
+    /// Free: it lives in padding the head already had, so the record stays 128
+    /// bytes and `AdjRef` stays 24.
+    pub(crate) generation: u32,
     pub(crate) name: NameKey,
-    /// VERSION 4: absorbed from `VertexRef`, which is retiring. Holding these
-    /// here is what lets the `verts` registry go away entirely rather than
-    /// shadowing the arena with a second structure that assigns ids in
-    /// lockstep by convention.
     pub(crate) target_raw: u128,
-    pub(crate) props_raw: u128,
+    pub(crate) data_props: u64,
+    /// Chunk-chain heads. 0 means "no chunk", which for a degree-≤1 record is
+    /// now the normal case — see the inline slots below.
     pub(crate) out_head: u64,
     pub(crate) in_head: u64,
+    /// Entries here are ordinary `AdjRef`s and carry a FOT index, which is
+    /// meaningful only inside the containing object — safe because the record
+    /// *is* in the arena, exactly as a chunk is.
+    pub(crate) inline_out: AdjRef,
+    pub(crate) inline_in: AdjRef,
 }
-unsafe impl Invariant for ArenaVertex {}
+unsafe impl Invariant for ArenaRecordHead {}
 
 /// One adjacency entry (VERSION 4).
 ///
@@ -68,9 +191,9 @@ unsafe impl Invariant for ArenaVertex {}
 #[repr(C)]
 pub(crate) struct AdjRef {
     pub(crate) edge_id: u64,
-    pub(crate) neighbor: InvPtr<ArenaVertex>,
+    pub(crate) neighbor: InvPtr<ArenaRecordHead>,
     pub(crate) label: u32,
-    pub(crate) _pad: u32,
+    pub(crate) neighbor_gen: u32,
 }
 unsafe impl Invariant for AdjRef {}
 
@@ -82,7 +205,7 @@ impl AdjRef {
             edge_id: 0,
             neighbor: InvPtr::null(),
             label: 0,
-            _pad: 0,
+            neighbor_gen: 0,
         }
     }
 }
@@ -163,10 +286,37 @@ pub struct ArenaStore {
     open: Vec<ArenaObject>,
     txs: Vec<Option<TxObject<ArenaBase>>>,
     stats: Vec<ArenaStat>,
+    /// Reclaimed record slots per arena, as `(offset, stride)`.
+    ///
+    /// In-memory, rebuilt on `open`. Persisting it would mean a second
+    /// structure to keep coherent with the records themselves — exactly the
+    /// record/mirror split that produced the `resolve`/`resolve_mut` bug — and
+    /// it is derivable: a slot is free iff some tombstoned `locs` entry names it
+    /// and no live entry does. Deriving costs one pass at open and cannot drift.
+    ///
+    /// Exact-stride reuse only. A freed 128-byte slot is not offered to a
+    /// record wanting 176, and is not split for one wanting 80. Both would work
+    /// but both need a size-class scheme, and today nearly every record is
+    /// `record_size(0)` — vertices default to no inline slots and edges always
+    /// have none — so exact match covers the common case at no complexity. If a
+    /// profile ever shows churn on mixed widths, that is when to generalise.
+    free: Vec<Vec<(u64, usize)>>,
     policy: Box<dyn Placement>,
     /// Syncs issued by `sync_all`, so a test can assert the batching property
     /// directly rather than inferring it from wall time.
     syncs: usize,
+    /// Both criteria were written as claims about *mechanism* ("performs no
+    /// second resolution", "assert the scan's cost"), which nothing could
+    /// check: they would have passed by inspection, which is how the
+    /// `resolve`/`resolve_mut` incoherence survived five days of a green suite.
+    /// A counter makes them falsifiable.
+    ///
+    /// `Cell` because `record_ptr` takes `&self`; the store is single-threaded
+    /// per handle, which is the same contract the raw pointers already rely on.
+    #[cfg(test)]
+    record_touches: core::cell::Cell<usize>,
+    #[cfg(test)]
+    data_block_reads: core::cell::Cell<usize>,
 }
 
 impl ArenaStore {
@@ -177,8 +327,13 @@ impl ArenaStore {
             open: Vec::new(),
             txs: Vec::new(),
             stats: Vec::new(),
+            free: Vec::new(),
             policy,
             syncs: 0,
+            #[cfg(test)]
+            record_touches: core::cell::Cell::new(0),
+            #[cfg(test)]
+            data_block_reads: core::cell::Cell::new(0),
         })
     }
 
@@ -233,6 +388,43 @@ impl ArenaStore {
                 open.len()
             );
         }
+        // Rebuild the free list (see the field's doc for why it is derived
+        // rather than persisted). A tombstoned entry's offset is free unless a
+        // live entry also names it — which happens exactly when the slot was
+        // already reused, in which case the live record owns it.
+        let mut free: Vec<Vec<(u64, usize)>> = (0..open.len()).map(|_| Vec::new()).collect();
+        {
+            let mut taken: Vec<(u32, u64)> = Vec::new();
+            for i in 0..locs.len() {
+                if let Some(l) = locs.get_ref(i) {
+                    if l.flags & TOMBSTONE == 0 {
+                        taken.push((l.arena, l.off));
+                    }
+                }
+            }
+            for i in 0..locs.len() {
+                let Some(l) = locs.get_ref(i).map(|l| *l) else {
+                    continue;
+                };
+                if l.flags & TOMBSTONE == 0 || taken.contains(&(l.arena, l.off)) {
+                    continue;
+                }
+                let Some(a) = open.get(l.arena as usize) else {
+                    continue;
+                };
+                // The dead record still describes its own extent.
+                let Some(p) = a
+                    .object()
+                    .lea(l.off as usize, size_of::<ArenaRecordHead>())
+                else {
+                    continue;
+                };
+                let nprops = unsafe { (*(p as *const ArenaRecordHead)).nprops };
+                if let Some(slots) = free.get_mut(l.arena as usize) {
+                    slots.push((l.off, record_size(nprops)));
+                }
+            }
+        }
         let txs = (0..open.len()).map(|_| None).collect();
         Ok(ArenaStore {
             dir,
@@ -240,8 +432,13 @@ impl ArenaStore {
             open,
             txs,
             stats,
+            free,
             policy,
             syncs: 0,
+            #[cfg(test)]
+            record_touches: core::cell::Cell::new(0),
+            #[cfg(test)]
+            data_block_reads: core::cell::Cell::new(0),
         })
     }
 
@@ -256,18 +453,6 @@ impl ArenaStore {
         let mut ids = self.dir.object_ids();
         ids.extend(self.locs.object_ids());
         ids.extend(self.open.iter().map(|a| a.object().id().raw()));
-        for id in 0..self.locs.len() as u64 {
-            // Tombstoned vertices included: their property objects are exactly
-            // the ones nothing else will ever free.
-            if let Some(loc) = self.locs.get_ref(id as usize).map(|l| *l) {
-                if let Some(rp) = self.record_ptr(&loc) {
-                    let p = unsafe { (*rp).props_raw };
-                    if p != 0 {
-                        ids.push(p);
-                    }
-                }
-            }
-        }
         ids
     }
 
@@ -275,7 +460,7 @@ impl ArenaStore {
         self.open.len()
     }
 
-    pub fn vertex_count(&self) -> usize {
+    pub fn record_count(&self) -> usize {
         self.locs.len()
     }
 
@@ -311,6 +496,7 @@ impl ArenaStore {
         self.open.push(arena);
         self.txs.push(None);
         self.stats.push(ArenaStat { vertices: 0 });
+        self.free.push(Vec::new());
         Ok(self.open.len() - 1)
     }
 
@@ -335,7 +521,7 @@ impl ArenaStore {
     /// where one is *required* rather than resolved: `InvPtr::new` needs a
     /// global address to build an adjacency entry against. Never resolve one
     /// of these to touch a record; go through [`Self::record_ptr`].
-    fn vertex_ptr(&self, id: u64) -> Option<GlobalPtr<ArenaVertex>> {
+    fn vertex_ptr(&self, id: u64) -> Option<GlobalPtr<ArenaRecordHead>> {
         let loc = self.locs.get_ref(id as usize)?;
         let aid = self.try_arena_id(loc.arena as usize)?;
         Some(GlobalPtr::new(aid, loc.off))
@@ -363,10 +549,34 @@ impl ArenaStore {
     // the rest of this file runs on.
 
     /// Raw pointer to a vertex record, inside its arena's own mapping.
-    fn record_ptr(&self, loc: &VertexLoc) -> Option<*mut ArenaVertex> {
+    fn record_ptr(&self, loc: &VertexLoc) -> Option<*mut ArenaRecordHead> {
+        #[cfg(test)]
+        self.record_touches.set(self.record_touches.get() + 1);
         let obj = self.open.get(loc.arena as usize)?.object();
-        obj.lea_mut(loc.off as usize, size_of::<ArenaVertex>())
-            .map(|p| p as *mut ArenaVertex)
+        obj.lea_mut(loc.off as usize, size_of::<ArenaRecordHead>())
+            .map(|p| p as *mut ArenaRecordHead)
+    }
+
+    /// Records touched since the last [`Self::reset_record_touches`].
+    ///
+    /// Counts *attempts*, incremented before the bounds check, so a lookup that
+    /// fails still registers. A path that "does not touch records" must not be
+    /// reaching this function at all — counting only successes would let a
+    /// miss-heavy path look clean.
+    #[cfg(test)]
+    pub(crate) fn record_touches(&self) -> usize {
+        self.record_touches.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_record_touches(&self) {
+        self.record_touches.set(0);
+        self.data_block_reads.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_block_reads(&self) -> usize {
+        self.data_block_reads.get()
     }
 
     /// Raw pointer to an adjacency chunk, inside its arena's own mapping.
@@ -391,34 +601,329 @@ impl ArenaStore {
         Some(loc)
     }
 
-    /// Add a vertex, letting the policy choose its arena.
+    /// Add a vertex with no inline traversal properties.
     pub fn add_vertex(&mut self, label: u32, name: &str, target_raw: u128) -> Result<u64> {
-        let idx = match self.policy.place(&self.stats) {
-            Some(i) if i < self.open.len() => i,
-            _ => self.new_arena()?,
+        self.add_record(label, name, target_raw, &[], false)
+    }
+
+    /// Add a record — vertex or edge — with `props` inline traversal slots.
+    ///
+    /// `props.len()` is fixed here and for the record's lifetime. Not a
+    /// policy choice: a record has O(in-degree) inbound `AdjRef.neighbor`
+    /// `InvPtr`s, each holding its arena offset, so growing one would mean
+    /// rewriting every inbound pointer with durability ordering to get right.
+    /// Anything added later becomes a *data* property, whose block has exactly
+    /// one referent and can therefore move freely.
+    /// `pub(crate)`, unlike [`Self::add_vertex`]: it takes [`PropSlot`], which is
+    /// a *persisted layout* type. Exposing it would publish the record format as
+    /// API and commit us to its field order. The public route to inline
+    /// properties is `Graph::add_vertex_with_props`, which speaks `&str` and
+    /// `PropValue`.
+    pub(crate) fn add_record(
+        &mut self,
+        label: u32,
+        name: &str,
+        target_raw: u128,
+        props: &[PropSlot],
+        is_edge: bool,
+    ) -> Result<u64> {
+        let nprops = u16::try_from(props.len())
+            .map_err(|_| twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+        // Reuse before placement. The policy counts records *ever* allocated,
+        // so it considers an arena full even when a delete has freed a slot in
+        // it — ask it first and it opens a new arena while reclaimed space sits
+        // unused. This overrides the policy only where the alternative is
+        // growth, and only for an exact stride match.
+        //
+        // Deliberate tension worth naming: placement stops being purely
+        // policy-driven, so a future locality-aware policy will sometimes be
+        // overruled by "wherever a slot happened to free up". That is the right
+        // default while the alternative is unbounded arena growth, but a policy
+        // that cares about locality should be able to decline a reclaimed slot.
+        // `Placement` has no way to express that yet.
+        let want = record_size(nprops);
+        let reusable = self
+            .free
+            .iter()
+            .position(|slots| slots.iter().any(|(_, sz)| *sz == want));
+        let idx = match reusable {
+            Some(i) => i,
+            None => match self.policy.place(&self.stats) {
+                Some(i) if i < self.open.len() => i,
+                _ => self.new_arena()?,
+            },
         };
         let id = self.locs.len() as u64;
-        let off = {
-            let tx = self.tx_for(idx)?;
-            tx.alloc(ArenaVertex {
-                id,
-                label,
-                flags: 0,
-                name: NameKey::new(name),
-                target_raw,
-                props_raw: 0,
-                out_head: 0,
-                in_head: 0,
-            })?
-            .offset()
-        };
+        // Not `tx.alloc(head)`, which reserves `Layout::new::<T>()` and so can
+        // only ever place a record with zero inline slots. Routing the ordinary
+        // vertex path through the variable-stride allocator now — at `nprops =
+        // 0`, where it is equivalent — means the whole test suite and `gstress`
+        // exercise it, rather than it sitting untested beside a working path
+        // until the day it is switched on.
+        let (off, generation) = self.alloc_record_bytes(idx, nprops)?;
+        {
+            let obj = self.open[idx].object();
+            let base = obj
+                .lea_mut(off as usize, record_size(nprops))
+                .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+            let p = base as *mut ArenaRecordHead;
+            unsafe {
+                (*p).id = id;
+                (*p).flags = 0;
+                (*p).label = label;
+                (*p).nprops = nprops;
+                (*p).generation = generation;
+                (*p).name = NameKey::new(name);
+                (*p).target_raw = target_raw;
+                (*p).data_props = 0;
+                (*p).out_head = 0;
+                (*p).in_head = 0;
+                if is_edge {
+                    (*p).flags |= IS_EDGE;
+                }
+                // Slots follow the head contiguously. `record_stride_has_no_
+                // hidden_padding` is what makes this pointer arithmetic sound.
+                let slots = base.add(size_of::<ArenaRecordHead>()) as *mut PropSlot;
+                for (i, s) in props.iter().enumerate() {
+                    slots.add(i).write(*s);
+                }
+            }
+        }
         self.locs.push_nosync(VertexLoc {
             arena: idx as u32,
-            flags: 0,
+            flags: if is_edge { IS_EDGE } else { 0 },
             off,
         })?;
         self.stats[idx].vertices += 1;
         Ok(id)
+    }
+
+    /// A live record's inline traversal slots.
+    pub(crate) fn traversal_props(&self, vertex: u64) -> Option<Vec<PropSlot>> {
+        let loc = self.live_loc(vertex)?;
+        let p = self.record_ptr(&loc)?;
+        let n = unsafe { (*p).nprops } as usize;
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        let obj = self.open.get(loc.arena as usize)?.object();
+        let base = obj.lea(loc.off as usize, record_size(n as u16))?;
+        let slots = unsafe { base.add(size_of::<ArenaRecordHead>()) } as *const PropSlot;
+        Some((0..n).map(|i| unsafe { *slots.add(i) }).collect())
+    }
+
+    /// One inline traversal property by interned key.
+    pub(crate) fn traversal_prop(&self, vertex: u64, key_id: u32) -> Option<PropValue> {
+        self.traversal_props(vertex)?
+            .into_iter()
+            .find(|s| s.key_id == key_id)
+            .map(|s| s.val)
+    }
+
+    /// Update an existing inline slot in place. Returns whether the key was
+    /// found; `false` means the caller should store it as a data property.
+    ///
+    /// Updating is safe where adding is not. A slot is fixed-size, so
+    /// overwriting its value moves nothing and no inbound `AdjRef.neighbor`
+    /// offset changes. It is *adding* a key that would grow the record, which is
+    /// the thing the format forbids.
+    ///
+    /// This exists to keep one source of truth. Without it, `set_vertex_prop` on
+    /// a key that happens to be inline would write the side object while readers
+    /// still saw the inline slot — a silent divergence, and indistinguishable
+    /// from an unset property from the outside.
+    pub(crate) fn set_traversal_prop(
+        &mut self,
+        vertex: u64,
+        key_id: u32,
+        val: PropValue,
+    ) -> Option<bool> {
+        let loc = self.live_loc(vertex)?;
+        let p = self.record_ptr(&loc)?;
+        let n = unsafe { (*p).nprops } as usize;
+        if n == 0 {
+            return Some(false);
+        }
+        let obj = self.open.get(loc.arena as usize)?.object();
+        let base = obj.lea_mut(loc.off as usize, record_size(n as u16))?;
+        let slots = unsafe { base.add(size_of::<ArenaRecordHead>()) } as *mut PropSlot;
+        for i in 0..n {
+            unsafe {
+                if (*slots.add(i)).key_id == key_id {
+                    (*slots.add(i)).val = val;
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    pub(crate) fn data_props(&self, vertex: u64) -> Option<Vec<PropSlot>> {
+        let loc = self.live_loc(vertex)?;
+        let p = self.record_ptr(&loc)?;
+        let off = unsafe { (*p).data_props };
+        if off == 0 {
+            return Some(Vec::new());
+        }
+        #[cfg(test)]
+        self.data_block_reads.set(self.data_block_reads.get() + 1);
+        let obj = self.open.get(loc.arena as usize)?.object();
+        let hp = obj.lea(off as usize, size_of::<DataBlockHead>())? as *const DataBlockHead;
+        let (len, cap) = unsafe { ((*hp).len, (*hp).cap) };
+        let base = obj.lea(off as usize, data_block_size(cap))?;
+        let slots = unsafe { base.add(size_of::<DataBlockHead>()) } as *const PropSlot;
+        Some((0..len as usize).map(|i| unsafe { *slots.add(i) }).collect())
+    }
+
+    /// Set a data property, allocating or growing the block as needed.
+    pub(crate) fn set_data_prop(&mut self, vertex: u64, key_id: u32, val: PropValue) -> Result<()> {
+        let loc = self
+            .live_loc(vertex)
+            .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+        let arena = loc.arena as usize;
+        let off = {
+            let p = self
+                .record_ptr(&loc)
+                .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+            unsafe { (*p).data_props }
+        };
+
+        // Existing block: update in place, or append if there is room.
+        if off != 0 {
+            let obj = self.open[arena].object();
+            let hp = obj
+                .lea_mut(off as usize, size_of::<DataBlockHead>())
+                .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?
+                as *mut DataBlockHead;
+            let (len, cap) = unsafe { ((*hp).len, (*hp).cap) };
+            let base = obj
+                .lea_mut(off as usize, data_block_size(cap))
+                .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+            let slots = unsafe { base.add(size_of::<DataBlockHead>()) } as *mut PropSlot;
+            for i in 0..len as usize {
+                unsafe {
+                    if (*slots.add(i)).key_id == key_id {
+                        (*slots.add(i)).val = val;
+                        return Ok(());
+                    }
+                }
+            }
+            if len < cap {
+                unsafe {
+                    slots.add(len as usize).write(PropSlot {
+                        key_id,
+                        _pad: 0,
+                        val,
+                    });
+                    (*hp).len = len + 1;
+                }
+                return Ok(());
+            }
+        }
+
+        // No block, or it is full: allocate a bigger one and copy.
+        let existing = self.data_props(vertex).unwrap_or_default();
+        let new_cap = if existing.is_empty() {
+            4
+        } else {
+            (existing.len() as u16).saturating_mul(2)
+        };
+        let zeros = vec![0u8; data_block_size(new_cap)];
+        let new_off = {
+            let tx = self.tx_for(arena)?;
+            tx.alloc_with_slice::<u8>(&zeros)?.1.offset()
+        };
+        {
+            let obj = self.open[arena].object();
+            let base = obj
+                .lea_mut(new_off as usize, data_block_size(new_cap))
+                .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+            let hp = base as *mut DataBlockHead;
+            let slots = unsafe { base.add(size_of::<DataBlockHead>()) } as *mut PropSlot;
+            unsafe {
+                for (i, s) in existing.iter().enumerate() {
+                    slots.add(i).write(*s);
+                }
+                slots.add(existing.len()).write(PropSlot {
+                    key_id,
+                    _pad: 0,
+                    val,
+                });
+                (*hp).len = existing.len() as u16 + 1;
+                (*hp).cap = new_cap;
+            }
+        }
+        // Repoint the record last: until this write lands, the record still
+        // names the old block, so an interruption leaks a block rather than
+        // leaving the record pointing at a half-built one.
+        let p = self
+            .record_ptr(&loc)
+            .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+        unsafe { (*p).data_props = new_off };
+        Ok(())
+    }
+
+    pub(crate) fn live_record(&self, vertex: u64) -> Option<()> {
+        self.live_loc(vertex).map(|_| ())
+    }
+
+    /// A slot's current generation, for stamping into an `AdjRef`.
+    fn generation_of(&self, vertex: u64) -> Option<u32> {
+        let loc = self.live_loc(vertex)?;
+        let p = self.record_ptr(&loc)?;
+        Some(unsafe { (*p).generation })
+    }
+
+    /// Whether a record is an edge. Reads the mirror, not the record — the
+    /// point of duplicating the bit into `VertexLoc.flags`.
+    pub(crate) fn is_edge(&self, vertex: u64) -> bool {
+        self.locs
+            .get_ref(vertex as usize)
+            .map_or(false, |l| l.flags & IS_EDGE != 0)
+    }
+
+    /// # Why a byte slice and not `alloc_inplace`
+    ///
+    /// A record's size depends on `nprops`, which is a runtime value, and the
+    /// arena's typed path cannot express that:
+    ///
+    /// Alignment is safe but incidental, and worth knowing: `Layout::array
+    /// ::<u8>` has align 1, yet `ArenaBase::reserve` raises every allocation to
+    /// `MIN_ALIGN = 16`, which is what `ArenaRecordHead` and `PropSlot` need.
+    /// We depend on that floor. If upstream ever lowers `MIN_ALIGN`, records
+    /// become misaligned — hence `record_head_alignment_holds` in the layout
+    /// tests, which fails loudly rather than letting reads go sideways.
+    ///
+    /// The bytes are zeroed, so a record is fully initialised before any field
+    /// is written and padding never carries stale arena contents to disk.
+    fn alloc_record_bytes(&mut self, idx: usize, nprops: u16) -> Result<(u64, u32)> {
+        let want = record_size(nprops);
+        // Reclaimed slot first — this is what stops churn growing arenas
+        // without bound. The caller bumps `generation` on the reused slot, which
+        // is what invalidates any `AdjRef` still pointing here.
+        if let Some(slots) = self.free.get_mut(idx) {
+            if let Some(pos) = slots.iter().position(|(_, sz)| *sz == want) {
+                let (off, _) = slots.swap_remove(pos);
+                // Read the old generation before zeroing, and hand back its
+                // successor. Zeroing would otherwise reset it to 0 and every
+                // stale `AdjRef` pointing here — which expects 0 for a slot that
+                // has never been reused — would match again. That single
+                // ordering mistake would silently undo the whole mechanism.
+                let mut next_gen = 1;
+                if let Some(p) = self.open[idx].object().lea_mut(off as usize, want) {
+                    unsafe {
+                        next_gen = (*(p as *const ArenaRecordHead)).generation.wrapping_add(1);
+                        core::ptr::write_bytes(p, 0, want);
+                    }
+                }
+                return Ok((off, next_gen));
+            }
+        }
+        let zeros = vec![0u8; want];
+        let tx = self.tx_for(idx)?;
+        // Generation 0: a slot handed out for the first time has never been
+        // reused, so nothing can hold a stale reference to it.
+        Ok((tx.alloc_with_slice::<u8>(&zeros)?.1.offset(), 0))
     }
 
     /// Append an adjacency entry to `vertex`'s out (or in) chain. The chunk is
@@ -435,7 +940,8 @@ impl ArenaStore {
         out: bool,
         edge_id: u64,
         label: u32,
-        neighbor: GlobalPtr<ArenaVertex>,
+        neighbor: GlobalPtr<ArenaRecordHead>,
+        neighbor_gen: u32,
     ) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
@@ -461,9 +967,26 @@ impl ArenaStore {
                 edge_id,
                 neighbor: InvPtr::new(&*tx, neighbor)?,
                 label,
-                _pad: 0,
+                neighbor_gen,
             }
         };
+
+        {
+            let bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
+            let occupied = unsafe { (*vp).flags & bit != 0 };
+            if !occupied {
+                unsafe {
+                    let dst = if out {
+                        &raw mut (*vp).inline_out
+                    } else {
+                        &raw mut (*vp).inline_in
+                    };
+                    dst.write(entry);
+                    (*vp).flags |= bit;
+                }
+                return Ok(());
+            }
+        }
 
         // Room in the head chunk? Append there and we are done.
         if head != 0 {
@@ -521,8 +1044,127 @@ impl ArenaStore {
         let Some(to_gp) = self.vertex_ptr(to) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
-        self.append_adj(from, true, edge_id, label, to_gp)?;
-        self.append_adj(to, false, edge_id, label, from_gp)
+        let (Some(fg), Some(tg)) = (self.generation_of(from), self.generation_of(to)) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        self.append_adj(from, true, edge_id, label, to_gp, tg)?;
+        self.append_adj(to, false, edge_id, label, from_gp, fg)
+    }
+
+    /// The topology becomes `from → edge → to`, with the edge record carrying
+    /// its own adjacency, rather than `from → to` with the edge id riding along
+    /// in the entry. That is what makes edge properties identical to vertex
+    /// properties and hyperedges need no new machinery — an edge record with
+    /// several out-links simply *is* a hyperedge.
+    ///
+    /// Four links, not two, and each is one direction of one hop:
+    ///
+    /// | chain | entry points at |
+    /// |---|---|
+    /// | `from` out | the edge record |
+    /// | edge out | `to` |
+    /// | `to` in | the edge record |
+    /// | edge in | `from` |
+    pub(crate) fn add_edge_record(&mut self, label: u32, from: u64, to: u64) -> Result<u64> {
+        if self.live_loc(from).is_none() || self.live_loc(to).is_none() {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        }
+        // The record first: the links below need its location to exist.
+        let edge = self.add_record(label, "", 0, &[], true)?;
+
+        let (Some(from_gp), Some(to_gp), Some(edge_gp)) = (
+            self.vertex_ptr(from),
+            self.vertex_ptr(to),
+            self.vertex_ptr(edge),
+        ) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+
+        let (Some(fg), Some(tg), Some(eg)) = (
+            self.generation_of(from),
+            self.generation_of(to),
+            self.generation_of(edge),
+        ) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        self.append_adj(from, true, edge, label, edge_gp, eg)?;
+        self.append_adj(to, false, edge, label, edge_gp, eg)?;
+        self.append_adj(edge, true, edge, label, to_gp, tg)?;
+        self.append_adj(edge, false, edge, label, from_gp, fg)?;
+        Ok(edge)
+    }
+
+    /// Attach a further participant to an existing edge record, making it a
+    /// hyperedge.
+    ///
+    /// The label is taken from the edge record so participants cannot disagree
+    /// about what edge they are on.
+    pub(crate) fn add_edge_endpoint(&mut self, edge: u64, vertex: u64, out: bool) -> Result<()> {
+        if !self.is_edge(edge) || self.live_loc(vertex).is_none() {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        }
+        let label = self
+            .vertex_label(edge)
+            .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
+        let (Some(v_gp), Some(e_gp)) = (self.vertex_ptr(vertex), self.vertex_ptr(edge)) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        let (Some(vg), Some(eg)) = (self.generation_of(vertex), self.generation_of(edge)) else {
+            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
+        };
+        self.append_adj(edge, out, edge, label, v_gp, vg)?;
+        self.append_adj(vertex, !out, edge, label, e_gp, eg)
+    }
+
+    /// An edge record's `(from, to)`, or `None` if `edge` is not a live edge.
+    ///
+    /// Reads the edge's own chains: its in-chain names the source, its out-chain
+    /// the target. A hyperedge has several of each; this returns the first of
+    /// each, so callers wanting the general shape must walk instead.
+    pub(crate) fn edge_endpoints(&self, edge: u64) -> Option<(u64, u64)> {
+        if !self.is_edge(edge) {
+            return None;
+        }
+        self.live_loc(edge)?;
+        let mut from = None;
+        let mut to = None;
+        self.walk_adj(edge, false, |_, _, nb| {
+            if from.is_none() {
+                from = Some(nb)
+            }
+        });
+        self.walk_adj(edge, true, |_, _, nb| {
+            if to.is_none() {
+                to = Some(nb)
+            }
+        });
+        Some((from?, to?))
+    }
+
+    /// `(edge record id, label, far vertex id)` for a vertex's incident edges —
+    /// the two-hop walk that replaces the old one-hop entry.
+    ///
+    /// Hyperedges yield one tuple per far endpoint, which is why this is a
+    /// nested walk rather than a lookup: an edge record with three out-links is
+    /// three neighbours through one edge, and nothing special has to know that.
+    pub(crate) fn neighbors_via_edges(&self, vertex: u64, out: bool, inc: bool) -> Vec<(u64, u32, u64)> {
+        let mut edges = Vec::new();
+        if out {
+            self.walk_adj(vertex, true, |e, l, _| edges.push((e, l, true)));
+        }
+        if inc {
+            self.walk_adj(vertex, false, |e, l, _| edges.push((e, l, false)));
+        }
+        let mut out_v = Vec::new();
+        for (e, l, forward) in edges {
+            // Follow the edge record onward: an out-edge continues down the
+            // edge's out-chain, an in-edge back down its in-chain. Walking the
+            // *matching* direction is what makes this correct — no filtering of
+            // the source is needed, and none is done, because a self-loop's far
+            // endpoint legitimately *is* the source and must be returned.
+            self.walk_adj(e, forward, |_, _, far| out_v.push((e, l, far)));
+        }
+        out_v
     }
 
     /// Walk `vertex`'s out (or in) chain in insertion order, calling
@@ -534,6 +1176,21 @@ impl ArenaStore {
         let Some(vp) = self.record_ptr(&loc) else {
             return;
         };
+        let inline_bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
+        let mut inline: Option<(u64, u32, u64)> = None;
+        unsafe {
+            if (*vp).flags & inline_bit != 0 {
+                let e = if out { &(*vp).inline_out } else { &(*vp).inline_in };
+                let nb = e.neighbor.resolve();
+                if nb.generation == e.neighbor_gen && self.is_alive(nb.id) {
+                    inline = Some((e.edge_id, e.label, nb.id));
+                }
+            }
+        }
+        if let Some((eid, lbl, nb)) = inline {
+            f(eid, lbl, nb);
+        }
+
         let mut off = unsafe {
             if out {
                 (*vp).out_head
@@ -587,6 +1244,20 @@ impl ArenaStore {
                 // at allocation and never written again. Do not read a
                 // mutable field of a neighbour record here.
                 let nb = unsafe { e.neighbor.resolve() };
+                // Generation check before anything else. The slot this
+                // entry points at may have been reclaimed and handed to a
+                // different record; if so `nb.id` is a valid, live id belonging
+                // to something that was never our neighbour, and every check
+                // below would pass. This is the one guard that makes space
+                // reuse safe, and it has to come first.
+                //
+                // `generation` is written once when the slot is (re)allocated
+                // and not touched again while the record lives, so reading it
+                // through a cross-arena mapping is safe for the same reason
+                // `nb.id` is. The liveness bit beside them is not.
+                if nb.generation != e.neighbor_gen {
+                    continue;
+                }
                 if self.is_alive(nb.id) {
                     f(e.edge_id, e.label, nb.id);
                 }
@@ -638,7 +1309,7 @@ impl ArenaStore {
     /// One `locs` read serves both the liveness check and the record address.
     /// Splitting them cost a second lookup on every call — measurably, on the
     /// `scale:20000` churn scan.
-    fn with_vertex<R>(&self, vertex: u64, f: impl FnOnce(&ArenaVertex) -> R) -> Option<R> {
+    fn with_vertex<R>(&self, vertex: u64, f: impl FnOnce(&ArenaRecordHead) -> R) -> Option<R> {
         let loc = self.live_loc(vertex)?;
         let p = self.record_ptr(&loc)?;
         Some(f(unsafe { &*p }))
@@ -715,31 +1386,18 @@ impl ArenaStore {
     }
 
     /// The vertex's property-object id (0 = none).
-    pub fn props_raw(&self, vertex: u64) -> Option<u128> {
-        self.with_vertex(vertex, |v| v.props_raw)
-    }
-
-    /// Point the vertex at a (possibly new) property object. Writes mapped
-    /// memory; durable at [`Self::sync_all`] like every other mutation here.
-    pub fn set_props_raw(&mut self, vertex: u64, raw: u128) -> Result<()> {
-        let Some(loc) = self.live_loc(vertex) else {
-            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
-        };
-        let Some(p) = self.record_ptr(&loc) else {
-            return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
-        };
-        unsafe { (*p).props_raw = raw };
-        Ok(())
-    }
 
     /// All live vertex ids — a linear walk of `locs`, touching no arena.
+    ///
+    /// Two bit tests on one already-loaded `u32` — no record is resolved, which
+    /// is why this stays cheap as records get wider. See [`IS_EDGE`].
     pub fn vertices(&self) -> Vec<u64> {
         let mut out = Vec::new();
         for id in 0..self.locs.len() {
             if self
                 .locs
                 .get_ref(id)
-                .map_or(false, |l| l.flags & TOMBSTONE == 0)
+                .map_or(false, |l| l.flags & (TOMBSTONE | IS_EDGE) == 0)
             {
                 out.push(id as u64);
             }
@@ -776,8 +1434,25 @@ impl ArenaStore {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Ok(());
         };
+        // Guard on the mirror, before touching anything. A second delete
+        // must not return the slot twice — two records would then be handed the
+        // same bytes, which is not a stale-reference problem that generations
+        // can catch but straightforward corruption. `deletes_stay_idempotent`
+        // covers the double-delete path.
+        if loc.flags & TOMBSTONE != 0 {
+            return Ok(());
+        }
+        let mut stride = None;
         if let Some(p) = self.record_ptr(&loc) {
-            unsafe { (*p).flags |= TOMBSTONE };
+            unsafe {
+                (*p).flags |= TOMBSTONE;
+                stride = Some(record_size((*p).nprops));
+            }
+        }
+        // The slot is immediately reusable: inbound `AdjRef`s still name it, but
+        // they carry the generation it had, and reuse bumps it.
+        if let (Some(sz), Some(slots)) = (stride, self.free.get_mut(loc.arena as usize)) {
+            slots.push((loc.off, sz));
         }
         // nosync: `with_mut_at` would sync the registry on every delete, which
         // measured 2.5× on the churn phase. Drained by `sync_all`'s
@@ -820,5 +1495,110 @@ impl ArenaStore {
         self.dir.flush()?;
         self.locs.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+
+    // Imported explicitly, as the module already does for `size_of`: these are
+    // prelude items only on newer toolchains.
+    use core::mem::{align_of, size_of};
+
+    use super::*;
+
+    /// The stride must be head + slots with no inter-element padding, which
+    /// holds only while `PropSlot`'s size is a multiple of the head's alignment.
+    /// Asserted rather than assumed — this is the arithmetic that goes wrong.
+    #[test]
+    fn record_stride_has_no_hidden_padding() {
+        assert_eq!(
+            size_of::<PropSlot>() % align_of::<ArenaRecordHead>(),
+            0,
+            "PropSlot ({}) must be a multiple of the head's alignment ({}), or \
+             records do not pack back-to-back and `record_size` is a lie",
+            size_of::<PropSlot>(),
+            align_of::<ArenaRecordHead>()
+        );
+        assert_eq!(
+            size_of::<ArenaRecordHead>() % align_of::<PropSlot>(),
+            0,
+            "the head must end on a PropSlot boundary, or slot 0 is misaligned"
+        );
+    }
+
+    #[test]
+    fn record_size_matches_the_types() {
+        assert_eq!(record_size(0), size_of::<ArenaRecordHead>());
+        for n in [1u16, 2, 7, 64, 1000, u16::MAX] {
+            assert_eq!(
+                record_size(n),
+                size_of::<ArenaRecordHead>() + n as usize * size_of::<PropSlot>()
+            );
+        }
+        // Strictly increasing, so two records can never be given the same
+        // extent by different `nprops` — a walk over an arena depends on it.
+        assert!(record_size(0) < record_size(1));
+        assert!(record_size(1) < record_size(2));
+    }
+
+    /// The mirror must not grow. `VertexLoc` is what makes a scan cheap:
+    /// 16 B means 256 entries per 4 KB page against ~42 records, and that 6.1×
+    /// density ratio is the model behind the measured 5.2× warm-scan gain.
+    /// `IS_EDGE` is a *bit*, so it costs nothing here — a test because the
+    /// tempting fix when the scan needs more information is to widen this.
+    #[test]
+    fn the_liveness_mirror_stays_sixteen_bytes() {
+        assert_eq!(
+            size_of::<VertexLoc>(),
+            16,
+            "widening VertexLoc trades away the property that makes scans cheap"
+        );
+    }
+
+    /// `TOMBSTONE` and `IS_EDGE` are distinct bits in the same word, and both
+    /// fit where the mirror already carries flags.
+    #[test]
+    fn record_flags_are_disjoint_bits() {
+        assert_eq!(TOMBSTONE & IS_EDGE, 0, "flags must not overlap");
+        assert_eq!(TOMBSTONE.count_ones(), 1);
+        assert_eq!(IS_EDGE.count_ones(), 1);
+    }
+
+    /// `alloc_record_bytes` depends on an alignment floor it does not set.
+    ///
+    /// Records are reserved as a `[u8]`, whose `Layout` alignment is 1;
+    /// `ArenaBase::reserve` raises every allocation to `MIN_ALIGN = 16`, and
+    /// that is the only reason a record lands 16-aligned. The constant is
+    /// upstream and private, so this asserts the requirement rather than the
+    /// mechanism: if the head or slots ever need more than 16, the byte-slice
+    /// allocation is silently wrong and this is where it shows.
+    #[test]
+    fn record_head_alignment_holds() {
+        const UPSTREAM_ARENA_MIN_ALIGN: usize = 16;
+        assert!(
+            align_of::<ArenaRecordHead>() <= UPSTREAM_ARENA_MIN_ALIGN,
+            "record head needs {}-byte alignment but arena allocations only \
+             guarantee {}; `alloc_record_bytes` can no longer use a byte slice",
+            align_of::<ArenaRecordHead>(),
+            UPSTREAM_ARENA_MIN_ALIGN
+        );
+        assert!(
+            align_of::<PropSlot>() <= UPSTREAM_ARENA_MIN_ALIGN,
+            "PropSlot needs {}-byte alignment, above the arena's guarantee",
+            align_of::<PropSlot>()
+        );
+    }
+
+    /// A record head must stay comfortably inside a page: a head split across
+    /// pages costs a second fault on every touch, and the traversal argument is
+    /// built on a hop being one.
+    #[test]
+    fn a_record_head_fits_well_within_a_page() {
+        assert!(
+            size_of::<ArenaRecordHead>() <= 4096 / 8,
+            "record head is {} bytes; at this size page density collapses",
+            size_of::<ArenaRecordHead>()
+        );
     }
 }

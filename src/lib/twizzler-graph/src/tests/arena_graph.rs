@@ -158,9 +158,7 @@ fn arena_properties_and_vertex_deletes() {
     assert!(g.get_vertex_prop(spokes[1], "age").is_none());
 }
 
-/// Edge deletion. The arena store hides tombstoned *vertices* but knows nothing
-/// about the edge registry, so without an explicit `is_edge_alive` filter in
-/// `Graph` a deleted edge would still yield its neighbour — a wrong answer
+/// Edge deletion — a deleted edge must not yield its neighbour, a wrong answer
 /// visible only after a delete.
 #[test]
 fn arena_hides_a_deleted_edge() {
@@ -250,7 +248,7 @@ fn arena_survives_bulk_vertex_deletion() {
 }
 
 #[test]
-fn arena_packs_vertices_and_adds_no_object_per_edge() {
+fn arena_packs_records_including_edges() {
     let name = "t-ab-objects";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
     let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
@@ -271,15 +269,29 @@ fn arena_packs_vertices_and_adds_no_object_per_edge() {
     for i in 0..11 {
         g.add_edge(ids[i], "e", ids[i + 1]).unwrap();
     }
+    // 12 vertices + 11 edges = 23 records, at cap 4 = 6 arenas.
     assert_eq!(
         g.arena_count(),
-        3,
-        "edges allocate inside existing arenas — v3 would have added 11 objects"
+        6,
+        "an edge is a record and occupies a slot: ceil((12+11)/{ARENA_CAP})"
+    );
+    assert!(
+        g.arena_count() * ARENA_CAP >= 23,
+        "arenas must cover every record"
+    );
+    assert!(
+        g.arena_count() < 47,
+        "still far below v3's object-per-entity cost — 6 against 47"
     );
 
     assert_eq!(g.arena_sync_count(), 0, "nothing synced before sync()");
+    let arenas = g.arena_count();
     g.sync().unwrap();
-    assert_eq!(g.arena_sync_count(), 3, "one sync per arena, not per record");
+    assert_eq!(
+        g.arena_sync_count(),
+        arenas,
+        "one sync per arena, not per record"
+    );
 }
 
 /// Ids are append indices and continue without gaps — the invariant that
@@ -374,24 +386,83 @@ fn destroy_cycles_do_not_accumulate() {
     assert!(freed_each[0] > 0);
 }
 
-/// A stale-but-walkable format is still reclaimed, not leaked.
+/// Asserting it now means a v5 regression is attributable to v5. Asserting it
+/// afterwards would only tell us the property is absent, not when it went.
 ///
-/// `version_supported` gates *reading* a graph and is strict, because misreading
-/// a layout yields garbage. Freeing one is a different question: it only needs
-/// the object ids to be findable. v7 and v8 differ solely in a trailing
-/// `GraphRoot` field that no inventory walk reads, so every arena, registry and
-/// property object of a v7 graph is exactly where v8's walker expects it.
+/// The counter is the whole point: "does not resolve the record" is otherwise a
+/// claim about mechanism that passes by inspection.
+#[test]
+fn scanning_vertices_does_not_touch_any_record() {
+    let mut g = fresh_arena("scan-cost");
+    let (hub, spokes) = build(&mut g);
+    g.set_vertex_prop(hub, "k", PropValue::I64(1)).unwrap();
+
+    // Deletes matter here: a tombstoned record is the case most likely to
+    // tempt an implementation into resolving, since liveness is what the scan
+    // filters on.
+    g.delete_vertex(spokes[3]).unwrap();
+
+    g.reset_record_touches();
+    let live = g.vertices();
+    assert_eq!(
+        g.record_touches(),
+        0,
+        "vertices() resolved {} record(s); liveness must come from the mirror",
+        g.record_touches()
+    );
+    assert_eq!(live.len(), 4, "hub plus three surviving spokes");
+
+    // Control. `vertices_by_label` filters on the label, which the mirror
+    // does not carry, so it resolves every record — `vertex_label` goes through
+    // `with_vertex`. Without this arm a zero above would be unfalsifiable: it
+    // would look identical whether the scan avoids records or the counter is
+    // simply never incremented.
+    //
+    // The label must be one `build` actually interned ("spoke", not "n"):
+    // `vertices_by_label` returns early on an unknown label without reaching
+    // the store, which would make the control pass for the wrong reason.
+    g.reset_record_touches();
+    let spoke_ids = g.vertices_by_label("spoke");
+    assert_eq!(spoke_ids.len(), 3, "one of the four spokes is deleted");
+    assert!(
+        g.record_touches() >= 4,
+        "control: a label scan resolves records (touched {}), so the zero \
+         above is a real property and not a dead counter",
+        g.record_touches()
+    );
+}
+
+/// What a build must do with a predecessor format it cannot walk.
 ///
-/// This exists because the 7 → 8 bump silently turned that into a leak — the
-/// inventory arm matched `VERSION_ARENA` by name, so changing the constant
-/// stopped it matching. Nothing failed; the graph was simply abandoned. A
-/// version bump must never quietly become a storage leak.
+/// This test has inverted once already, and the inversion is the lesson.
+///
+/// It was written when format 7 *was* reclaimable — 7 → 8 moved only a trailing
+/// `GraphRoot` field, leaving every object exactly where the walker expected —
+/// and it existed because that bump had silently turned reclaim into a leak:
+/// the inventory arm matched `VERSION_ARENA` by name, so changing the constant
+/// stopped it matching, with no error.
+///
+/// Format 9 moved the *record* layout, and the inventory walk reads records.
+/// So 7 stopped being walkable and the correct answer flipped from "free it" to
+/// "refuse". The rule was never about which versions are in the set — it is
+/// that a build must never guess. Three outcomes are acceptable in principle
+/// and only two are acceptable in practice:
+///
+/// - free it, when the object graph is genuinely walkable;
+/// - refuse loudly, when it is not;
+/// - and never `Ok(0)`, which reads as "there was nothing to free" and is how
+///   the original regression hid.
+///
+/// The complement matters as much: `reset` must still succeed, or the name is
+/// stranded forever. `data/` entries cannot be unbound on this build, so a
+/// format the engine can neither open nor reset is a permanently burned name,
+/// in this boot and every future one.
 ///
 /// The graph is built normally and then *downgraded* by rewriting its root's
-/// version, which is the only way to get a previous-format graph out of a build
-/// that can no longer write one.
+/// version, which is the only way to obtain a previous-format graph from a
+/// build that can no longer write one.
 #[test]
-fn a_previous_arena_format_is_still_reclaimed_on_destroy() {
+fn an_unwalkable_predecessor_is_refused_loudly_and_stays_recoverable() {
     use naming::{static_naming_factory, GetFlags};
     use twizzler::object::{MapFlags, Object};
 
@@ -424,19 +495,32 @@ fn a_previous_arena_format_is_still_reclaimed_on_destroy() {
     })
     .expect("downgrade");
 
-    // Reading it must still refuse — that guard is meant to be strict.
+    let _ = owned;
+
+    // Reading it must refuse — that guard is meant to be strict.
     assert!(
         Graph::open_or_create(name).is_err(),
         "a previous format must not open"
     );
 
-    // Freeing it must still work.
-    let freed = Graph::destroy(name).expect("destroy a previous-format graph");
-    assert_eq!(
-        freed, owned,
-        "every object the graph owned was freed, not leaked"
-    );
-    assert_eq!(Graph::destroy(name).expect("second destroy"), 0);
+    // `destroy` must refuse *loudly*, not return Ok(0). Format 9 moved the
+    // record layout and the inventory walk reads records, so walking a format-7
+    // graph would free ids read at the wrong offsets — mis-freeing, which is
+    // strictly worse than leaking. But a silent `Ok(0)` would be worse still:
+    // indistinguishable from "there was nothing to free", which is how the
+    // 7 → 8 bump turned into a leak nobody noticed.
+    match Graph::destroy(name) {
+        Err(crate::GraphError::StaleVersion { found, expected }) => {
+            assert_eq!(found, VERSION_ARENA_NOCAP);
+            assert_eq!(expected, crate::graph::VERSION_ARENA);
+        }
+        Ok(n) => panic!("destroy silently reported {n} objects freed"),
+        Err(e) => panic!("expected StaleVersion, got {e:?}"),
+    }
+
+    Graph::reset_arena(name, ARENA_CAP).expect("reset must recover the name");
+    let g = Graph::open_or_create_arena(name, ARENA_CAP).expect("reopen after reset");
+    assert!(g.vertices().is_empty(), "rebuilt empty and usable");
 }
 
 /// The load-bearing assertion is about where new records go, not where old
@@ -504,4 +588,67 @@ fn graph_reopens_by_name_with_contents_intact() {
     assert_eq!(g.out_neighbors(ids.0, Labels::any()).len(), 4);
     assert_eq!(g.get_vertex_prop(ids.0, "k"), Some(PropValue::I64(1)));
     assert_eq!(g.in_neighbors(ids.1[3], Labels::any()).len(), 2);
+}
+
+/// The contrast is the test. Either assertion alone is worthless — zero could
+/// mean "free" or "counter never incremented", and non-zero could mean anything.
+#[test]
+fn inline_properties_are_free_and_data_properties_are_not() {
+    let name = "t-ab-propcost";
+    Graph::reset_arena(name, ARENA_CAP).expect("reset");
+    let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open");
+
+    // `hot` is supplied at insert, so it is inline. `cold` is added afterwards,
+    // so it is a data property — that is the entire user-facing rule.
+    let v = g
+        .add_vertex_with_props("n", "v", ObjID::new(0), &[("hot", PropValue::I64(1))])
+        .expect("add with inline props");
+    g.set_vertex_prop(v, "cold", PropValue::I64(2)).unwrap();
+
+    // Both are readable, and neither shadows the other.
+    assert_eq!(g.get_vertex_prop(v, "hot"), Some(PropValue::I64(1)));
+    assert_eq!(g.get_vertex_prop(v, "cold"), Some(PropValue::I64(2)));
+
+    g.reset_record_touches();
+    assert_eq!(g.get_vertex_prop(v, "hot"), Some(PropValue::I64(1)));
+    assert_eq!(
+        g.data_block_reads(),
+        0,
+        "an inline property must not touch the data block"
+    );
+
+    g.reset_record_touches();
+    assert_eq!(g.get_vertex_prop(v, "cold"), Some(PropValue::I64(2)));
+    assert!(
+        g.data_block_reads() > 0,
+        "control: a data property does dereference the block, so the zero \
+         above means 'free' rather than 'counter never fires'"
+    );
+
+    // Updating an inline key must stay inline rather than forking a second copy
+    // into the data block — the two-sources-of-truth hazard.
+    g.set_vertex_prop(v, "hot", PropValue::I64(9)).unwrap();
+    assert_eq!(g.get_vertex_prop(v, "hot"), Some(PropValue::I64(9)));
+    g.reset_record_touches();
+    assert_eq!(g.get_vertex_prop(v, "hot"), Some(PropValue::I64(9)));
+    assert_eq!(
+        g.data_block_reads(),
+        0,
+        "updating an inline key must not migrate it to the data block"
+    );
+
+    // Growth: enough data properties to force at least one block reallocation.
+    for i in 0..12 {
+        g.set_vertex_prop(v, &format!("d{i}"), PropValue::I64(i as i64))
+            .unwrap();
+    }
+    for i in 0..12 {
+        assert_eq!(
+            g.get_vertex_prop(v, &format!("d{i}")),
+            Some(PropValue::I64(i as i64)),
+            "d{i} survived the block reallocations"
+        );
+    }
+    assert_eq!(g.get_vertex_prop(v, "cold"), Some(PropValue::I64(2)));
+    assert_eq!(g.get_vertex_prop(v, "hot"), Some(PropValue::I64(9)));
 }

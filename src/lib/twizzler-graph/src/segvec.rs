@@ -169,22 +169,7 @@ impl<T: Invariant> SegVec<T> {
         self.segs.get(idx / self.cap)?.get_ref(idx % self.cap)
     }
 
-    /// Run `f` on a mutable reference to the element at `idx` (transactional,
-    /// so the mutation is synced to the backing store).
-    pub(crate) fn with_mut_at<R>(
-        &mut self,
-        idx: usize,
-        f: impl FnOnce(&mut T) -> Result<R>,
-    ) -> Result<R> {
-        let (si, off) = (idx / self.cap, idx % self.cap);
-        let seg = self
-            .segs
-            .get_mut(si)
-            .ok_or(TwzError::from(ArgumentError::InvalidArgument))?;
-        seg.with_mut_slice(off..off + 1, |s| f(&mut s[0]))
-    }
-
-    /// [`SegVec::with_mut_at`] with durability deferred to [`SegVec::flush`].
+    /// Mutate the entry at `i`, deferring durability to [`SegVec::flush`].
     pub(crate) fn with_mut_at_nosync<R>(
         &mut self,
         idx: usize,
@@ -365,19 +350,24 @@ mod tests {
         assert!(sv.get_ref(100).is_none()); // past all segments
     }
 
+    /// In-place mutation, and the durability contract that comes with it.
     #[test]
-    fn segvec_with_mut_at() {
+    fn segvec_with_mut_at_nosync_defers_durability() {
         let mut sv = filled(4, 9);
         // Mutate inside the second segment; read back.
-        sv.with_mut_at(5, |r| {
+        sv.with_mut_at_nosync(5, |r| {
             r.v = 55;
             Ok(())
         })
         .unwrap();
+        assert_eq!(sv.get_ref(5).unwrap().v, 55, "visible immediately in memory");
+        assert_eq!(sv.get_ref(4).unwrap().v, 4, "neighbour untouched");
+
+        sv.flush().expect("flush");
         assert_eq!(sv.get_ref(5).unwrap().v, 55);
-        assert_eq!(sv.get_ref(4).unwrap().v, 4); // neighbor untouched
-                                                 // Out of bounds is an error, not a panic.
-        assert!(sv.with_mut_at(100, |_| Ok(())).is_err());
+
+        // Out of bounds is an error, not a panic.
+        assert!(sv.with_mut_at_nosync(100, |_| Ok(())).is_err());
     }
 
     #[test]

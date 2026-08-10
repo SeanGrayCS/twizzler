@@ -10,8 +10,11 @@
 //! and `out_edges`/`in_edges`/`both_edges`, each with a label filter, plus
 //! `_where` variants taking a user predicate over a [`VertexHandle`]/[`EdgeHandle`]
 //! (e.g. to skip already-visited vertices during recursive traversal).
+//!
+//! There is no vertex registry: `locs` in `arena_store.rs` is the only index
+//! from id to record, and it holds edges too.
 
-use twizzler::{marker::Invariant, object::ObjID};
+use twizzler::object::ObjID;
 
 use crate::{
     edge::{EdgeHandle, EdgeId},
@@ -19,11 +22,15 @@ use crate::{
     name::NameKey,
 };
 
-/// A re-export, not `type VertexId = RecordId`. A type alias binds only the
-/// *type* namespace, so `VertexId(id)` — the tuple-struct constructor, which
-/// lives in the value namespace — fails to resolve (E0423, 28 sites). `use ...
-/// as` imports every namespace the path resolves in, so both the type and the
-/// constructor come across.
+/// Public vertex id (an append index) — `RecordId` under another name. Edges
+/// are records too, so there is one id space and `VertexId(n)` and `EdgeId(n)`
+/// name the same record; the separate names document intent. See `record.rs`.
+///
+/// A re-export, not `type VertexId = RecordId`: a type alias binds only the
+/// type namespace, so `VertexId(id)` — the tuple-struct constructor, which
+/// lives in the value namespace — would fail to resolve. `use ... as` imports
+/// every namespace the path resolves in, so both the type and the constructor
+/// come across.
 pub use crate::record::RecordId as VertexId;
 
 /// Label filter for traversal: any label, or a specific set (so one query can
@@ -49,23 +56,6 @@ enum Which {
     In,
     Both,
 }
-
-/// Vestigial. The v3 vertex registry row. Nothing writes one: vertices live
-/// in [`crate::arena_store::ArenaStore`] and `Graph::verts` is always empty.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(crate) struct VertexRef {
-    pub(crate) id: u64,
-    pub(crate) label: u32,
-    pub(crate) name: NameKey,
-    pub(crate) target_raw: u128,
-    pub(crate) props_raw: u128,
-    pub(crate) flags: u32,
-    pub(crate) vobj_raw: u128,
-    pub(crate) out_raw: u128,
-    pub(crate) in_raw: u128,
-}
-unsafe impl Invariant for VertexRef {}
 
 /// A snapshot of a vertex's data for callers.
 #[derive(Clone)]
@@ -95,9 +85,7 @@ impl VertexHandle {
 }
 
 /// A handle for vertex-centric traversal: a vertex id bound to a graph.
-///
-/// *v3 also carried the ObjIDs of the two adjacency lists; the arena layout has
-/// no such objects, so the walk goes through `Graph::arena_adjacency`.*
+/// The walk goes through `Graph::arena_adjacency`.
 pub struct VertexView<'a> {
     pub(crate) graph: &'a Graph,
     pub(crate) id: VertexId,
@@ -227,8 +215,8 @@ impl<'a> VertexView<'a> {
         let filter = self.graph.resolve_labels(labels);
 
         // The adjacency entry carries the edge id and label, and the endpoints
-        // come from the shared registry — there is no edge *object* on this
-        // layout to resolve them from.
+        // come from the shared registry — there is no edge object to resolve
+        // them from.
         let (o, i) = Self::dirs(which);
         let mut out = Vec::new();
         for (eid, elabel, _) in self.graph.arena_adjacency(self.id, o, i) {

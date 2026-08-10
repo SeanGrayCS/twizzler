@@ -32,14 +32,12 @@ fn inventory_covers_everything_the_graph_owns() {
     assert!(ids.iter().all(|r| *r != 0), "no null ids in the inventory");
     assert!(!ids.contains(&g.root_id().raw()), "root is not owned");
 
-    // Property objects are the only per-entity objects left in v4, and the only
-    // ones a reclaim pass could orphan.
-    let a_props = g.vertex_props_raw(a).expect("vertex record");
-    assert!(a_props != 0 && ids.contains(&a_props), "vertex props");
-    assert_eq!(g.vertex_props_raw(b), Some(0), "b has no properties");
-
-    let e_props = g.edge_props_raw(e).expect("edge record");
-    assert!(e_props != 0 && ids.contains(&e_props), "edge props");
+    assert_eq!(
+        g.vertex_props_raw(a),
+        Some(0),
+        "a property must no longer allocate an object"
+    );
+    assert_eq!(g.edge_props_raw(e), Some(0), "nor an edge property");
 
     let mut sorted = ids.clone();
     sorted.sort_unstable();
@@ -63,20 +61,20 @@ fn inventory_covers_everything_the_graph_owns() {
     );
 }
 
-/// The property object is deliberately kept in the inventory. It is
-/// unreachable through the graph but still allocated, and `owned_object_ids`
-/// is what a reclaim pass would act on: dropping it here is precisely how a
-/// tombstoned vertex's properties would leak forever.
 #[test]
-fn delete_vertex_releases_prop_ids() {
+fn delete_vertex_leaves_no_object_to_reclaim() {
     let mut g = fresh("t-reclaim-delv");
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
     let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
     g.add_edge(a, "knows", b).unwrap();
     g.set_vertex_prop(a, "age", PropValue::I64(30)).unwrap();
 
-    let props_raw = g.vertex_props_raw(a).expect("vertex record");
-    assert!(props_raw != 0, "property object exists before the delete");
+    let before = g.owned_object_ids().len();
+    assert_eq!(
+        g.vertex_props_raw(a),
+        Some(0),
+        "properties are arena bytes now, not an object"
+    );
 
     g.delete_vertex(a).unwrap();
 
@@ -94,9 +92,10 @@ fn delete_vertex_releases_prop_ids() {
     );
     assert_eq!(g.get_vertex_prop(a, "age"), None, "properties unreadable");
 
-    assert!(
-        g.owned_object_ids().contains(&props_raw),
-        "the orphaned property object stays inventoried so reclaim can free it"
+    assert_eq!(
+        g.owned_object_ids().len(),
+        before,
+        "a delete must not change the object inventory: records own no objects"
     );
 }
 

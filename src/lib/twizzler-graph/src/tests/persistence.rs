@@ -112,8 +112,6 @@ fn stale_v2_root_detected_and_resettable() {
                 magic: MAGIC,
                 version: 2,
                 seg_cap: 0,
-                verts_raw: 0,
-                edges_raw: 0,
                 labels_raw: 0,
                 vindex_raw: 0,
                 arena_dir_raw: 0,

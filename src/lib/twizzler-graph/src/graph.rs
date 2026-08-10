@@ -19,14 +19,14 @@ use twizzler::{
 use twizzler_rt_abi::error::ArgumentError;
 
 use crate::{
-    arena_store::{ArenaStore, FillTo},
-    edge::{EdgeId, EdgeInfo, EdgeRef},
+    arena_store::{ArenaStore, FillTo, PropSlot},
+    edge::{EdgeId, EdgeInfo},
     error::{GraphError, Result},
     name::NameKey,
-    props::{self, PropValue},
+    props::PropValue,
     reclaim,
     segvec::SegVec,
-    vertex::{Labels, VertexId, VertexInfo, VertexRef, VertexView},
+    vertex::{Labels, VertexId, VertexInfo, VertexView},
 };
 
 pub(crate) const MAGIC: u64 = 0x4731_5457_5A47_5248; // "G1TWZGRH"
@@ -62,11 +62,17 @@ pub(crate) const VERSION: u32 = 5;
 /// On-disk format 8 (the arena layout): vertices and adjacency live in
 /// packed arenas ([`ArenaStore`]) instead of three objects per vertex plus one
 /// per edge.
-pub(crate) const VERSION_ARENA: u32 = 8;
+///
+/// Reading a format-8 graph with this build would interpret padding as a
+/// generation, mismatch every adjacency entry, and silently return a graph with
+/// no edges. Clear the disk image.
+pub(crate) const VERSION_ARENA: u32 = 11;
 
-/// Kept because a v7 graph is still reclaimable: the two formats differ only
-/// in a trailing root field, and every arena, registry and property object sits
-/// exactly where it did. See [`version_reclaimable`].
+/// No longer reclaimable as of format 9. It was, while 8 differed from 7
+/// only in a trailing root field; format 9 moved the *record* layout, and the
+/// inventory walk reads records. Kept for the same reason as [`VERSION`]: the
+/// number is burned and must never be recycled.
+#[allow(dead_code)] // reserved, not obsolete — see above
 pub(crate) const VERSION_ARENA_NOCAP: u32 = 7;
 
 /// Whether this build can *operate* on a graph in the given on-disk format —
@@ -85,9 +91,11 @@ fn version_supported(v: u32) -> bool {
 /// object ids, so a predecessor format qualifies whenever its *object graph* is
 /// unchanged, whatever happened to the interpretation of individual records.
 fn version_reclaimable(v: u32) -> bool {
-    v == VERSION_ARENA || v == VERSION_ARENA_NOCAP
+    // This is the rule from the 7 → 8 mistake applied in the other direction:
+    // extend `version_reclaimable` when placement is untouched, and *don't*
+    // when it isn't.
+    v == VERSION_ARENA
 }
-const TOMBSTONE: u32 = 1; // `flags` bit 0: record is deleted
 
 /// Default per-segment registry capacity. Registry records are plain data
 /// (~100–150 B, no `InvPtr`s), so 4096 entries keep a segment well under the
@@ -100,6 +108,9 @@ pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
 /// 16384 and 65536 were indistinguishable on every metric, because both held
 /// all 6 001 phase-A vertices in a single arena. Cap only matters up to the
 /// working set being connected.
+///
+/// Memory is not the constraint — per-vertex overhead is `1454/cap` frames,
+/// so this raise takes it from ~0.36 to ~0.089.
 ///
 /// # This value is PROVISIONAL
 pub const DEFAULT_ARENA_CAP: usize = 16384;
@@ -119,8 +130,6 @@ pub(crate) struct GraphRoot {
     pub(crate) magic: u64,
     pub(crate) version: u32,
     pub(crate) seg_cap: u32,
-    pub(crate) verts_raw: u128,
-    pub(crate) edges_raw: u128,
     pub(crate) labels_raw: u128,
     pub(crate) vindex_raw: u128,
     /// The [`ArenaStore`]'s arena directory and location registry.
@@ -158,18 +167,6 @@ type VIndex = PersistentHashMap<VKey, u64>;
 /// An open graph: the root id, the registries, the vertex index, and the store.
 pub struct Graph {
     root_id: ObjID,
-    /// Vestigial, and genuinely unread — the `dead_code` warning this raises
-    /// is deliberate. Do not silence it; it is the reminder that this field
-    /// still needs removing.
-    ///
-    /// Vertices live in `store`; this registry is always empty. It is still
-    /// *allocated* because `GraphRoot.verts_raw` is a persisted field, and still
-    /// *inventoried* so `reset`/`destroy` free its objects rather than orphaning
-    /// them — but both go through raw ids, not this handle. The only code that
-    /// touches the handle is `owned_object_ids`, which is `#[cfg(test)]`, so a
-    /// normal build reads it nowhere.
-    verts: SegVec<VertexRef>,
-    edges: SegVec<EdgeRef>,
     labels: SegVec<LabelEntry>,
     vindex: VIndex,
     /// Vertices and adjacency — the whole graph, in packed arenas.
@@ -177,6 +174,10 @@ pub struct Graph {
 }
 
 impl Graph {
+
+    pub fn record_count(&self) -> usize {
+        self.store.record_count()
+    }
 
     pub fn arena_count(&self) -> usize {
         self.store.arena_count()
@@ -246,14 +247,12 @@ impl Graph {
         if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
             let root =
                 Object::<GraphRoot>::map(node.id.into(), MapFlags::READ | MapFlags::PERSIST)?;
-            let (magic, version, seg_cap, verts_raw, edges_raw, labels_raw, vindex_raw) = {
+            let (magic, version, seg_cap, labels_raw, vindex_raw) = {
                 let r = root.base();
                 (
                     r.magic,
                     r.version,
                     r.seg_cap,
-                    r.verts_raw,
-                    r.edges_raw,
                     r.labels_raw,
                     r.vindex_raw,
                 )
@@ -286,8 +285,6 @@ impl Graph {
                 };
                 return Ok(Graph {
                     root_id: node.id.into(),
-                    verts: SegVec::open(verts_raw, cap)?,
-                    edges: SegVec::open(edges_raw, cap)?,
                     labels: SegVec::open(labels_raw, cap)?,
                     vindex: PersistentHashMap::from(vbacking),
                     store,
@@ -301,8 +298,6 @@ impl Graph {
             });
         }
 
-        let verts = SegVec::create(cap)?;
-        let edges = SegVec::create(cap)?;
         let labels = SegVec::create(cap)?;
         let vindex = VIndex::new_persist()?;
         let store = ArenaStore::create(Box::new(FillTo { cap: arena_cap }), cap)?;
@@ -314,8 +309,6 @@ impl Graph {
                 magic: MAGIC,
                 version: VERSION_ARENA,
                 seg_cap: cap as u32,
-                verts_raw: verts.dir_raw(),
-                edges_raw: edges.dir_raw(),
                 labels_raw: labels.dir_raw(),
                 vindex_raw: vindex.object().id().raw(),
                 arena_dir_raw,
@@ -328,8 +321,6 @@ impl Graph {
 
         Ok(Graph {
             root_id: root.id(),
-            verts,
-            edges,
             labels,
             vindex,
             store,
@@ -397,14 +388,12 @@ impl Graph {
             return Ok(0); // nothing registered
         };
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
-        let (is_graph, version, cap, v, e, l, x, ad, al) = {
+        let (is_graph, version, cap, l, x, ad, al) = {
             let r = root.base();
             (
                 r.magic == MAGIC,
                 r.version,
                 r.seg_cap as usize,
-                r.verts_raw,
-                r.edges_raw,
                 r.labels_raw,
                 r.vindex_raw,
                 r.arena_dir_raw,
@@ -446,10 +435,6 @@ impl Graph {
             ) {
                 ids.extend(store.owned_object_ids());
             }
-            ids.extend(edge_registry_ids(e, cap));
-            if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
-                ids.extend(sv.object_ids());
-            }
             if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
                 ids.extend(sv.object_ids());
             }
@@ -466,8 +451,6 @@ impl Graph {
         root.with_tx(|tx| {
             let mut b = tx.base_mut();
             b.magic = MAGIC_DESTROYED;
-            b.verts_raw = 0;
-            b.edges_raw = 0;
             b.labels_raw = 0;
             b.vindex_raw = 0;
             b.arena_dir_raw = 0;
@@ -514,11 +497,9 @@ impl Graph {
         let cap = cap.unwrap_or(DEFAULT_SEG_CAP);
 
         let old_ids = {
-            let (v, e, l, x, ad, al) = {
+            let (l, x, ad, al) = {
                 let r = root.base();
                 (
-                    r.verts_raw,
-                    r.edges_raw,
                     r.labels_raw,
                     r.vindex_raw,
                     r.arena_dir_raw,
@@ -529,12 +510,9 @@ impl Graph {
                 // A destroyed root already freed everything and zeroed its
                 // registry ids; walking them would chase freed objects.
                 _ if was_destroyed => Vec::new(),
-                // Arenas plus registries. The `verts` registry exists but is
-                // unused, and is freed with the rest. Matches any *reclaimable*
-                // format, not just the current one — see `version_reclaimable`.
-                //
-                // Bound as `ver`, not `v`: `v` is already the verts registry id
-                // in this scope, and a match binding would shadow it.
+                // Arenas, the label registry and the index. Matches any
+                // *reclaimable* format, not just the current one — see
+                // `version_reclaimable`.
                 ver if version_reclaimable(ver) && old_cap != 0 => {
                     let cap = old_cap as usize;
                     let mut ids = Vec::new();
@@ -547,10 +525,6 @@ impl Graph {
                         cap,
                     ) {
                         ids.extend(store.owned_object_ids());
-                    }
-                    ids.extend(edge_registry_ids(e, cap));
-                    if let Ok(sv) = SegVec::<VertexRef>::open(v, cap) {
-                        ids.extend(sv.object_ids());
                     }
                     if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
                         ids.extend(sv.object_ids());
@@ -566,13 +540,9 @@ impl Graph {
         };
 
         // Fresh, empty registries.
-        let verts = SegVec::<VertexRef>::create(cap)?;
-        let edges = SegVec::<EdgeRef>::create(cap)?;
         let labels = SegVec::<LabelEntry>::create(cap)?;
         let vindex = VIndex::new_persist()?;
-        let (verts_raw, edges_raw, labels_raw, vindex_raw) = (
-            verts.dir_raw(),
-            edges.dir_raw(),
+        let (labels_raw, vindex_raw) = (
             labels.dir_raw(),
             vindex.object().id().raw(),
         );
@@ -586,8 +556,6 @@ impl Graph {
             b.magic = MAGIC;
             b.version = VERSION_ARENA;
             b.seg_cap = cap as u32;
-            b.verts_raw = verts_raw;
-            b.edges_raw = edges_raw;
             b.labels_raw = labels_raw;
             b.vindex_raw = vindex_raw;
             b.arena_dir_raw = arena_dir_raw;
@@ -598,6 +566,50 @@ impl Graph {
 
         reclaim::delete_all(old_ids);
         Ok(())
+    }
+
+    /// The set supplied here is fixed for the record's lifetime, because the
+    /// record's size is: every inbound `AdjRef.neighbor` holds its arena offset,
+    /// so a record that grew would have to have all of them rewritten. Anything
+    /// added later via [`Graph::set_vertex_prop`] becomes a *data* property,
+    /// which lives behind one indirection and can move freely.
+    ///
+    /// Choosing is the user's job, and the criterion is access pattern: put
+    /// a property here if traversals *filter* on it, since inline slots sit in
+    /// cache lines a walk has already paid for. Put everything else in data
+    /// properties — inline slots widen every record, and record width is what
+    /// sets page density.
+    ///
+    /// Keys are interned through the same table as labels. They cannot collide:
+    /// a label id is read from `record.label` and a key id from `slot.key_id`,
+    /// which are different fields consulted in different contexts.
+    pub fn add_vertex_with_props(
+        &mut self,
+        label: &str,
+        name: &str,
+        target: ObjID,
+        props: &[(&str, PropValue)],
+    ) -> Result<VertexId> {
+        let lbl = self.intern_label(label)?;
+        let mut slots = Vec::with_capacity(props.len());
+        for (k, v) in props {
+            slots.push(PropSlot {
+                key_id: self.intern_label(k)?,
+                _pad: 0,
+                val: *v,
+            });
+        }
+        let id = self
+            .store
+            .add_record(lbl, name, target.raw(), &slots, false)?;
+        self.vindex.insert(
+            VKey {
+                label: lbl,
+                name: NameKey::new(name),
+            },
+            id,
+        )?;
+        Ok(VertexId(id))
     }
 
     pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
@@ -622,24 +634,18 @@ impl Graph {
     pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
         let lbl = self.intern_label(label)?;
 
-        // No edge object at all. The adjacency entry carries the edge id and
-        // label, and its `InvPtr` neighbour costs no FOT entry when both
-        // endpoints share an arena.
-        let id = self.edges.len() as u64;
-        if !self.store.is_alive(from.0) || !self.store.is_alive(to.0) {
-            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
-        }
-        self.store.add_edge(from.0, to.0, id, lbl)?;
-        self.edges.push_nosync(EdgeRef {
-            id,
-            label: lbl,
-            from_id: from.0,
-            to_id: to.0,
-            eobj_raw: 0, // no edge object on this layout
-            props_raw: 0,
-            flags: 0,
-        })?;
+        let id = self.store.add_edge_record(lbl, from.0, to.0)?;
         Ok(EdgeId(id))
+    }
+
+    /// Attach a further participant to an existing edge, making it a hyperedge.
+    ///
+    /// `out = true` adds `vertex` as another target of `edge`, `false` as
+    /// another source. Edges are records, so this needs no machinery beyond one
+    /// more link in each direction.
+    pub fn add_edge_endpoint(&mut self, edge: EdgeId, vertex: VertexId, out: bool) -> Result<()> {
+        self.store.add_edge_endpoint(edge.0, vertex.0, out)?;
+        Ok(())
     }
 
     /// Find a vertex by (label, name) via the persistent index.
@@ -686,16 +692,15 @@ impl Graph {
         out: bool,
         inc: bool,
     ) -> Vec<(u64, u32, u64)> {
-        // The store hides tombstoned *vertices* but knows nothing about the
-        // edge registry, so a deleted edge would still yield its neighbour.
-        // Filtering it out has to happen here, since `Graph` owns the registry.
-        // Missing it would diverge only on deletes — a bug that shows up as a
-        // wrong query result long after the change that caused it.
-        self.store
-            .adjacency(id.0, out, inc)
-            .into_iter()
-            .filter(|(eid, _, _)| self.is_edge_alive(EdgeId(*eid)))
-            .collect()
+        // Worth stating because deleting a filter is exactly the change that
+        // looks like a regression later: the guarantee moved rather than went
+        // away, and `deleting_an_edge_agrees` in `graph-eval` is what would
+        // notice if it had gone away.
+        //
+        // It is also a small win. The old filter ran `is_edge_alive` per entry,
+        // which now resolves records; keeping it would have put that on the hot
+        // path for no benefit.
+        self.store.neighbors_via_edges(id.0, out, inc)
     }
 
     /// A neighbour's `(label, name)` for predicate evaluation — no `String`
@@ -704,14 +709,16 @@ impl Graph {
         self.store.vertex_key(id)
     }
 
-    /// An edge's label and endpoints from the registry. Used to build
-    /// `EdgeHandle`s without an edge *object*, which this layout does not have.
+    /// An edge's label and endpoints, read from its record. Used to build
+    /// `EdgeHandle`s.
+    ///
+    /// A hyperedge has several of each endpoint; this returns the first, which
+    /// is what an `EdgeHandle` can represent. Callers needing the general shape
+    /// walk the edge's chains instead.
     pub(crate) fn edge_endpoints(&self, e: EdgeId) -> Option<(u32, VertexId, VertexId)> {
-        let r = self.edges.get_ref(e.0 as usize)?;
-        if r.id != e.0 || r.flags & TOMBSTONE != 0 {
-            return None;
-        }
-        Some((r.label, VertexId(r.from_id), VertexId(r.to_id)))
+        let label = self.store.vertex_label(e.0)?;
+        let (from, to) = self.store.edge_endpoints(e.0)?;
+        Some((label, VertexId(from), VertexId(to)))
     }
 
     fn arena_neighbors(
@@ -737,17 +744,23 @@ impl Graph {
         self.store.vertices().into_iter().map(VertexId).collect()
     }
 
-    /// An edge's label and endpoints by id, or `None` if the edge is deleted.
-    /// O(1): ids are append indices, so the record is at position `id`.
+    /// An edge's label and endpoints by id, or `None` if it is deleted or is
+    /// not an edge.
+    ///
+    /// That second case is new with the unified id space and is the runtime
+    /// check replacing what the type system used to give us: `EdgeId` and
+    /// `VertexId` are the same type now, so "edge passed where a vertex belongs"
+    /// cannot be rejected at compile time. `IS_EDGE` does the rejecting instead,
+    /// and `edge_info` on a vertex record must return `None`.
     pub fn edge_info(&self, id: EdgeId) -> Option<EdgeInfo> {
         if !self.is_edge_alive(id) {
             return None;
         }
-        let r = self.edges.get_ref(id.0 as usize)?;
+        let (label, from, to) = self.edge_endpoints(id)?;
         Some(EdgeInfo {
-            label: self.label_name(r.label).unwrap_or_default(),
-            from: VertexId(r.from_id),
-            to: VertexId(r.to_id),
+            label: self.label_name(label).unwrap_or_default(),
+            from,
+            to,
         })
     }
 
@@ -768,16 +781,10 @@ impl Graph {
 
     /// Delete an edge (tombstone). No-op if already gone.
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<()> {
-        let idx = id.0 as usize;
-        if idx >= self.edges.len() {
-            return Ok(());
+        if !self.store.is_edge(id.0) {
+            return Ok(()); // not an edge record: no-op, as for an unknown id
         }
-        self.edges.with_mut_at(idx, |r| {
-            if r.id == id.0 && r.flags & TOMBSTONE == 0 {
-                r.flags |= TOMBSTONE;
-            }
-            Ok(())
-        })?;
+        self.store.delete_vertex(id.0)?;
         Ok(())
     }
 
@@ -786,29 +793,35 @@ impl Graph {
         let mut ids = Vec::new();
         ids.extend(self.store.owned_object_ids());
         // Edges: no object to map, and the property id lives in the mirror.
-        ids.extend(self.edges.object_ids());
-        for i in 0..self.edges.len() {
-            if let Some(r) = self.edges.get_ref(i) {
-                if r.props_raw != 0 {
-                    ids.push(r.props_raw);
-                }
-            }
-        }
         // `verts` is vestigial on v4 but still allocated, and still freed.
-        ids.extend(self.verts.object_ids());
         ids.extend(self.labels.object_ids());
         ids.push(self.vindex.object().id().raw());
         ids
     }
 
     #[cfg(test)]
+    pub(crate) fn record_touches(&self) -> usize {
+        self.store.record_touches()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_record_touches(&self) {
+        self.store.reset_record_touches();
+    }
+
+    #[cfg(test)]
     pub(crate) fn vertex_props_raw(&self, v: VertexId) -> Option<u128> {
-        self.store.props_raw(v.0)
+        self.store.live_record(v.0).map(|_| 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_block_reads(&self) -> usize {
+        self.store.data_block_reads()
     }
 
     #[cfg(test)]
     pub(crate) fn edge_props_raw(&self, e: EdgeId) -> Option<u128> {
-        self.edges.get_ref(e.0 as usize).map(|r| r.props_raw)
+        self.store.live_record(e.0).map(|_| 0)
     }
 
     /// Set a property on a vertex; errors if it is missing or tombstoned.
@@ -818,11 +831,17 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        let cur = self.store.props_raw(v.0).unwrap_or(0);
-        let new_raw = props::set_in(cur, key, val)?;
-        if new_raw != cur {
-            self.store.set_props_raw(v.0, new_raw)?;
+        // If the key is already an inline traversal slot, update it there.
+        // Writing the side object instead would leave two values for one key,
+        // with readers preferring the stale inline one — a divergence invisible
+        // from outside, since a wrong property reads exactly like a right one.
+        // Updating in place is sound because a slot is fixed-size; it is
+        // *adding* a key that the format forbids, not changing one.
+        let key_id = self.intern_label(key)?;
+        if self.store.set_traversal_prop(v.0, key_id, val) == Some(true) {
+            return Ok(());
         }
+        self.store.set_data_prop(v.0, key_id, val)?;
         Ok(())
     }
 
@@ -831,15 +850,31 @@ impl Graph {
         if !self.is_vertex_alive(v) {
             return None;
         }
-        props::get_in(self.store.props_raw(v.0)?, key)
+        let key_id = self.find_label(key)?;
+        if let Some(val) = self.store.traversal_prop(v.0, key_id) {
+            return Some(val);
+        }
+        self.store
+            .data_props(v.0)?
+            .into_iter()
+            .find(|s| s.key_id == key_id)
+            .map(|s| s.val)
     }
 
-    /// All of a vertex's properties in insertion order (empty if dead/unset).
+    /// All of a vertex's properties (empty if dead/unset).
+    ///
+    /// Inline traversal properties first, in slot order, then data properties in
+    /// insertion order. The two sets are disjoint by construction.
     pub fn vertex_props(&self, v: VertexId) -> Vec<(String, PropValue)> {
         if !self.is_vertex_alive(v) {
             return Vec::new();
         }
-        self.store.props_raw(v.0).map_or(Vec::new(), props::list_in)
+        let mut slots = self.store.traversal_props(v.0).unwrap_or_default();
+        slots.extend(self.store.data_props(v.0).unwrap_or_default());
+        slots
+            .into_iter()
+            .filter_map(|s| self.label_name(s.key_id).map(|k| (k, s.val)))
+            .collect()
     }
 
     /// Set a property on an edge; errors if it is missing, tombstoned, or has
@@ -849,16 +884,7 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
-        let idx = e.0 as usize;
-        let cur = self.edges.get_ref(idx).map(|r| r.props_raw).unwrap_or(0);
-        let new_raw = props::set_in(cur, key, val)?;
-        if new_raw != cur {
-            self.edges.with_mut_at(idx, |r| {
-                r.props_raw = new_raw;
-                Ok(())
-            })?;
-        }
-        Ok(())
+        self.set_vertex_prop(VertexId(e.0), key, val)
     }
 
     /// An edge property, or `None` if unset or the edge is dead.
@@ -866,7 +892,7 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return None;
         }
-        props::get_in(self.edges.get_ref(e.0 as usize)?.props_raw, key)
+        self.get_vertex_prop(VertexId(e.0), key)
     }
 
     /// All of an edge's properties in insertion order (empty if dead/unset).
@@ -874,10 +900,7 @@ impl Graph {
         if !self.is_edge_alive(e) {
             return Vec::new();
         }
-        match self.edges.get_ref(e.0 as usize) {
-            Some(r) => props::list_in(r.props_raw),
-            None => Vec::new(),
-        }
+        self.vertex_props(VertexId(e.0))
     }
 
     /// Whether a vertex exists and is not tombstoned.
@@ -888,20 +911,25 @@ impl Graph {
     /// Make the graph durable — one sync per arena plus the registries.
     pub fn sync(&mut self) -> Result<()> {
         self.store.sync_all()?;
-        self.edges.flush()?;
         self.labels.flush()?;
         Ok(())
     }
 
-    /// Whether an edge exists, is not tombstoned, and both endpoints are alive.
+    /// Whether `id` names a live edge record whose endpoints are both live.
+    ///
+    /// The `is_edge` test is what keeps the unified id space honest: without it
+    /// every live vertex would answer "yes" and `edge_info`/`get_edge_prop`
+    /// would happily treat a vertex as an edge.
     pub(crate) fn is_edge_alive(&self, id: EdgeId) -> bool {
-        let Some(r) = self.edges.get_ref(id.0 as usize) else {
-            return false;
-        };
-        if r.id != id.0 || r.flags & TOMBSTONE != 0 {
+        if !self.store.is_edge(id.0) || !self.store.is_alive(id.0) {
             return false;
         }
-        self.is_vertex_alive(VertexId(r.from_id)) && self.is_vertex_alive(VertexId(r.to_id))
+        // An edge is alive only while both endpoints are — unchanged semantics,
+        // now read from the edge's own chains rather than a registry mirror.
+        match self.store.edge_endpoints(id.0) {
+            Some((f, t)) => self.store.is_alive(f) && self.store.is_alive(t),
+            None => false,
+        }
     }
 
     /// All vertices with the given label. Linear scan.
@@ -919,6 +947,15 @@ impl Graph {
     /// Read back a vertex's data from the registry, or `None` if it is deleted.
     /// O(1): ids are append indices, so the record is at position `id`.
     pub fn vertex_info(&self, id: VertexId) -> Option<VertexInfo> {
+        // An edge record is not a vertex. The mirror of the `IS_EDGE` check
+        // in `edge_info`, and it was missing: with one id space the type system
+        // no longer separates the two, so every accessor has to reject the
+        // wrong kind at runtime or it will happily describe an edge as a vertex.
+        // `gstress verify` found this by reading an id that had silently become
+        // an edge's.
+        if self.store.is_edge(id.0) {
+            return None;
+        }
         let (lbl, name, target) = self.store.vertex_info(id.0)?;
         Some(VertexInfo {
             label: self.label_name(lbl).unwrap_or_default(),
@@ -998,26 +1035,6 @@ fn find_label_in(labels: &SegVec<LabelEntry>, name: &str) -> Option<u32> {
     None
 }
 
-/// The edge registry's own objects plus every edge property object.
-///
-/// v4 keeps `props_raw` in `EdgeRef`, so this needs no edge *objects* — which
-/// is why it is separate from [`inventory`], whose v3 form has to map each edge
-/// object to find the same id.
-fn edge_registry_ids(edges_raw: u128, cap: usize) -> Vec<u128> {
-    let Ok(edges) = SegVec::<EdgeRef>::open(edges_raw, cap) else {
-        return Vec::new();
-    };
-    let mut ids = edges.object_ids();
-    for i in 0..edges.len() {
-        if let Some(r) = edges.get_ref(i) {
-            if r.props_raw != 0 {
-                ids.push(r.props_raw);
-            }
-        }
-    }
-    ids
-}
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for the format guards and the geometry validation.
@@ -1034,27 +1051,38 @@ mod tests {
         assert!(version_supported(VERSION_ARENA));
         assert!(!version_supported(VERSION_ARENA_NOCAP), "v7 is not readable");
         assert!(!version_supported(VERSION), "v3 is not readable");
-        for v in [0, 1, 2, 3, 4, 6, 9, 99, u32::MAX] {
+        // Every number *except* the current one. Written as a filter over a
+        // range rather than a literal list, which is how `9` ended up in a
+        // "must not be readable" list on the very build that made 9 current.
+        for v in (0..=32u32).filter(|v| *v != VERSION_ARENA) {
             assert!(!version_supported(v), "version {v} must not be readable");
         }
     }
 
-    /// Freeing is gated on whether the *object graph* is walkable, which is a
-    /// weaker condition — v7 differs from v8 only by a trailing root field.
+    /// Freeing is gated on whether the *object graph* is walkable — a weaker
+    /// condition than readability, but not a free pass.
+    ///
+    /// Currently no predecessor qualifies, and that is a statement about
+    /// format 9 rather than a permanent one: 7 qualified while 8 was current,
+    /// because 7 → 8 moved only a trailing root field. The rule is what to
+    /// assert, not the membership.
     #[test]
-    fn a_predecessor_with_the_same_object_graph_is_reclaimable() {
+    fn reclaimability_tracks_whether_records_are_still_walkable() {
         assert!(version_reclaimable(VERSION_ARENA));
+        // Format 7 was reclaimable while 8 was current, because 7 → 8 touched
+        // only a trailing root field. Format 9 moved the record layout, and the
+        // inventory walk reads records — so 7 dropped out, deliberately.
         assert!(
-            version_reclaimable(VERSION_ARENA_NOCAP),
-            "v7 must stay reclaimable: same arenas, same registries, same \
-             property objects — only GraphRoot grew a trailing field"
+            !version_reclaimable(VERSION_ARENA_NOCAP),
+            "a format whose record layout we can no longer read must not be \
+             walked for object ids: leaking beats mis-freeing"
         );
     }
 
     #[test]
     fn v3_is_not_reclaimable() {
         assert!(!version_reclaimable(VERSION));
-        for v in [0, 1, 2, 3, 4, 6, 9, 99, u32::MAX] {
+        for v in (0..=32u32).filter(|v| *v != VERSION_ARENA) {
             assert!(!version_reclaimable(v), "version {v} must not be freed");
         }
     }
