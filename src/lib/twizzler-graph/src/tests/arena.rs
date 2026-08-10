@@ -706,3 +706,131 @@ fn a_degree_one_record_allocates_no_chunk() {
          inline entry is the oldest and the chunks are prepended"
     );
 }
+
+// --- cross-arena adjacency -------------------------------------------------
+//
+// `gstress scale:20000` then lost every cross-arena inline adjacency entry —
+// clique out-degrees of 0 where 99 were due — while chunk entries beside them
+// resolved fine. Seven arenas is where the suite's blind spot started.
+//
+// These use `FillTo { cap: 2 }` so that almost every reference crosses an
+// arena, and they assert they are actually crossing: a test that quietly
+// fell back to one arena would pass while covering nothing, which is the exact
+// failure mode being corrected.
+
+/// The shape that broke: `a → edge → b` with all three in different arenas.
+#[test]
+fn cross_arena_edge_traversal_is_correct_at_every_hop() {
+    let mut s = store(Box::new(FillTo { cap: 2 }));
+    let a = s.add_record(1, "a", 0, &[], false).unwrap();
+    let b = s.add_record(1, "b", 0, &[], false).unwrap();
+    let e = s.add_edge_record(9, a, b).unwrap();
+
+    // The premise. Without this the test could pass by not crossing anything.
+    assert!(
+        s.arena_count() >= 2,
+        "cap 2 must push the edge record out of a and b's arena; got {} arena(s)",
+        s.arena_count()
+    );
+
+    let _ = s.take_diag();
+    assert_eq!(s.neighbors_via_edges(a, true, false), vec![(e, 9, b)]);
+    let d = s.take_diag();
+    assert!(
+        d.inline > 0,
+        "the edge is degree-1, so its entry must be inline — that is the path \
+         that failed cross-arena"
+    );
+    assert_eq!(d.skipped_dead, 0, "no live neighbour may read as dead");
+    assert_eq!(d.skipped_gen, 0, "no live neighbour may fail the generation check");
+
+    assert_eq!(s.neighbors_via_edges(b, false, true), vec![(e, 9, a)]);
+    assert_eq!(s.edge_endpoints(e), Some((a, b)));
+    assert_eq!(s.vertices(), vec![a, b]);
+}
+
+/// Chunk entries across arenas, past the inline slot. These always worked, so
+/// this is the control: it shows the inline test above is measuring the inline
+/// path rather than cross-arena traversal in general.
+#[test]
+fn cross_arena_chunk_entries_resolve_and_keep_order() {
+    let mut s = store(Box::new(FillTo { cap: 2 }));
+    let hub = s.add_record(1, "hub", 0, &[], false).unwrap();
+    let mut targets = Vec::new();
+    for i in 0..ADJ_CHUNK + 3 {
+        let t = s.add_record(1, &format!("t{i}"), 0, &[], false).unwrap();
+        s.add_edge_record(7, hub, t).unwrap();
+        targets.push(t);
+    }
+    assert!(s.arena_count() > 4, "many arenas, so references cross freely");
+
+    let _ = s.take_diag();
+    let got: Vec<u64> = s
+        .neighbors_via_edges(hub, true, false)
+        .into_iter()
+        .map(|(_, _, far)| far)
+        .collect();
+    let d = s.take_diag();
+
+    assert_eq!(got, targets, "every far endpoint, in insertion order");
+    assert!(
+        d.cross_arena > 0,
+        "the hub's chunk entries must actually cross an arena boundary"
+    );
+    assert!(d.inline > 0, "and the first entry is still inline");
+    assert_eq!(d.skipped_dead, 0);
+    assert_eq!(d.skipped_gen, 0);
+}
+
+/// Liveness across arenas: a tombstoned far vertex must disappear from a walk
+/// that reaches it through another arena, and its neighbours must not.
+#[test]
+fn cross_arena_deletes_hide_exactly_one_neighbour() {
+    let mut s = store(Box::new(FillTo { cap: 2 }));
+    let hub = s.add_record(1, "hub", 0, &[], false).unwrap();
+    let mut targets = Vec::new();
+    for i in 0..5 {
+        let t = s.add_record(1, &format!("t{i}"), 0, &[], false).unwrap();
+        s.add_edge_record(7, hub, t).unwrap();
+        targets.push(t);
+    }
+    assert!(s.arena_count() > 2);
+
+    s.delete_vertex(targets[2]).unwrap();
+
+    let got: Vec<u64> = s
+        .neighbors_via_edges(hub, true, false)
+        .into_iter()
+        .map(|(_, _, far)| far)
+        .collect();
+    let expected: Vec<u64> = targets
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 2)
+        .map(|(_, t)| *t)
+        .collect();
+    assert_eq!(got, expected, "exactly the deleted target disappears");
+    assert!(!s.vertices().contains(&targets[2]));
+}
+
+/// Slot reuse across arenas: the generation guard must still reject a stale
+/// *chunk* entry when the reused slot is in a different arena from the walker.
+#[test]
+fn cross_arena_slot_reuse_does_not_resurrect_a_neighbour() {
+    let mut s = store(Box::new(FillTo { cap: 2 }));
+    let hub = s.add_record(1, "hub", 0, &[], false).unwrap();
+    let victim = s.add_record(1, "victim", 0, &[], false).unwrap();
+    let e = s.add_edge_record(9, hub, victim).unwrap();
+    assert!(s.arena_count() >= 2);
+    assert_eq!(s.neighbors_via_edges(hub, true, false), vec![(e, 9, victim)]);
+
+    s.delete_vertex(victim).unwrap();
+    let squatter = s.add_record(1, "squatter", 0, &[], false).unwrap();
+
+    assert_eq!(
+        s.neighbors_via_edges(hub, true, false),
+        vec![],
+        "the squatter was never hub's neighbour, whatever arena it landed in"
+    );
+    assert_eq!(s.vertex_name(squatter).as_deref(), Some("squatter"));
+}

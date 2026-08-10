@@ -168,11 +168,9 @@ pub(crate) struct ArenaRecordHead {
     /// now the normal case — see the inline slots below.
     pub(crate) out_head: u64,
     pub(crate) in_head: u64,
-    /// Entries here are ordinary `AdjRef`s and carry a FOT index, which is
-    /// meaningful only inside the containing object — safe because the record
-    /// *is* in the arena, exactly as a chunk is.
-    pub(crate) inline_out: AdjRef,
-    pub(crate) inline_in: AdjRef,
+    /// These name the neighbour by *id*, not by `InvPtr` — see [`InlineAdj`].
+    pub(crate) inline_out: InlineAdj,
+    pub(crate) inline_in: InlineAdj,
 }
 unsafe impl Invariant for ArenaRecordHead {}
 
@@ -184,10 +182,33 @@ unsafe impl Invariant for ArenaRecordHead {}
 /// costs one FOT entry, deduped per target arena by the runtime's
 /// `insert_fot`. Traversal therefore never consults the location registry.
 ///
-/// Neither this nor [`AdjChunk`] is `Copy`, and that is load-bearing: a FOT
-/// index means something only inside its containing object, so copying an entry
-/// between arenas would silently mis-resolve. `InvPtr` is not `Copy` for
-/// exactly this reason; do not "fix" it by storing the raw `u64`.
+/// This started as an `AdjRef` and had to change. An `InvPtr`'s FOT index is
+/// meaningful only inside its containing object, and a chunk earns one by being
+/// allocated through the arena's transaction. The inline slot is written
+/// straight into the record with a raw pointer, and cross-arena resolution from
+/// there returned garbage: `gstress scale:20000` lost every cross-arena
+/// inline entry — clique out-degrees of 0 where 99 were due — while the chunk
+/// entries beside them resolved correctly. Same-arena resolution worked, which
+/// is why a single-arena test suite never saw it.
+///
+/// Ids sidestep the question rather than answering it. They also cost less here
+/// than pointers did: no FOT entry per degree-1 record, and no generation
+/// check — an id is never reused, so a stale one finds a tombstone in `locs`
+/// and `is_alive` rejects it. Generations exist to catch a stale *pointer* into
+/// a reused slot; an id cannot go stale that way.
+///
+/// The high-degree path keeps `InvPtr`s in chunks, so index-free adjacency —
+/// the mechanism the project is about — is untouched where it matters.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub(crate) struct InlineAdj {
+    pub(crate) edge_id: u64,
+    pub(crate) neighbor_id: u64,
+    pub(crate) label: u32,
+    pub(crate) _pad: u32,
+}
+unsafe impl Invariant for InlineAdj {}
+
 #[repr(C)]
 pub(crate) struct AdjRef {
     pub(crate) edge_id: u64,
@@ -317,6 +338,28 @@ pub struct ArenaStore {
     record_touches: core::cell::Cell<usize>,
     #[cfg(test)]
     data_block_reads: core::cell::Cell<usize>,
+    /// Adjacency counters. Test-only, like `record_touches`: they sit on the
+    /// hottest path in the engine.
+    #[cfg(test)]
+    pub(crate) diag: core::cell::Cell<AdjDiag>,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct AdjDiag {
+    /// Entries visited by `walk_adj`, before any filtering.
+    pub seen: usize,
+    /// …of which came from a record's inline slot rather than a chunk.
+    pub inline: usize,
+    /// …whose neighbour `InvPtr` is not FOT-index 0, i.e. resolves through
+    /// `slow_resolve` into a different mapping of another arena.
+    pub cross_arena: usize,
+    /// …dropped because the neighbour's slot generation did not match.
+    pub skipped_gen: usize,
+    /// …dropped because the neighbour was tombstoned.
+    pub skipped_dead: usize,
+    /// Of the generation-skipped entries, how many were cross-arena. If this
+    /// equals `skipped_gen`, every skip is explained by the mapping split.
+    pub skipped_gen_cross: usize,
 }
 
 impl ArenaStore {
@@ -334,6 +377,8 @@ impl ArenaStore {
             record_touches: core::cell::Cell::new(0),
             #[cfg(test)]
             data_block_reads: core::cell::Cell::new(0),
+            #[cfg(test)]
+            diag: core::cell::Cell::new(AdjDiag::default()),
         })
     }
 
@@ -439,6 +484,8 @@ impl ArenaStore {
             record_touches: core::cell::Cell::new(0),
             #[cfg(test)]
             data_block_reads: core::cell::Cell::new(0),
+            #[cfg(test)]
+            diag: core::cell::Cell::new(AdjDiag::default()),
         })
     }
 
@@ -867,6 +914,14 @@ impl ArenaStore {
         self.live_loc(vertex).map(|_| ())
     }
 
+    /// Read and clear the adjacency diagnostic counters.
+    #[cfg(test)]
+    pub fn take_diag(&self) -> AdjDiag {
+        let d = self.diag.get();
+        self.diag.set(AdjDiag::default());
+        d
+    }
+
     /// A slot's current generation, for stamping into an `AdjRef`.
     fn generation_of(&self, vertex: u64) -> Option<u32> {
         let loc = self.live_loc(vertex)?;
@@ -941,6 +996,7 @@ impl ArenaStore {
         edge_id: u64,
         label: u32,
         neighbor: GlobalPtr<ArenaRecordHead>,
+        neighbor_id: u64,
         neighbor_gen: u32,
     ) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
@@ -959,6 +1015,30 @@ impl ArenaStore {
             }
         };
 
+        // Note this runs before the `AdjRef` is built, so a degree-1 record
+        // also costs no FOT entry — `InvPtr::new` is never called for it.
+        {
+            let bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
+            let occupied = unsafe { (*vp).flags & bit != 0 };
+            if !occupied {
+                unsafe {
+                    let dst = if out {
+                        &raw mut (*vp).inline_out
+                    } else {
+                        &raw mut (*vp).inline_in
+                    };
+                    dst.write(InlineAdj {
+                        edge_id,
+                        neighbor_id,
+                        label,
+                        _pad: 0,
+                    });
+                    (*vp).flags |= bit;
+                }
+                return Ok(());
+            }
+        }
+
         // Build the entry against this arena's transaction. `InvPtr::new`
         // returns FOT index 0 when `neighbor` lives in this same arena.
         let entry = {
@@ -970,23 +1050,6 @@ impl ArenaStore {
                 neighbor_gen,
             }
         };
-
-        {
-            let bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
-            let occupied = unsafe { (*vp).flags & bit != 0 };
-            if !occupied {
-                unsafe {
-                    let dst = if out {
-                        &raw mut (*vp).inline_out
-                    } else {
-                        &raw mut (*vp).inline_in
-                    };
-                    dst.write(entry);
-                    (*vp).flags |= bit;
-                }
-                return Ok(());
-            }
-        }
 
         // Room in the head chunk? Append there and we are done.
         if head != 0 {
@@ -1047,8 +1110,8 @@ impl ArenaStore {
         let (Some(fg), Some(tg)) = (self.generation_of(from), self.generation_of(to)) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
-        self.append_adj(from, true, edge_id, label, to_gp, tg)?;
-        self.append_adj(to, false, edge_id, label, from_gp, fg)
+        self.append_adj(from, true, edge_id, label, to_gp, to, tg)?;
+        self.append_adj(to, false, edge_id, label, from_gp, from, fg)
     }
 
     /// The topology becomes `from → edge → to`, with the edge record carrying
@@ -1087,10 +1150,10 @@ impl ArenaStore {
         ) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
-        self.append_adj(from, true, edge, label, edge_gp, eg)?;
-        self.append_adj(to, false, edge, label, edge_gp, eg)?;
-        self.append_adj(edge, true, edge, label, to_gp, tg)?;
-        self.append_adj(edge, false, edge, label, from_gp, fg)?;
+        self.append_adj(from, true, edge, label, edge_gp, edge, eg)?;
+        self.append_adj(to, false, edge, label, edge_gp, edge, eg)?;
+        self.append_adj(edge, true, edge, label, to_gp, to, tg)?;
+        self.append_adj(edge, false, edge, label, from_gp, from, fg)?;
         Ok(edge)
     }
 
@@ -1112,8 +1175,8 @@ impl ArenaStore {
         let (Some(vg), Some(eg)) = (self.generation_of(vertex), self.generation_of(edge)) else {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
         };
-        self.append_adj(edge, out, edge, label, v_gp, vg)?;
-        self.append_adj(vertex, !out, edge, label, e_gp, eg)
+        self.append_adj(edge, out, edge, label, v_gp, vertex, vg)?;
+        self.append_adj(vertex, !out, edge, label, e_gp, edge, eg)
     }
 
     /// An edge record's `(from, to)`, or `None` if `edge` is not a live edge.
@@ -1181,10 +1244,28 @@ impl ArenaStore {
         unsafe {
             if (*vp).flags & inline_bit != 0 {
                 let e = if out { &(*vp).inline_out } else { &(*vp).inline_in };
-                let nb = e.neighbor.resolve();
-                if nb.generation == e.neighbor_gen && self.is_alive(nb.id) {
-                    inline = Some((e.edge_id, e.label, nb.id));
+                #[cfg(test)]
+                let mut d = self.diag.get();
+                #[cfg(test)]
+                {
+                    d.seen += 1;
+                    d.inline += 1;
                 }
+                // No resolve and no generation check: the neighbour is named by
+                // id, and `is_alive` reads the flat `locs` array through its own
+                // coherent mapping. Nothing here depends on a cross-arena view
+                // of another record, which is what the `InvPtr` version got
+                // wrong.
+                if !self.is_alive(e.neighbor_id) {
+                    #[cfg(test)]
+                    {
+                        d.skipped_dead += 1;
+                    }
+                } else {
+                    inline = Some((e.edge_id, e.label, e.neighbor_id));
+                }
+                #[cfg(test)]
+                self.diag.set(d);
             }
         }
         if let Some((eid, lbl, nb)) = inline {
@@ -1243,6 +1324,17 @@ impl ArenaStore {
                 // `delete_vertex`. Only `nb.id` is read from it, which is fixed
                 // at allocation and never written again. Do not read a
                 // mutable field of a neighbour record here.
+                #[cfg(test)]
+                let mut d = self.diag.get();
+                #[cfg(test)]
+                let cross = !e.neighbor.is_local();
+                #[cfg(test)]
+                {
+                    d.seen += 1;
+                    if cross {
+                        d.cross_arena += 1;
+                    }
+                }
                 let nb = unsafe { e.neighbor.resolve() };
                 // Generation check before anything else. The slot this
                 // entry points at may have been reclaimed and handed to a
@@ -1256,7 +1348,22 @@ impl ArenaStore {
                 // through a cross-arena mapping is safe for the same reason
                 // `nb.id` is. The liveness bit beside them is not.
                 if nb.generation != e.neighbor_gen {
+                    #[cfg(test)]
+                    {
+                        d.skipped_gen += 1;
+                        if cross {
+                            d.skipped_gen_cross += 1;
+                        }
+                        self.diag.set(d);
+                    }
                     continue;
+                }
+                #[cfg(test)]
+                {
+                    if !self.is_alive(nb.id) {
+                        d.skipped_dead += 1;
+                    }
+                    self.diag.set(d);
                 }
                 if self.is_alive(nb.id) {
                     f(e.edge_id, e.label, nb.id);

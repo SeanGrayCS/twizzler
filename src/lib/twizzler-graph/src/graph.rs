@@ -66,7 +66,7 @@ pub(crate) const VERSION: u32 = 5;
 /// Reading a format-8 graph with this build would interpret padding as a
 /// generation, mismatch every adjacency entry, and silently return a graph with
 /// no edges. Clear the disk image.
-pub(crate) const VERSION_ARENA: u32 = 11;
+pub(crate) const VERSION_ARENA: u32 = 12;
 
 /// No longer reclaimable as of format 9. It was, while 8 differed from 7
 /// only in a trailing root field; format 9 moved the *record* layout, and the
