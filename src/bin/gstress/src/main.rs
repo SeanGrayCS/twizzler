@@ -16,7 +16,12 @@ use twizzler_graph::{Graph, Labels, VertexId};
 
 const GRAPH: &str = "gstress";
 
-pub(crate) const HARNESS_REV: &str = "2026-08-04d";
+/// Where id arithmetic survives it is load-bearing on one invariant: a phase
+/// that creates vertices *before* any edge still gets contiguous ids from 0, so
+/// `VertexId(i)` is valid for phase-A vertices and for `seed`'s `v*`. Anything
+/// created after an edge is not addressable that way. If a phase is ever
+/// reordered, those become silent misreads rather than errors.
+pub(crate) const HARNESS_REV: &str = "2026-08-04f";
 
 mod indradb_mode;
 mod props_probe;
@@ -429,9 +434,18 @@ fn main() {
                 .expect("open");
             let mut ids = Vec::with_capacity(n);
             for i in 0..n {
+                let w = i % 4;
+                let props: Vec<(&str, twizzler_graph::PropValue)> = (0..w)
+                    .map(|j| {
+                        (
+                            ["t0", "t1", "t2"][j],
+                            twizzler_graph::PropValue::I64((i * 10 + j) as i64),
+                        )
+                    })
+                    .collect();
                 ids.push(
-                    g.add_vertex("d", &format!("v{i}"), ObjID::new(i as u128))
-                        .expect("add_vertex"),
+                    g.add_vertex_with_props("d", &format!("v{i}"), ObjID::new(i as u128), &props)
+                        .expect("add_vertex_with_props"),
                 );
             }
             for i in 0..n.saturating_sub(1) {
@@ -490,9 +504,11 @@ fn main() {
         };
         let post = n / 4;
         for i in (0..post).step_by(23) {
-            let v = VertexId((n + i) as u64);
             st.ck(
-                g.vertex_info(v).map(|inf| inf.name) == Some(format!("w{i}")),
+                g.find_vertex("d2", &format!("w{i}"))
+                    .and_then(|v| g.vertex_info(v))
+                    .map(|inf| inf.name)
+                    == Some(format!("w{i}")),
                 || format!("w{i} (written after a mid-seed reopen) did not survive"),
             );
         }
@@ -505,6 +521,31 @@ fn main() {
         st.ck(g.arena_count() > 0, || {
             "arena directory came back empty — the store's arenas did not reach disk".into()
         });
+
+        for i in (0..n).step_by(97) {
+            if i % 7 == 0 {
+                continue; // tombstoned; checked below
+            }
+            let v = VertexId(i as u64);
+            let w = i % 4;
+            for j in 0..w {
+                let key = ["t0", "t1", "t2"][j];
+                let want = twizzler_graph::PropValue::I64((i * 10 + j) as i64);
+                st.ck(g.get_vertex_prop(v, key) == Some(want), || {
+                    format!(
+                        "v{i} (nprops={w}) inline property {key} did not survive the \
+                         reboot — a stride error reads the neighbouring record"
+                    )
+                });
+            }
+            // A record must not report slots it never had: reading past its own
+            // extent is how a stride slip presents when it lands short.
+            if w < 3 {
+                st.ck(g.get_vertex_prop(v, ["t0", "t1", "t2"][w]).is_none(), || {
+                    format!("v{i} (nprops={w}) returned a slot beyond its own width")
+                });
+            }
+        }
 
         for i in (0..n).step_by(97) {
             let v = VertexId(i as u64);
@@ -669,7 +710,7 @@ fn main() {
     );
 
     let mut st = Stats::new();
-    let mut next_id: u64 = 0;
+    let mut counters: (u64, u64) = (0, 0);
 
     let setup = Instant::now();
     Graph::reset_arena(GRAPH, arena_cap).expect("reset arena graph");
@@ -680,18 +721,27 @@ fn main() {
     // Workload only, from here.
     let total = Instant::now();
 
-    let add_v = |g: &mut Graph, st: &mut Stats, next_id: &mut u64, label: &str, name: &str| {
+    let add_v = |g: &mut Graph,
+                 st: &mut Stats,
+                 counters: &mut (u64, u64),
+                 label: &str,
+                 name: &str| {
+        let (vertices, next_id) = counters;
         let v = g
             .add_vertex(label, name, ObjID::new(0))
             .expect("add_vertex");
-        // Ids are append indices and never reused; any drift is a bug.
-        if v.0 != *next_id {
+        // What is still true, and still worth asserting: ids strictly increase
+        // and are never handed out twice. That is what callers actually depend
+        // on, and it is what would break if slot reuse ever started recycling
+        // ids as well as space.
+        if v.0 <= *next_id && *next_id != 0 {
             st.fail(format!(
-                "vertex id drift: got {}, expected {}",
+                "vertex id did not advance: got {}, previous high-water {}",
                 v.0, *next_id
             ));
         }
-        *next_id += 1;
+        *next_id = v.0;
+        *vertices += 1;
         v
     };
 
@@ -699,7 +749,7 @@ fn main() {
     let n = preset.vertices;
     let t = Instant::now();
     for i in 0..n {
-        add_v(&mut g, &mut st, &mut next_id, "n", &format!("v{i}"));
+        add_v(&mut g, &mut st, &mut counters, "n", &format!("v{i}"));
         if (i + 1) % 500 == 0 {
             heartbeat("A:rollover", i + 1, n, &t);
         }
@@ -754,7 +804,7 @@ fn main() {
 
     // --- Phase C: high-degree hub (adjacency ceiling probe) -----------------
     let t = Instant::now();
-    let hub = add_v(&mut g, &mut st, &mut next_id, "hub", "hub1");
+    let hub = add_v(&mut g, &mut st, &mut counters, "hub", "hub1");
     let mut hub_deg = 0usize;
     for i in 0..preset.degree_cap {
         let target = VertexId(safe_target(i, n) as u64);
@@ -781,7 +831,7 @@ fn main() {
     if preset.same_target_variant {
         // Same-target parallel edges: if FOT entries dedup per target object,
         // this should reach a higher ceiling than the distinct-target hub (I0).
-        let hub2 = add_v(&mut g, &mut st, &mut next_id, "hub", "hub2");
+        let hub2 = add_v(&mut g, &mut st, &mut counters, "hub", "hub2");
         let target = VertexId(1); // index 1 survives churn
         for i in 0..preset.degree_cap {
             if i > 0 && i % 1000 == 0 {
@@ -862,7 +912,7 @@ fn main() {
     }
     // Adds after deletes: ids continue, never reuse.
     for i in 0..preset.churn_add {
-        add_v(&mut g, &mut st, &mut next_id, "c", &format!("c{i}"));
+        add_v(&mut g, &mut st, &mut counters, "c", &format!("c{i}"));
     }
     report("D:churn", n + preset.churn_add, t);
 
@@ -900,10 +950,10 @@ fn main() {
     report("E:reopen", 5, t);
 
     let t = Instant::now();
-    let head = add_v(&mut g, &mut st, &mut next_id, "ch", "ch0");
+    let head = add_v(&mut g, &mut st, &mut counters, "ch", "ch0");
     let mut prev = head;
     for i in 1..preset.chain {
-        let v = add_v(&mut g, &mut st, &mut next_id, "ch", &format!("ch{i}"));
+        let v = add_v(&mut g, &mut st, &mut counters, "ch", &format!("ch{i}"));
         g.add_edge(prev, "next", v).expect("chain add_edge");
         prev = v;
         if (i + 1) % 500 == 0 {
@@ -950,7 +1000,7 @@ fn main() {
         cl.push(add_v(
             &mut g,
             &mut st,
-            &mut next_id,
+            &mut counters,
             "cl",
             &format!("cl{i}"),
         ));
@@ -1043,7 +1093,7 @@ fn main() {
         // The arena layout batches by construction, so the direct path here is
         // the like-for-like comparison, not a slower one.
         for j in 0..preset.degrade_batch {
-            add_v(&mut g, &mut st, &mut next_id, "g", &format!("g{}_{}", w, j));
+            add_v(&mut g, &mut st, &mut counters, "g", &format!("g{}_{}", w, j));
         }
         gdone = base + preset.degrade_batch;
         prog.tick(gdone, gtotal);
@@ -1064,20 +1114,24 @@ fn main() {
          ({:.2}s of it the final sync)",
         if st.fails == 0 { "OK" } else { "FAILED" },
         preset.name,
-        next_id,
+        counters.0,
         hub_deg,
         hub2_deg,
         secs,
         sync_secs
     );
+    let records = g.record_count() as u64;
     println!(
-        "GSTRESS ARENA: {} arenas for {} vertices ({:.4} objects/vertex), {} syncs; \
-         v3 would have spent ~{} objects (3/vertex + 1/edge)",
+        "GSTRESS ARENA: {} arenas for {} records ({} vertices + {} edges), \
+         {:.5} objects/record, {} syncs; v3 would have spent ~{} objects \
+         (3/vertex + 1/edge)",
         g.arena_count(),
-        next_id,
-        g.arena_count() as f64 / next_id.max(1) as f64,
+        records,
+        counters.0,
+        records.saturating_sub(counters.0),
+        g.arena_count() as f64 / records.max(1) as f64,
         g.arena_sync_count(),
-        next_id * 3 + preset.bulk_edges as u64
+        counters.0 * 3 + records.saturating_sub(counters.0)
     );
     let (policy, actual) = g.arena_vertex_counts();
     println!("GSTRESS ARENA DIST policy: {policy:?}");
