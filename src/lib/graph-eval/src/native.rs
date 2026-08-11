@@ -15,23 +15,36 @@ type Result<T> = core::result::Result<T, GraphError>;
 
 /// Load [`FIXTURE`] into a freshly reset graph registered at `data/<name>`.
 ///
-/// **v4 arena layout.** This used `Graph::reset` + `bulk` until v3 retired
-/// (2026-08-04): `BulkSession` was a v3 construct, and the arena store batches
-/// internally — one transaction per arena (A4.2-AC3b) — so the direct path
-/// *is* the batched path. Nothing here needs to change to stay fast.
+/// **Batched through `Graph::bulk_insert`.**
+///
+/// *This note previously read: "the arena store batches internally — one
+/// transaction per arena — so the direct path **is** the batched path. Nothing
+/// here needs to change to stay fast." That was true of the arena and false of
+/// the index.* `PersistentHashMap::insert` opens a transaction per call and
+/// syncs on drop, so the direct path paid one sync per vertex — measured at
+/// **5.35 ms against 46.3 µs batched**, a 115× difference that was invisible
+/// because it hid inside "vertex creation is slow on this platform".
+///
+/// The fixture is tiny, so this is not about *this* loader's speed; it is that
+/// the loader is the template an LDBC load will be built from, and it should
+/// not teach the wrong pattern.
 pub fn load(name: &str, f: &Fixture) -> Result<Graph> {
     Graph::reset_arena(name, twizzler_graph::DEFAULT_ARENA_CAP)?;
     let mut g = Graph::open_or_create_arena(name, twizzler_graph::DEFAULT_ARENA_CAP)?;
 
-    for p in f.people {
-        g.add_vertex(PERSON, p.name, ObjID::new(0))?;
-    }
-    for m in f.messages {
-        g.add_vertex(MESSAGE, m.name, ObjID::new(0))?;
-    }
-    for fo in f.forums {
-        g.add_vertex(FORUM, fo.name, ObjID::new(0))?;
-    }
+    // One index transaction for every vertex, rather than one per vertex.
+    g.bulk_insert(|b| {
+        for p in f.people {
+            b.add_vertex(PERSON, p.name, ObjID::new(0))?;
+        }
+        for m in f.messages {
+            b.add_vertex(MESSAGE, m.name, ObjID::new(0))?;
+        }
+        for fo in f.forums {
+            b.add_vertex(FORUM, fo.name, ObjID::new(0))?;
+        }
+        Ok(())
+    })?;
 
     for p in f.people {
         let v = find(&g, PERSON, p.name)?;
