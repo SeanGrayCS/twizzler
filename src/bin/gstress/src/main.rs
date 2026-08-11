@@ -23,6 +23,7 @@ const GRAPH: &str = "gstress";
 /// reordered, those become silent misreads rather than errors.
 pub(crate) const HARNESS_REV: &str = "2026-08-04f";
 
+mod index_probe;
 mod indradb_mode;
 mod props_probe;
 mod residency;
@@ -39,7 +40,11 @@ pub(crate) fn stamp(mode: &str, preset: &Preset) {
 
 pub(crate) struct Preset {
     pub(crate) name: &'static str,
-    /// Phase A vertices (must exceed DEFAULT_SEG_CAP = 4096 to force rollover).
+    /// Phase A vertices.
+    ///
+    /// The phase is still the project's headline vertex-insertion rate, and
+    /// that is now its whole job. Renaming it would break comparison with every
+    /// recorded `A:rollover` figure, so the name stays and this note explains it.
     pub(crate) vertices: usize,
     /// Phase B random edges.
     pub(crate) bulk_edges: usize,
@@ -383,6 +388,16 @@ pub(crate) fn max_distinct_degree(n: usize) -> usize {
 
 fn main() {
     let arg1 = std::env::args().nth(1);
+
+    if arg1.as_deref() == Some("index") {
+        let n = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(20_000);
+        let arm = std::env::args().nth(3).unwrap_or_else(|| "graph".into());
+        index_probe::run(n, &arm);
+        return;
+    }
 
     if arg1.as_deref() == Some("props") {
         let n = std::env::args()
