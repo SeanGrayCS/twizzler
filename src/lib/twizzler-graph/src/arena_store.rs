@@ -307,6 +307,16 @@ pub struct ArenaStore {
     open: Vec<ArenaObject>,
     txs: Vec<Option<TxObject<ArenaBase>>>,
     stats: Vec<ArenaStat>,
+    /// Which arenas have been touched since the last `sync_all`.
+    ///
+    /// Conservative on purpose: set by `record_ptr`/`chunk_ptr`, which are the
+    /// only ways to obtain a writable pointer into an arena. They serve reads
+    /// too, so a read-heavy workload marks arenas it only read and syncs them
+    /// needlessly — no worse than the old unconditional behaviour, and never
+    /// *unsafe*. Missing a write path would be silent data loss, which is not a
+    /// trade worth making for a sync we can afford. A precise version needs
+    /// separate read/write pointer accessors; noted, not done.
+    dirty: Vec<bool>,
     /// Reclaimed record slots per arena, as `(offset, stride)`.
     ///
     /// In-memory, rebuilt on `open`. Persisting it would mean a second
@@ -370,6 +380,7 @@ impl ArenaStore {
             open: Vec::new(),
             txs: Vec::new(),
             stats: Vec::new(),
+            dirty: Vec::new(),
             free: Vec::new(),
             policy,
             syncs: 0,
@@ -470,6 +481,7 @@ impl ArenaStore {
                 }
             }
         }
+        let open_len = open.len();
         let txs = (0..open.len()).map(|_| None).collect();
         Ok(ArenaStore {
             dir,
@@ -477,6 +489,7 @@ impl ArenaStore {
             open,
             txs,
             stats,
+            dirty: vec![false; open_len],
             free,
             policy,
             syncs: 0,
@@ -543,6 +556,7 @@ impl ArenaStore {
         self.open.push(arena);
         self.txs.push(None);
         self.stats.push(ArenaStat { vertices: 0 });
+        self.dirty.push(true); // a fresh arena has a base to write out
         self.free.push(Vec::new());
         Ok(self.open.len() - 1)
     }
@@ -599,6 +613,7 @@ impl ArenaStore {
     fn record_ptr(&self, loc: &VertexLoc) -> Option<*mut ArenaRecordHead> {
         #[cfg(test)]
         self.record_touches.set(self.record_touches.get() + 1);
+        self.mark_dirty(loc.arena as usize);
         let obj = self.open.get(loc.arena as usize)?.object();
         obj.lea_mut(loc.off as usize, size_of::<ArenaRecordHead>())
             .map(|p| p as *mut ArenaRecordHead)
@@ -628,6 +643,7 @@ impl ArenaStore {
 
     /// Raw pointer to an adjacency chunk, inside its arena's own mapping.
     fn chunk_ptr(&self, arena: u32, off: u64) -> Option<*mut AdjChunk> {
+        self.mark_dirty(arena as usize);
         let obj = self.open.get(arena as usize)?.object();
         obj.lea_mut(off as usize, size_of::<AdjChunk>())
             .map(|p| p as *mut AdjChunk)
@@ -920,6 +936,21 @@ impl ArenaStore {
         let d = self.diag.get();
         self.diag.set(AdjDiag::default());
         d
+    }
+
+    /// Note an arena as needing a sync. `&self` because the pointer accessors
+    /// that call it are `&self`; `Cell` would be tidier but `Vec<bool>` is
+    /// indexed hot and this stays a plain write behind an existing borrow.
+    fn mark_dirty(&self, idx: usize) {
+        // Interior mutability via raw pointer is deliberate and local: `dirty`
+        // is engine bookkeeping, never persisted, and is only ever set to
+        // `true` here and cleared under `&mut self` in `sync_all`.
+        if idx < self.dirty.len() {
+            unsafe {
+                let p = self.dirty.as_ptr() as *mut bool;
+                *p.add(idx) = true;
+            }
+        }
     }
 
     /// A slot's current generation, for stamping into an `AdjRef`.
@@ -1595,9 +1626,15 @@ impl ArenaStore {
                 tx.abort();
             }
         }
-        for a in &self.open {
+        for (i, a) in self.open.iter().enumerate() {
+            if !self.dirty.get(i).copied().unwrap_or(true) {
+                continue;
+            }
             unsafe { a.object().as_mut()?.sync()? };
             self.syncs += 1;
+        }
+        for d in self.dirty.iter_mut() {
+            *d = false;
         }
         self.dir.flush()?;
         self.locs.flush()?;
