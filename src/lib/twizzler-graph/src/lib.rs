@@ -25,7 +25,7 @@ mod tests;
 
 pub use edge::{EdgeHandle, EdgeId, EdgeInfo};
 pub use error::GraphError;
-pub use graph::{Graph, DEFAULT_ARENA_CAP};
+pub use graph::{BulkInsert, Graph, DEFAULT_ARENA_CAP, DEFAULT_SEG_CAP};
 pub use props::PropValue;
 pub use arena_store::{ArenaStat, ArenaStore, FillTo, OnePerArena, Placement};
 pub use name::NameKey;

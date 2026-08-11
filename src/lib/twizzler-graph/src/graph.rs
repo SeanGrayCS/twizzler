@@ -12,7 +12,7 @@
 
 use naming::{static_naming_factory, GetFlags};
 use twizzler::{
-    collections::hachage::{PersistentHashMap, PersistentHashMapBase},
+    collections::hachage::{PHMsession, PersistentHashMap, PersistentHashMapBase},
     marker::{BaseType, Invariant},
     object::{MapFlags, ObjID, Object, ObjectBuilder, TypedObject},
 };
@@ -97,10 +97,20 @@ fn version_reclaimable(v: u32) -> bool {
     v == VERSION_ARENA
 }
 
-/// Default per-segment registry capacity. Registry records are plain data
-/// (~100–150 B, no `InvPtr`s), so 4096 entries keep a segment well under the
-/// object size limit while amortizing segment creation.
-pub(crate) const DEFAULT_SEG_CAP: usize = 4096;
+/// Default per-segment registry capacity.
+///
+/// This costs a small graph nothing. `cap` is a rollover threshold, not a
+/// preallocation — `SegVec` maps element `i` to `(i / cap, i % cap)` and only
+/// creates the next segment when the last one fills, and the underlying
+/// `VecObject` grows on demand. A five-vertex graph has one segment object
+/// either way.
+///
+/// No format bump. `seg_cap` is persisted per graph in `GraphRoot` and
+/// honoured on open, so existing graphs keep the geometry they were built with;
+/// only newly created (and `reset`) graphs take the new default. That is also
+/// why segment geometry must stay uniform for a graph's lifetime — the O(1)
+/// index arithmetic depends on it.
+pub const DEFAULT_SEG_CAP: usize = 262_144;
 
 /// Default vertices packed per arena on the VERSION 4 layout.
 ///
@@ -1020,6 +1030,80 @@ impl Graph {
         Ok(id)
     }
 
+    /// Insert many vertices under one index transaction.
+    ///
+    /// Why a closure rather than a field. `PHMsession<'a>` borrows the map,
+    /// so it cannot be stored beside `vindex` in `Graph` — that is a
+    /// self-referential borrow. `ArenaStore` gets away with holding its
+    /// transactions because `TxObject<ArenaBase>` is owned. Scoping the session
+    /// to a closure is what the borrow checker leaves available, and it also
+    /// makes the durability boundary explicit: the index is durable when the
+    /// closure returns, not before.
+    ///
+    /// Records are still batched per arena as usual, so a bulk load pays one
+    /// index sync plus one sync per arena rather than one per vertex.
+    pub fn bulk_insert<R>(&mut self, f: impl FnOnce(&mut BulkInsert<'_>) -> Result<R>) -> Result<R> {
+        // Disjoint field borrows: the session borrows `vindex`, the handle
+        // borrows `store` and `labels`.
+        let Graph {
+            labels,
+            vindex,
+            store,
+            ..
+        } = self;
+        let session = vindex.write_session()?;
+        let mut b = BulkInsert {
+            store,
+            labels,
+            session,
+        };
+        f(&mut b)
+    }
+}
+
+/// A batching handle from [`Graph::bulk_insert`]. Holds one index transaction
+/// open for its lifetime; the index becomes durable when it is dropped.
+pub struct BulkInsert<'a> {
+    store: &'a mut ArenaStore,
+    labels: &'a mut SegVec<LabelEntry>,
+    session: PHMsession<'a, VKey, u64>,
+}
+
+impl BulkInsert<'_> {
+    /// As [`Graph::add_vertex`], but the index write joins the open transaction.
+    pub fn add_vertex(&mut self, label: &str, name: &str, target: ObjID) -> Result<VertexId> {
+        let lbl = self.intern_label(label)?;
+        let id = self.store.add_record(lbl, name, target.raw(), &[], false)?;
+        self.session.insert(
+            VKey {
+                label: lbl,
+                name: NameKey::new(name),
+            },
+            id,
+        )?;
+        Ok(VertexId(id))
+    }
+
+    /// As [`Graph::add_edge`]. Edges touch no index, so this is here only so a
+    /// bulk load need not drop out of the session to add them — leaving and
+    /// re-entering would close and reopen the index transaction per edge, which
+    /// is the cost the session exists to avoid.
+    pub fn add_edge(&mut self, from: VertexId, label: &str, to: VertexId) -> Result<EdgeId> {
+        let lbl = self.intern_label(label)?;
+        Ok(EdgeId(self.store.add_edge_record(lbl, from.0, to.0)?))
+    }
+
+    fn intern_label(&mut self, name: &str) -> Result<u32> {
+        if let Some(id) = find_label_in(self.labels, name) {
+            return Ok(id);
+        }
+        let id = self.labels.len() as u32;
+        self.labels.push(LabelEntry {
+            id,
+            name: NameKey::new(name),
+        })?;
+        Ok(id)
+    }
 }
 
 // --- shared lookup helpers -------------------------------------------------
