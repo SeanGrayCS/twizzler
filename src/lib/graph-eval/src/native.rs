@@ -6,7 +6,7 @@
 //! feeds the B workstream.
 
 use twizzler::object::ObjID;
-use twizzler_graph::{Graph, GraphError, Labels, PropValue, VertexId};
+use twizzler_graph::{Graph, GraphError, Labels, Lookup, PropValue, VertexId};
 
 use crate::fixture::*;
 use crate::results::*;
@@ -31,6 +31,19 @@ type Result<T> = core::result::Result<T, GraphError>;
 pub fn load(name: &str, f: &Fixture) -> Result<Graph> {
     Graph::reset_arena(name, twizzler_graph::DEFAULT_ARENA_CAP)?;
     let mut g = Graph::open_or_create_arena(name, twizzler_graph::DEFAULT_ARENA_CAP)?;
+
+    // **A8: declare before anything looks up.** The default schema indexes
+    // nothing until asked, and this loader resolves every vertex by name to wire
+    // its edges — so the declaration has to precede the *loading* lookups below,
+    // not just the queries. Declaring after the load would leave `find` hitting
+    // `NotIndexed` on the first edge.
+    //
+    // These are exactly the labels resolved by name: `find` uses all three while
+    // loading, and the queries use PERSON and MESSAGE. Nothing else is indexed,
+    // which is the point — the index covers roots, not records.
+    for l in [PERSON, MESSAGE, FORUM] {
+        g.set_label_indexed(l, true)?;
+    }
 
     // One index transaction for every vertex, rather than one per vertex.
     g.bulk_insert(|b| {
@@ -91,8 +104,26 @@ pub fn load(name: &str, f: &Fixture) -> Result<Graph> {
     Ok(g)
 }
 
+/// **A8: `NotIndexed` must not become "not found" here.** Under the default
+/// schema a label is only indexed if the loader declared it, and collapsing the
+/// two would make every query return empty results while looking like a graph
+/// that simply had no matches — a benchmark reporting zeros instead of failing.
+/// So it panics: a loud crash beats a plausible wrong number.
+fn resolve(g: &Graph, label: &str, name: &str) -> Option<VertexId> {
+    match g.find_vertex(label, name) {
+        Lookup::Found(v) => Some(v),
+        Lookup::NotFound => None,
+        Lookup::NotIndexed => panic!(
+            "label `{label}` is not indexed, so this query cannot resolve its root. \
+             Declare it with `set_label_indexed` when loading, or set \
+             `UnindexedLookup::Scan` in the schema. Returning \"no results\" here \
+             would report a benchmark number that is silently meaningless."
+        ),
+    }
+}
+
 fn find(g: &Graph, label: &str, name: &str) -> Result<VertexId> {
-    g.find_vertex(label, name)
+    resolve(g, label, name)
         .ok_or_else(|| GraphError::Twz(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into()))
 }
 
@@ -169,7 +200,7 @@ pub fn delete_knows(g: &mut Graph, a: &str, b: &str) -> Result<bool> {
 
 /// IS1 — profile of a person.
 pub fn is1_profile(g: &Graph, person: &str) -> Option<Profile> {
-    let v = g.find_vertex(PERSON, person)?;
+    let v = resolve(g, PERSON, person)?;
     Some(Profile {
         name: person.to_string(),
         first: str_prop(g, v, P_FIRST),
@@ -182,7 +213,7 @@ pub fn is1_profile(g: &Graph, person: &str) -> Option<Profile> {
 /// IS2 — a person's most recent messages, newest first, capped at `limit`.
 /// Pure DSL: incoming `hasCreator` edges, ordered by the message's date.
 pub fn is2_recent_messages(g: &Graph, person: &str, limit: usize) -> Vec<MessageRow> {
-    let Some(v) = g.find_vertex(PERSON, person) else {
+    let Some(v) = resolve(g, PERSON, person) else {
         return Vec::new();
     };
     g.traversal()
@@ -210,7 +241,7 @@ pub fn is2_recent_messages(g: &Graph, person: &str, limit: usize) -> Vec<Message
 /// Missing steps, for the B workstream: `EdgeTraversal::order_by_prop{,_desc}`
 /// and an edge→endpoint step that retains the edge's properties.
 pub fn is3_friends(g: &Graph, person: &str) -> Vec<FriendRow> {
-    let Some(v) = g.find_vertex(PERSON, person) else {
+    let Some(v) = resolve(g, PERSON, person) else {
         return Vec::new();
     };
     // `knows` is stored one way; friendship is symmetric, so read both.
@@ -242,7 +273,7 @@ pub fn is3_friends(g: &Graph, person: &str) -> Vec<FriendRow> {
 
 /// IS4 — content and date of a message.
 pub fn is4_message(g: &Graph, message: &str) -> Option<MessageRow> {
-    let m = g.find_vertex(MESSAGE, message)?;
+    let m = resolve(g, MESSAGE, message)?;
     Some(MessageRow {
         name: message.to_string(),
         content: str_prop(g, m, P_CONTENT),
@@ -252,7 +283,7 @@ pub fn is4_message(g: &Graph, message: &str) -> Option<MessageRow> {
 
 /// IS5 — the person who created a message. Pure DSL.
 pub fn is5_creator(g: &Graph, message: &str) -> Option<Profile> {
-    let m = g.find_vertex(MESSAGE, message)?;
+    let m = resolve(g, MESSAGE, message)?;
     let creator = g
         .traversal()
         .v(m)
@@ -271,7 +302,7 @@ pub fn is5_creator(g: &Graph, message: &str) -> Option<Profile> {
 /// (`repeat`/`until`) would express: `repeat(out(replyOf)).until(no outgoing
 /// replyOf)`. The loop is bounded defensively so a cycle cannot hang a query.
 pub fn is6_forum(g: &Graph, message: &str) -> Option<ForumRow> {
-    let mut cur = g.find_vertex(MESSAGE, message)?;
+    let mut cur = resolve(g, MESSAGE, message)?;
     let mut hops = 0usize;
     loop {
         let parents = g
@@ -309,7 +340,7 @@ pub fn is6_forum(g: &Graph, message: &str) -> Option<ForumRow> {
 /// IS7 — direct replies to a message, their authors, and whether each author
 /// knows the author of the message replied to. Newest first, then author name.
 pub fn is7_replies(g: &Graph, message: &str) -> Vec<ReplyRow> {
-    let Some(m) = g.find_vertex(MESSAGE, message) else {
+    let Some(m) = resolve(g, MESSAGE, message) else {
         return Vec::new();
     };
     let parent_author = g

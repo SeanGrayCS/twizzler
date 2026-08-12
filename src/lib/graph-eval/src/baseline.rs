@@ -40,6 +40,26 @@ fn ident(s: &str) -> Identifier {
 /// Load [`FIXTURE`] into a datastore registered at `data/<name>`.
 pub fn load(name: &str, f: &Fixture) -> Db {
     let db = TwizzlerDatastore::open_db(name).expect("open datastore");
+
+    // **Clear first — the datastore outlives the run.** `open_db` opens
+    // whatever is registered at `data/<name>`, and the disk image survives
+    // between QEMU invocations, so without this a second run loads the fixture
+    // *on top of* the first copy.
+    //
+    // That is not hypothetical: on 2026-08-11 three equivalence tests failed
+    // comparing 4 native records against 8 baseline ones — every person twice.
+    // The native loader calls `Graph::reset_arena` and starts clean; this side
+    // did not, so the two engines silently held different data and the suite
+    // reported a disagreement that was really a dirty image.
+    //
+    // **An equivalence suite that only holds on a freshly cleared image is a
+    // weak guarantee for the thing it exists to protect**, so the reset belongs
+    // here rather than in an operator step. Deleting the vertices cascades to
+    // their edges (see `delete_person` below, where that cascade is itself the
+    // documented difference from the native engine).
+    db.delete(indradb::AllVertexQuery)
+        .expect("clear datastore before load");
+
     // Name lookups are property queries here, so the index must be declared.
     db.index_property(ident(P_NAME)).expect("index name");
 

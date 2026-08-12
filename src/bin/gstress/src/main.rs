@@ -12,9 +12,19 @@
 use std::time::Instant;
 
 use twizzler::object::ObjID;
-use twizzler_graph::{Graph, Labels, VertexId};
+use twizzler_graph::{Graph, Labels, Lookup, VertexId};
 
 const GRAPH: &str = "gstress";
+
+/// Declaring *after* the inserts would also work (the lazy rebuild reconstructs
+/// from records), but doing it at open keeps the reason next to the open.
+pub(crate) fn declare_lookup_labels(g: &mut Graph) {
+    for l in ["n", "d", "d2", "c", "hub", "spoke", "tag"] {
+        // Best-effort: a strategy of `None` refuses, and that is a legitimate
+        // configuration for arms that never look up.
+        let _ = g.set_label_indexed(l, true);
+    }
+}
 
 /// Where id arithmetic survives it is load-bearing on one invariant: a phase
 /// that creates vertices *before* any edge still gets contiguous ids from 0, so
@@ -463,6 +473,7 @@ fn main() {
             Graph::reset_arena(DUR, twizzler_graph::DEFAULT_ARENA_CAP).expect("reset");
             let mut g = Graph::open_or_create_arena(DUR, twizzler_graph::DEFAULT_ARENA_CAP)
                 .expect("open");
+            crate::declare_lookup_labels(&mut g);
             let mut ids = Vec::with_capacity(n);
             for i in 0..n {
                 let w = i % 4;
@@ -537,6 +548,7 @@ fn main() {
         for i in (0..post).step_by(23) {
             st.ck(
                 g.find_vertex("d2", &format!("w{i}"))
+                    .found()
                     .and_then(|v| g.vertex_info(v))
                     .map(|inf| inf.name)
                     == Some(format!("w{i}")),
@@ -746,6 +758,7 @@ fn main() {
     let setup = Instant::now();
     Graph::reset_arena(GRAPH, arena_cap).expect("reset arena graph");
     let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("create arena graph");
+            crate::declare_lookup_labels(&mut g);
     let setup_secs = setup.elapsed().as_secs_f64();
     println!("GSTRESS SETUP: reset + open {setup_secs:.2}s (excluded from the run total)");
 
@@ -802,7 +815,7 @@ fn main() {
     let step = (n / 100).max(1);
     for i in (0..n).step_by(step) {
         st.ck(
-            g.find_vertex("n", &format!("v{i}")) == Some(VertexId(i as u64)),
+            g.find_vertex("n", &format!("v{i}")) == Lookup::Found(VertexId(i as u64)),
             || format!("find_vertex v{i} failed"),
         );
     }
@@ -957,10 +970,11 @@ fn main() {
     g.sync().expect("sync before reopen");
     drop(g);
     let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("reopen arena graph");
+            crate::declare_lookup_labels(&mut g);
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {
         "reopen: deleted v7 came back".into()
     });
-    st.ck(g.find_vertex("n", "v8") == Some(VertexId(8)), || {
+    st.ck(g.find_vertex("n", "v8") == Lookup::Found(VertexId(8)), || {
         "reopen: v8 lookup failed".into()
     });
     if n > 4096 {
@@ -975,7 +989,7 @@ fn main() {
     });
     st.ck(
         g.find_vertex("c", &format!("c{}", preset.churn_add - 1))
-            .is_some(),
+            .is_found(),
         || "reopen: last churn vertex missing".into(),
     );
     report("E:reopen", 5, t);
@@ -1081,7 +1095,7 @@ fn main() {
     measure_read("H:lookup", max_reps, || {
         let mut found = 0usize;
         for i in &read_idx {
-            if g.find_vertex("n", &format!("v{i}")).is_some() {
+            if g.find_vertex("n", &format!("v{i}")).is_found() {
                 found += 1;
             }
         }

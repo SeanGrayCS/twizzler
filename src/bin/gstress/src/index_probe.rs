@@ -70,6 +70,7 @@ pub(crate) fn run(n: usize, arm: &str) {
             g.bulk_insert(|b| {
                 for i in 0..n {
                     b.add_vertex("n", &format!("v{i}"), ObjID::new(0))?;
+                    heartbeat(i + 1, n, &t);
                 }
                 Ok(())
             })

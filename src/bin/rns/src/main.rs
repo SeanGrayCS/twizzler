@@ -28,9 +28,10 @@ impl BaseType for FileMeta {}
 
 fn build() -> Result<()> {
     let mut g = Graph::open_or_create("rns")?;
+    g.set_label_indexed("tag", true)?;
 
     // Idempotent: if the thesis tag already exists, don't duplicate.
-    if g.find_vertex("tag", "thesis").is_some() {
+    if g.find_vertex("tag", "thesis").is_found() {
         println!("graph already built (data/rns); run `rns lookup`.");
         return Ok(());
     }
@@ -64,9 +65,13 @@ fn build() -> Result<()> {
 }
 
 fn lookup() -> Result<()> {
-    let g = Graph::open_or_create("rns")?;
+    let mut g = Graph::open_or_create("rns")?;
+    // Declared here too: `lookup` is a separate process from `build`, and the
+    // volatile index does not survive one. The declaration does, so the rebuild
+    // on first lookup knows what to reconstruct.
+    g.set_label_indexed("tag", true)?;
 
-    let Some(thesis) = g.find_vertex("tag", "thesis") else {
+    let Some(thesis) = g.find_vertex("tag", "thesis").found() else {
         println!("no 'thesis' tag found; run `rns build` first.");
         return Ok(());
     };
