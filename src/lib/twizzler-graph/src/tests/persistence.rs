@@ -8,6 +8,7 @@
 //! not the write-back path to the disk image. A graph could in principle live
 //! entirely in mapped memory and pass every test in this file.
 
+use crate::Lookup;
 use twizzler::object::ObjID;
 
 use super::fresh;
@@ -50,19 +51,20 @@ fn vertex_index_find_delete_and_persist() {
     let _ = Graph::reset(name);
     let (t, deleted) = {
         let mut g = Graph::open_or_create(name).unwrap();
+        super::declare_test_labels(&mut g);
         let t = g.add_vertex("tag", "thesis", ObjID::new(0)).unwrap();
         let d = g.add_vertex("tag", "gone", ObjID::new(0)).unwrap();
         // Index lookup.
-        assert_eq!(g.find_vertex("tag", "thesis"), Some(t));
+        assert_eq!(g.find_vertex("tag", "thesis"), Lookup::Found(t));
         // Deleted vertices are not returned by the index lookup.
         g.delete_vertex(d).unwrap();
-        assert_eq!(g.find_vertex("tag", "gone"), None);
+        assert_eq!(g.find_vertex("tag", "gone"), Lookup::NotFound);
         (t, d)
     };
     // The index persists: reopen and look up again.
     let g = Graph::open_or_create(name).unwrap();
-    assert_eq!(g.find_vertex("tag", "thesis"), Some(t));
-    assert_eq!(g.find_vertex("tag", "gone"), None);
+    assert_eq!(g.find_vertex("tag", "thesis"), Lookup::Found(t));
+    assert_eq!(g.find_vertex("tag", "gone"), Lookup::NotFound);
     assert!(g.vertex_info(deleted).is_none());
     let _ = Graph::reset(name);
 }
@@ -117,6 +119,8 @@ fn stale_v2_root_detected_and_resettable() {
                 arena_dir_raw: 0,
                 arena_locs_raw: 0,
                 arena_cap: 0,
+                index_bits: 0,
+                index_labels_raw: 0,
             })
             .unwrap();
         namer.put(&path, root.id()).unwrap();
@@ -146,10 +150,10 @@ fn multiple_graphs_coexist() {
     let b = g2.add_vertex("m", "only-in-b", ObjID::new(0)).unwrap();
 
     assert_ne!(g1.root_id(), g2.root_id());
-    assert_eq!(g1.find_vertex("n", "only-in-a"), Some(a));
-    assert_eq!(g1.find_vertex("m", "only-in-b"), None);
-    assert_eq!(g2.find_vertex("m", "only-in-b"), Some(b));
-    assert_eq!(g2.find_vertex("n", "only-in-a"), None);
+    assert_eq!(g1.find_vertex("n", "only-in-a"), Lookup::Found(a));
+    assert_eq!(g1.find_vertex("m", "only-in-b"), Lookup::NotFound);
+    assert_eq!(g2.find_vertex("m", "only-in-b"), Lookup::Found(b));
+    assert_eq!(g2.find_vertex("n", "only-in-a"), Lookup::NotFound);
     assert_eq!(g1.vertices(), vec![a]);
     assert_eq!(g2.vertices(), vec![b]);
 }

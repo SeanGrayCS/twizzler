@@ -1,6 +1,7 @@
 //! NameKey and label/name edge cases: truncation, UTF-8 boundaries, empty
 //! strings, and duplicate (label, name) pairs.
 
+use crate::Lookup;
 use twizzler::object::ObjID;
 
 use super::fresh;
@@ -14,9 +15,9 @@ fn long_names_truncate_to_31_bytes() {
     // Stored name is the 31-byte prefix.
     assert_eq!(g.vertex_info(v).unwrap().name, "a".repeat(31));
     // Lookup with the full string hits: the key truncates identically.
-    assert_eq!(g.find_vertex("n", &long), Some(v));
+    assert_eq!(g.find_vertex("n", &long), Lookup::Found(v));
     // ...which means prefix-sharing names collide by design.
-    assert_eq!(g.find_vertex("n", &"a".repeat(35)), Some(v));
+    assert_eq!(g.find_vertex("n", &"a".repeat(35)), Lookup::Found(v));
 }
 
 #[test]
@@ -27,14 +28,14 @@ fn multibyte_char_at_truncation_boundary() {
     let v = g.add_vertex("n", &name, ObjID::new(0)).unwrap();
 
     assert_eq!(g.vertex_info(v).unwrap().name, "");
-    assert_eq!(g.find_vertex("n", &name), Some(v));
+    assert_eq!(g.find_vertex("n", &name), Lookup::Found(v));
 }
 
 #[test]
 fn empty_label_and_name() {
     let mut g = fresh("t-empty");
     let v = g.add_vertex("", "", ObjID::new(0)).unwrap();
-    assert_eq!(g.find_vertex("", ""), Some(v));
+    assert_eq!(g.find_vertex("", ""), Lookup::Found(v));
     let info = g.vertex_info(v).unwrap();
     assert_eq!(info.label, "");
     assert_eq!(info.name, "");
@@ -52,11 +53,11 @@ fn duplicate_label_name_pairs() {
     assert!(g.vertex_info(v2).is_some());
     assert_eq!(g.vertices_by_label("tag").len(), 2);
     // ...but the index resolves to the most recent insert.
-    assert_eq!(g.find_vertex("tag", "x"), Some(v2));
+    assert_eq!(g.find_vertex("tag", "x"), Lookup::Found(v2));
 
     // Deleting the bound one leaves the key unbound (not versioned).
     g.delete_vertex(v2).unwrap();
-    assert_eq!(g.find_vertex("tag", "x"), None);
+    assert_eq!(g.find_vertex("tag", "x"), Lookup::NotFound);
     // The shadowed vertex is still alive and enumerable.
     assert_eq!(g.vertices_by_label("tag"), vec![v1]);
 }

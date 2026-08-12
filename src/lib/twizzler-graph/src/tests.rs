@@ -16,6 +16,8 @@ mod arena_graph;
 mod crud;
 #[cfg(feature = "test-query")]
 mod dsl;
+#[cfg(feature = "test-storage")]
+mod index_strategy;
 #[cfg(feature = "test-core")]
 mod names;
 #[cfg(feature = "test-core")]
@@ -40,5 +42,18 @@ pub(crate) const TEST_ARENA_CAP: usize = 64;
 #[allow(dead_code)]
 pub(crate) fn fresh(name: &str) -> Graph {
     Graph::reset_arena(name, TEST_ARENA_CAP).expect("reset arena graph");
-    Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("create arena graph")
+    let mut g =
+        Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("create arena graph");
+    declare_test_labels(&mut g);
+    g
+}
+
+/// The empty label is deliberate — `names.rs` uses it.
+pub(crate) const TEST_INDEXED_LABELS: &[&str] =
+    &["", "n", "m", "c", "d", "d2", "tag", "file", "hub", "spoke"];
+
+pub(crate) fn declare_test_labels(g: &mut Graph) {
+    for l in TEST_INDEXED_LABELS {
+        g.set_label_indexed(l, true).expect("declare test label");
+    }
 }

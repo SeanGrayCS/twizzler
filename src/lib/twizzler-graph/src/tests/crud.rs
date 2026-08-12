@@ -1,5 +1,6 @@
 //! Create/read/delete semantics, id behavior, and lookup by key.
 
+use crate::Lookup;
 use twizzler::object::ObjID;
 
 use super::fresh;
@@ -18,8 +19,8 @@ fn create_and_vertex_info() {
 fn find_and_by_label() {
     let mut g = fresh("t-find");
     let t = g.add_vertex("tag", "thesis", ObjID::new(0)).unwrap();
-    assert_eq!(g.find_vertex("tag", "thesis"), Some(t));
-    assert_eq!(g.find_vertex("tag", "missing"), None);
+    assert_eq!(g.find_vertex("tag", "thesis"), Lookup::Found(t));
+    assert_eq!(g.find_vertex("tag", "missing"), Lookup::NotFound);
     g.add_vertex("tag", "other", ObjID::new(0)).unwrap();
     assert_eq!(g.vertices_by_label("tag").len(), 2);
     assert_eq!(g.vertices_by_label("file").len(), 0);
@@ -72,6 +73,8 @@ fn delete_edge_hides_it() {
         .is_empty());
 }
 
+/// Reads and deletes with out-of-range ids are safe no-ops, not panics or
+/// errors.
 #[test]
 fn out_of_range_ids_are_none() {
     let mut g = fresh("t-oob");
@@ -84,6 +87,8 @@ fn out_of_range_ids_are_none() {
     g.delete_edge(EdgeId(9999)).unwrap();
 }
 
+/// Double-delete is a no-op, and ids are append indices that are never
+/// reused after a delete (tombstones keep the id space stable).
 #[test]
 fn delete_is_idempotent_and_ids_are_not_reused() {
     let mut g = fresh("t-delid");

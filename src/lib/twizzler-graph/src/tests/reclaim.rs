@@ -11,6 +11,7 @@
 //!   eligible for reclaim in the first place;
 //! - the semantics guarantee, that none of this changes an answer.
 
+use crate::Lookup;
 use twizzler::object::ObjID;
 
 use super::{fresh, TEST_ARENA_CAP};
@@ -115,7 +116,7 @@ fn reclaim_does_not_change_answers() {
 
     // The deleted vertex is invisible in every way.
     assert!(g.vertex_info(spokes[1]).is_none());
-    assert_eq!(g.find_vertex("n", "s1"), None);
+    assert_eq!(g.find_vertex("n", "s1"), Lookup::NotFound);
     assert!(g.out_neighbors(spokes[1], Labels::any()).is_empty());
     assert!(g.in_neighbors(spokes[1], Labels::any()).is_empty());
     assert_eq!(g.get_vertex_prop(spokes[1], "k"), None);
@@ -176,7 +177,7 @@ fn reset_leaves_a_working_empty_graph() {
         Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("reopen after reset");
     assert_eq!(g.root_id(), root, "reset keeps the graph's identity");
     assert!(g.vertices().is_empty());
-    assert_eq!(g.find_vertex("n", "a"), None);
+    assert_eq!(g.find_vertex("n", "a"), Lookup::NotFound);
     // And it is usable again: ids restart from 0.
     let v = g.add_vertex("n", "fresh", ObjID::new(0)).unwrap();
     assert_eq!(v.0, 0);

@@ -1554,6 +1554,11 @@ impl ArenaStore {
         self.with_vertex(vertex, |v| v.name.as_str().to_string())
     }
 
+    /// The stored key itself, not a `String` round-trip.
+    pub fn vertex_name_key(&self, vertex: u64) -> Option<NameKey> {
+        self.with_vertex(vertex, |v| v.name)
+    }
+
     /// Tombstone a vertex, in the record and in the `locs` mirror.
     ///
     /// `GlobalPtr::resolve` maps its object `READ`, while `GlobalPtr::resolve_mut`

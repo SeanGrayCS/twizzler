@@ -3,6 +3,7 @@
 //! Graphs here use a deliberately tiny `ARENA_CAP` so a handful of inserts
 //! crosses an arena boundary; that is the seam most likely to break.
 
+use crate::Lookup;
 use twizzler::object::ObjID;
 
 use crate::{Graph, Labels, PropValue, VertexId};
@@ -17,12 +18,13 @@ const ARENA_CAP: usize = 4;
 fn fresh_arena(tag: &str) -> Graph {
     let name = format!("t-ab-{tag}");
     Graph::reset_arena(&name, ARENA_CAP).expect("reset v4");
-    Graph::open_or_create_arena(&name, ARENA_CAP).expect("open v4")
+    let mut g = Graph::open_or_create_arena(&name, ARENA_CAP).expect("open v4");
+    super::declare_test_labels(&mut g);
+    g
 }
 
-/// A hub with four labelled spokes, plus a chain among the spokes. Returns the
-/// ids so callers can compare across layouts — ids are append indices on both,
-/// so they line up.
+/// A hub with four labelled spokes, plus a chain among the spokes. Returns
+/// the ids for later assertions.
 fn build(g: &mut Graph) -> (VertexId, Vec<VertexId>) {
     let hub = g.add_vertex("hub", "h", ObjID::new(0)).unwrap();
     let mut spokes = Vec::new();
@@ -40,6 +42,7 @@ fn build(g: &mut Graph) -> (VertexId, Vec<VertexId>) {
     (hub, spokes)
 }
 
+/// Every read path returns the expected shape.
 #[test]
 fn arena_read_paths_return_the_expected_shape() {
     let mut g = fresh_arena("reads");
@@ -52,7 +55,7 @@ fn arena_read_paths_return_the_expected_shape() {
     assert_eq!(g.vertices_by_label("hub"), vec![hub]);
     assert!(g.vertices_by_label("nonesuch").is_empty());
 
-    // Per-vertex records, including the target ObjID the arena record absorbed.
+    // Per-vertex records, including the target ObjID carried inline.
     let h = g.vertex_info(hub).expect("hub info");
     assert_eq!((h.label.as_str(), h.name.as_str()), ("hub", "h"));
     assert_eq!(h.target, ObjID::new(0));
@@ -68,12 +71,12 @@ fn arena_read_paths_return_the_expected_shape() {
     }
 
     // Name lookup through the index.
-    assert_eq!(g.find_vertex("hub", "h"), Some(hub));
+    assert_eq!(g.find_vertex("hub", "h"), Lookup::Found(hub));
     for (i, &s) in spokes.iter().enumerate() {
-        assert_eq!(g.find_vertex("spoke", &format!("s{i}")), Some(s));
+        assert_eq!(g.find_vertex("spoke", &format!("s{i}")), Lookup::Found(s));
     }
-    assert_eq!(g.find_vertex("spoke", "missing"), None);
-    assert_eq!(g.find_vertex("nonesuch", "h"), None, "label is part of the key");
+    assert_eq!(g.find_vertex("spoke", "missing"), Lookup::NotFound);
+    assert_eq!(g.find_vertex("nonesuch", "h"), Lookup::NotFound, "label is part of the key");
 
     // Adjacency. The hub points at every spoke; the spokes form a chain.
     assert_eq!(g.out_neighbors(hub, Labels::any()), spokes);
@@ -114,8 +117,8 @@ fn arena_read_paths_return_the_expected_shape() {
     assert!(g.out_neighbors(hub, Labels::these(&["absent"])).is_empty());
 }
 
-/// Properties and tombstones — the paths most likely to break, since the arena
-/// record holds `props_raw` inline where v3 kept it in a registry mirror.
+/// Vertex properties read back, and a deleted vertex vanishes from every
+/// view, including its neighbours' lists.
 #[test]
 fn arena_properties_and_vertex_deletes() {
     let mut g = fresh_arena("mutate");
@@ -136,10 +139,12 @@ fn arena_properties_and_vertex_deletes() {
         "both keys, and no leakage from the other vertex's property object"
     );
 
+    // Delete a spoke: it vanishes from enumeration, lookup, its own adjacency,
+    // and its neighbours' lists.
     g.delete_vertex(spokes[1]).unwrap();
 
     assert!(g.vertex_info(spokes[1]).is_none());
-    assert_eq!(g.find_vertex("spoke", "s1"), None);
+    assert_eq!(g.find_vertex("spoke", "s1"), Lookup::NotFound);
     assert_eq!(
         g.vertices(),
         vec![hub, spokes[0], spokes[2], spokes[3]],
@@ -158,13 +163,16 @@ fn arena_properties_and_vertex_deletes() {
     assert!(g.get_vertex_prop(spokes[1], "age").is_none());
 }
 
-/// Edge deletion — a deleted edge must not yield its neighbour, a wrong answer
-/// visible only after a delete.
+/// A deleted edge must not yield its neighbour. An edge is a record, so a
+/// deleted edge is a tombstoned neighbour and `walk_adj` skips it.
 #[test]
 fn arena_hides_a_deleted_edge() {
     let mut g = fresh_arena("deledge");
     let (hub, spokes) = build(&mut g);
 
+    // `build` creates hub->spokes[0] first. The edge id is captured rather
+    // than assumed: edge ids share the vertex id space, so a literal would
+    // silently name a different record.
     let e0 = g
         .vertex_view(hub)
         .expect("hub view")
@@ -197,8 +205,13 @@ fn arena_hides_a_deleted_edge() {
     assert!(g.vertex_info(spokes[0]).is_some());
 }
 
+/// Bulk deletes through `Graph`, across several arenas with cross-arena
+/// edges: every id reads back consistent with the bookkeeping — deleted ones
+/// absent, the rest present.
 #[test]
 fn arena_survives_bulk_vertex_deletion() {
+    // 18 arenas at ARENA_CAP = 4. The point is crossing arena boundaries, not
+    // size — `gstress` covers scale.
     const N: usize = 70;
     let mut g = fresh_arena("bulkdel");
 
@@ -232,7 +245,7 @@ fn arena_survives_bulk_vertex_deletion() {
         .collect();
     assert_eq!(g.vertices(), expected, "the scan agrees with the bookkeeping");
 
-    // A dead vertex is hidden from its *neighbours'* lists too — the direction
+    // A dead vertex is hidden from its neighbours' lists too — the direction
     // that only breaks after a delete.
     for i in (0..N).step_by(7).take(4) {
         let src = (i + N - 37) % N;
@@ -247,6 +260,9 @@ fn arena_survives_bulk_vertex_deletion() {
     }
 }
 
+/// An arena holds `cap` records, and an edge is a record that consumes a
+/// slot, so arena count is `ceil((V+E)/cap)`. Syncing costs one flush per
+/// arena.
 #[test]
 fn arena_packs_records_including_edges() {
     let name = "t-ab-objects";
@@ -275,6 +291,8 @@ fn arena_packs_records_including_edges() {
         6,
         "an edge is a record and occupies a slot: ceil((12+11)/{ARENA_CAP})"
     );
+    // Objects per entity stay ~1/cap rather than ~1; 47 is what an
+    // object-per-entity layout would spend (3 per vertex plus 1 per edge).
     assert!(
         g.arena_count() * ARENA_CAP >= 23,
         "arenas must cover every record"
@@ -284,6 +302,9 @@ fn arena_packs_records_including_edges() {
         "still far below v3's object-per-entity cost — 6 against 47"
     );
 
+    // The batch costs one sync per arena. Stated against `arena_count()`
+    // rather than a literal: the property is "one per arena", whatever the
+    // count.
     assert_eq!(g.arena_sync_count(), 0, "nothing synced before sync()");
     let arenas = g.arena_count();
     g.sync().unwrap();
@@ -294,19 +315,22 @@ fn arena_packs_records_including_edges() {
     );
 }
 
-/// Ids are append indices and continue without gaps — the invariant that
-/// `bulk_is_refused_on_the_arena_layout` used to guard from the other side.
+/// Ids are append indices and continue without gaps; a deleted id is never
+/// reused.
 #[test]
 fn arena_ids_are_gapless_append_indices() {
     let name = "t-ab-ids";
     Graph::reset_arena(name, ARENA_CAP).expect("reset v4");
     let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
+    // Built directly rather than via `fresh_arena`, so it needs its own
+    // declaration — the default schema indexes nothing until asked.
+    super::declare_test_labels(&mut g);
 
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
     assert_eq!(g.vertices(), vec![a]);
     let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
     assert_eq!(b.0, a.0 + 1, "ids continue without gaps");
-    assert_eq!(g.find_vertex("n", "b"), Some(b));
+    assert_eq!(g.find_vertex("n", "b"), Lookup::Found(b));
 
     // A delete tombstones rather than freeing the id, so the next insert does
     // not reuse it. `gstress` asserts the same property as "vertex id drift".
@@ -315,6 +339,8 @@ fn arena_ids_are_gapless_append_indices() {
     assert_eq!(c.0, b.0 + 1, "a deleted id is never reused");
 }
 
+/// `destroy` frees everything and leaves the name refusing to open, rather
+/// than naming freed objects.
 #[test]
 fn destroy_frees_the_graph_and_refuses_reopen() {
     let name = "t-ab-destroy";
@@ -323,6 +349,9 @@ fn destroy_frees_the_graph_and_refuses_reopen() {
         let mut g = Graph::open_or_create_arena(name, ARENA_CAP).expect("open v4");
         let (hub, spokes) = build(&mut g);
         g.set_vertex_prop(hub, "k", PropValue::I64(1)).unwrap();
+        // Capture the edge id rather than writing `EdgeId(0)`: edges share
+        // the vertex id space, so the literal keeps compiling and names a
+        // different record.
         let e0 = g
             .vertex_view(hub)
             .expect("hub view")
@@ -363,6 +392,7 @@ fn destroy_frees_the_graph_and_refuses_reopen() {
     assert!(g.vertices().is_empty());
 }
 
+/// Repeated create/destroy cycles do not accumulate objects within a boot.
 #[test]
 fn destroy_cycles_do_not_accumulate() {
     let name = "t-ab-cycle";
@@ -386,11 +416,9 @@ fn destroy_cycles_do_not_accumulate() {
     assert!(freed_each[0] > 0);
 }
 
-/// Asserting it now means a v5 regression is attributable to v5. Asserting it
-/// afterwards would only tell us the property is absent, not when it went.
-///
-/// The counter is the whole point: "does not resolve the record" is otherwise a
-/// claim about mechanism that passes by inspection.
+/// A vertex scan reads the liveness mirror and resolves no record. The
+/// counter makes that falsifiable; the label scan is the control showing the
+/// counter fires at all.
 #[test]
 fn scanning_vertices_does_not_touch_any_record() {
     let mut g = fresh_arena("scan-cost");
@@ -412,11 +440,9 @@ fn scanning_vertices_does_not_touch_any_record() {
     );
     assert_eq!(live.len(), 4, "hub plus three surviving spokes");
 
-    // Control. `vertices_by_label` filters on the label, which the mirror
-    // does not carry, so it resolves every record — `vertex_label` goes through
-    // `with_vertex`. Without this arm a zero above would be unfalsifiable: it
-    // would look identical whether the scan avoids records or the counter is
-    // simply never incremented.
+    // Control: `vertices_by_label` filters on the label, which the mirror does
+    // not carry, so it resolves every record. Without this arm a zero above
+    // could equally mean the counter never increments.
     //
     // The label must be one `build` actually interned ("spoke", not "n"):
     // `vertices_by_label` returns early on an unknown label without reaching
@@ -432,35 +458,8 @@ fn scanning_vertices_does_not_touch_any_record() {
     );
 }
 
-/// What a build must do with a predecessor format it cannot walk.
-///
-/// This test has inverted once already, and the inversion is the lesson.
-///
-/// It was written when format 7 *was* reclaimable — 7 → 8 moved only a trailing
-/// `GraphRoot` field, leaving every object exactly where the walker expected —
-/// and it existed because that bump had silently turned reclaim into a leak:
-/// the inventory arm matched `VERSION_ARENA` by name, so changing the constant
-/// stopped it matching, with no error.
-///
-/// Format 9 moved the *record* layout, and the inventory walk reads records.
-/// So 7 stopped being walkable and the correct answer flipped from "free it" to
-/// "refuse". The rule was never about which versions are in the set — it is
-/// that a build must never guess. Three outcomes are acceptable in principle
-/// and only two are acceptable in practice:
-///
-/// - free it, when the object graph is genuinely walkable;
-/// - refuse loudly, when it is not;
-/// - and never `Ok(0)`, which reads as "there was nothing to free" and is how
-///   the original regression hid.
-///
-/// The complement matters as much: `reset` must still succeed, or the name is
-/// stranded forever. `data/` entries cannot be unbound on this build, so a
-/// format the engine can neither open nor reset is a permanently burned name,
-/// in this boot and every future one.
-///
-/// The graph is built normally and then *downgraded* by rewriting its root's
-/// version, which is the only way to obtain a previous-format graph from a
-/// build that can no longer write one.
+/// An unwalkable predecessor format: `open` refuses, `destroy` refuses loudly
+/// rather than returning `Ok(0)`, and `reset` still recovers the name.
 #[test]
 fn an_unwalkable_predecessor_is_refused_loudly_and_stays_recoverable() {
     use naming::{static_naming_factory, GetFlags};
@@ -503,12 +502,10 @@ fn an_unwalkable_predecessor_is_refused_loudly_and_stays_recoverable() {
         "a previous format must not open"
     );
 
-    // `destroy` must refuse *loudly*, not return Ok(0). Format 9 moved the
-    // record layout and the inventory walk reads records, so walking a format-7
-    // graph would free ids read at the wrong offsets — mis-freeing, which is
-    // strictly worse than leaking. But a silent `Ok(0)` would be worse still:
-    // indistinguishable from "there was nothing to free", which is how the
-    // 7 → 8 bump turned into a leak nobody noticed.
+    // `destroy` must refuse loudly, not return Ok(0). The inventory walk reads
+    // records, so walking a previous-format graph would free ids read at the
+    // wrong offsets — mis-freeing, worse than leaking. And a silent Ok(0) is
+    // indistinguishable from "there was nothing to free".
     match Graph::destroy(name) {
         Err(crate::GraphError::StaleVersion { found, expected }) => {
             assert_eq!(found, VERSION_ARENA_NOCAP);
@@ -518,14 +515,18 @@ fn an_unwalkable_predecessor_is_refused_loudly_and_stays_recoverable() {
         Err(e) => panic!("expected StaleVersion, got {e:?}"),
     }
 
+    // And the name must stay recoverable. `data/` names cannot be unbound on
+    // this build, so if `reset` refused as well the name would be stranded in
+    // every future boot. `reset` therefore succeeds and leaks the outgoing
+    // graph — a deliberate asymmetry.
     Graph::reset_arena(name, ARENA_CAP).expect("reset must recover the name");
     let g = Graph::open_or_create_arena(name, ARENA_CAP).expect("reopen after reset");
     assert!(g.vertices().is_empty(), "rebuilt empty and usable");
 }
 
-/// The load-bearing assertion is about where new records go, not where old
-/// ones are. Existing records never move regardless, so an implementation that
-/// persisted nothing would still pass a test that only re-read old placement.
+/// `arena_cap` is persisted: a reopen that supplies none places new records
+/// by the stored cap, not `DEFAULT_ARENA_CAP`. The load-bearing assertion is
+/// where new records go — existing records never move regardless.
 #[test]
 fn arena_cap_survives_a_reopen_that_does_not_supply_one() {
     let name = "t-ab-cap-persist";
@@ -552,9 +553,8 @@ fn arena_cap_survives_a_reopen_that_does_not_supply_one() {
     );
 
     // The third arena holds 2 of 4. Four more inserts must fill it and then
-    // roll into a fourth. Under the defect the store reopens at
-    // DEFAULT_ARENA_CAP (16384), so all four land in arena 2 and the count
-    // stays at 3 — which is exactly the silent relayout being pinned here.
+    // roll into a fourth; a store that reopened at DEFAULT_ARENA_CAP would
+    // land all four in arena 2 and stay at 3.
     for i in 10..14 {
         g.add_vertex("n", &format!("w{i}"), ObjID::new(0))
             .expect("add after reopen");
@@ -571,6 +571,8 @@ fn arena_cap_survives_a_reopen_that_does_not_supply_one() {
     );
 }
 
+/// A graph reopened by name comes back with its contents intact, and survives
+/// dropping every handle within one boot.
 #[test]
 fn graph_reopens_by_name_with_contents_intact() {
     let name = "t-ab-reopen";
@@ -583,6 +585,8 @@ fn graph_reopens_by_name_with_contents_intact() {
         (hub, spokes)
     };
 
+    // Re-opened through the plain constructor rather than the one this graph
+    // was built with; existing contents must be unaffected.
     let g = Graph::open_or_create(name).expect("reopen by name");
     assert_eq!(g.vertex_info(ids.0).unwrap().name, "h");
     assert_eq!(g.out_neighbors(ids.0, Labels::any()).len(), 4);
@@ -590,8 +594,9 @@ fn graph_reopens_by_name_with_contents_intact() {
     assert_eq!(g.in_neighbors(ids.1[3], Labels::any()).len(), 2);
 }
 
-/// The contrast is the test. Either assertion alone is worthless — zero could
-/// mean "free" or "counter never incremented", and non-zero could mean anything.
+/// Inline traversal properties cost nothing beyond the record; data
+/// properties cost a block dereference. The counter pair makes the contrast
+/// checkable: either assertion alone could pass vacuously.
 #[test]
 fn inline_properties_are_free_and_data_properties_are_not() {
     let name = "t-ab-propcost";
