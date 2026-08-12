@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// `delete_all` is live at `Graph::destroy` and `Graph::reset_inner_fmt`.
 
 //! Reclaim is best-effort by design. A delete that fails (the object is
 //! already gone, or the kernel refuses it) must not fail the teardown that
