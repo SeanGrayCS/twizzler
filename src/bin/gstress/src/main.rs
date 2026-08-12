@@ -24,6 +24,7 @@ const GRAPH: &str = "gstress";
 pub(crate) const HARNESS_REV: &str = "2026-08-04f";
 
 mod index_probe;
+mod reclaim_probe;
 mod indradb_mode;
 mod props_probe;
 mod residency;
@@ -396,6 +397,21 @@ fn main() {
             .unwrap_or(20_000);
         let arm = std::env::args().nth(3).unwrap_or_else(|| "graph".into());
         index_probe::run(n, &arm);
+        return;
+    }
+
+    if arg1.as_deref() == Some("reclaim") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let nums: Vec<usize> = rest.iter().filter_map(|s| s.parse().ok()).collect();
+        let n = nums.first().copied().unwrap_or(100_000);
+        let cycles = nums.get(1).copied().unwrap_or(12);
+        // `keep` is the control arm, not a variant: see reclaim_probe.rs.
+        let keep = rest.iter().any(|s| s == "keep");
+        let cap = rest
+            .iter()
+            .find_map(|s| s.strip_prefix("cap:").and_then(|v| v.parse().ok()))
+            .unwrap_or(256);
+        reclaim_probe::run(n, cycles, keep, cap);
         return;
     }
 
