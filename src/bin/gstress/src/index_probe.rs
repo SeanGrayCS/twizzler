@@ -1,40 +1,40 @@
-//! Findings so far, each from an arm below:
-//!
-//! - The index was 99.5% of a vertex insert (5.35 ms vs 26 µs), because
-//!   `PersistentHashMap::insert` opens a transaction per call. `bulk` holds one
-//!   open: 115× faster.
-//! - `DEFAULT_SEG_CAP` was 64× too small for 16-byte `VertexLoc` records:
-//!   733 registry objects at 3 M records against 184 arenas. Raising it gave
-//!   2.5×, removed the throughput decay, and cleared a memory ceiling.
-//! - Sync runs at 2–4 MB/s, ≈1.5 ms per 4 KB page, consistent across syncs
-//!   from 4 MB to 196 MB. Insertion dirties pages ~2–5× faster than writeback
-//!   retires them, which is what `overflowing pager queue, waiting...` is.
-//!
-//! The open question these last two arms settle. A 3 M-record load exhausted
-//! memory. Two very different causes fit:
-//!
-//! They need opposite work, so guessing is expensive.
+//! Index probe: what limits a large load — insertion, the index, memory
+//! residency, or writeback?
 //!
 //!   gstress index [N]                # Graph::add_vertex — record + index
 //!   gstress index [N] noindex        # record only, sync at end (baseline)
 //!   gstress index [N] bulk           # record + batched index
+//!   gstress index [N] rebuild        # lazy rebuild cost, RebuildSource::Scan
+//!   gstress index [N] rebuild:roots  # same, RebuildSource::Roots — the pair is
+//!                                    # the measurement; either alone is not
 //!   gstress index [N] sync:K         # record only, sync every K records
 //!   gstress index [N] throttle:K     # record only, pause every K records
 //!
-//! Reading the result. `throttle` slows insertion without changing when
-//! pages are written, so it isolates *rate*. `sync:K` bounds how much dirty
-//! state can accumulate, so it isolates *backlog depth*.
+//! Reading the result: `throttle` slows insertion without changing when pages
+//! are written, so it isolates rate. `sync:K` bounds how much dirty state can
+//! accumulate, so it isolates backlog depth.
 //!
-//! `sync:K` also directly evaluates the write-behind design: sync each chunk as
-//! the next is built, rather than one sync at the end. It should not change
-//! *total* bytes written — the per-page cost is the same — but it bounds peak
-//! dirty state, and the per-chunk timings below show whether sync cost stays
-//! flat (clean arenas are free to re-sync) or grows.
+//! - `throttle` completes, `noindex` does not → backlog; pacing is the fix.
+//! - `sync:K` completes, `throttle` does not → it is specifically unsynced
+//!   pages, not rate; incremental sync is the fix and throttling is not.
+//! - neither completes → residency, not writeback.
+//! - both complete → either works; prefer `sync:K`, which costs no wall time
+//!   that the final sync would not have cost anyway.
+//!
+//! `sync:K` also evaluates write-behind — sync each chunk as the next is
+//! built, rather than one sync at the end. It should not change total bytes
+//! written, but it bounds peak dirty state, and the per-chunk timings show
+//! whether sync cost stays flat (clean arenas are free to re-sync) or grows.
+//!
+//! Run each arm in its own boot — ordering within a boot skews throughput.
 
 use std::time::{Duration, Instant};
 
 use twizzler::object::ObjID;
-use twizzler_graph::{ArenaStore, FillTo, Graph, DEFAULT_ARENA_CAP, DEFAULT_SEG_CAP};
+use twizzler_graph::{
+    ArenaStore, FillTo, Graph, IndexSchema, IndexStrategy, RebuildSource, DEFAULT_ARENA_CAP,
+    DEFAULT_SEG_CAP,
+};
 
 const NAME: &str = "gindex";
 
@@ -70,6 +70,8 @@ pub(crate) fn run(n: usize, arm: &str) {
             g.bulk_insert(|b| {
                 for i in 0..n {
                     b.add_vertex("n", &format!("v{i}"), ObjID::new(0))?;
+                    // Without a heartbeat a slow run and a hung one look
+                    // identical at this scale.
                     heartbeat(i + 1, n, &t);
                 }
                 Ok(())
@@ -77,6 +79,115 @@ pub(crate) fn run(n: usize, arm: &str) {
             .expect("bulk_insert");
             report("bulk (record + batched index)", n, &t, g.arena_count());
             sync_and_report(|| g.sync().expect("sync"));
+        }
+        // What a lazy rebuild costs: load, sync, reopen in the same boot, then
+        // time the first lookup (which pays for the rebuild) against the
+        // second (which must not).
+        //
+        // Same-boot reopen, so this is a lower bound. The arenas are still
+        // resident, so it measures the walk — reading every record's label and
+        // name — and not the fault-in a cold reopen would pay.
+        a if a.starts_with("rebuild") => {
+            // `rebuild[:roots][:RATIO]` — RATIO indexes one record in every
+            // RATIO, the rest under an undeclared label.
+            //
+            // RATIO is the variable. At 1 every record is indexed and both
+            // sources read all N records, so the arms cannot meaningfully
+            // differ. The case `Roots` exists for is a small indexed fraction:
+            // there `Scan` still walks every record (`vertices_by_label`
+            // filters all of `locs`) while `Roots` reads only the roots list.
+            // Run the pair at the ratio you actually care about.
+            let parts: Vec<&str> = a.split(':').collect();
+            let source = if parts.contains(&"roots") {
+                RebuildSource::Roots
+            } else {
+                RebuildSource::Scan
+            };
+            let ratio = parts
+                .iter()
+                .find_map(|p| p.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let schema = IndexSchema::new(IndexStrategy::LazyLabel).rebuild(source);
+            println!(
+                "GSTRESS REBUILD: source={source:?} ratio=1:{ratio} \
+                 ({} of {n} records indexed)",
+                n.div_ceil(ratio)
+            );
+            Graph::reset_arena_with_index(NAME, DEFAULT_ARENA_CAP, schema).expect("reset");
+            let mut g = Graph::open_or_create_arena_with_index(NAME, DEFAULT_ARENA_CAP, schema)
+                .expect("open");
+            g.set_label_indexed("n", true).expect("declare");
+            println!("GSTRESS SETUP: {:.2}s (excluded)", t.elapsed().as_secs_f64());
+
+            let t = Instant::now();
+            g.bulk_insert(|b| {
+                for i in 0..n {
+                    // Only `n` is declared; `c` records are the unindexed bulk.
+                    if i % ratio == 0 {
+                        b.add_vertex("n", &format!("v{i}"), ObjID::new(0))?;
+                    } else {
+                        b.add_vertex("c", &format!("c{i}"), ObjID::new(0))?;
+                    }
+                    heartbeat(i + 1, n, &t);
+                }
+                Ok(())
+            })
+            .expect("bulk_insert");
+            report("rebuild (load phase)", n, &t, g.arena_count());
+            assert_eq!(
+                g.index_builds(),
+                0,
+                "A8-AC4: a load that never looks up must not build the index"
+            );
+            sync_and_report(|| g.sync().expect("sync"));
+            drop(g);
+
+            let t = Instant::now();
+            let g = Graph::open_or_create_arena(NAME, DEFAULT_ARENA_CAP).expect("reopen");
+            let open_s = t.elapsed().as_secs_f64();
+
+            // The first lookup pays for the build; the second must not.
+            let t = Instant::now();
+            let first = g.find_vertex("n", "v0");
+            let cold_s = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            // Round to an indexed id, or at ratio>1 this looks up a record that
+            // was never indexed and reports NotFound for the wrong reason.
+            let mid = (n / 2) / ratio * ratio;
+            let second = g.find_vertex("n", &format!("v{mid}"));
+            let warm_s = t.elapsed().as_secs_f64();
+
+            println!(
+                "GSTRESS REBUILD: source={source:?} | reopen {open_s:.2}s | \
+                 first lookup {cold_s:.2}s (builds={}) | second {warm_s:.4}s | \
+                 {:.0} rec/s rebuilt | roots tracked {}",
+                g.index_builds(),
+                n as f64 / cold_s.max(1e-9),
+                g.indexed_root_count()
+            );
+            println!(
+                "GSTRESS REBUILD: first={first:?} second={second:?} — both must \
+                 be Found, or the rebuild is not reconstructing what the load wrote"
+            );
+            println!(
+                "GSTRESS REBUILD: **lower bound** — same-boot reopen, arenas \
+                 still resident, so this is the walk cost without the cold \
+                 fault-in. Compare against the 127 s the persistent index cost \
+                 per sync, not against zero."
+            );
+
+            // Teardown is timed separately: it is the only way to tell
+            // "dropping the graph is slow" from "the process will not exit".
+            // A rebuild materialises a large in-heap map on top of the
+            // resident arenas, so teardown under that pressure can be slow.
+            let t = Instant::now();
+            drop(g);
+            println!(
+                "GSTRESS REBUILD teardown: dropped graph in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+            println!("GSTRESS REBUILD DONE — anything after this is process exit, not the probe");
         }
         "graph" | "" => {
             Graph::reset_arena(NAME, DEFAULT_ARENA_CAP).expect("reset");
@@ -105,6 +216,8 @@ pub(crate) fn run(n: usize, arm: &str) {
 /// The record-only arms: `noindex`, `sync:K`, `throttle:K`.
 fn records_only(n: usize, arm: &str, p: Pacing) {
     let t = Instant::now();
+    // `DEFAULT_SEG_CAP`, not a literal: a probe that hardcodes the constant
+    // it measures is not a probe.
     let mut s = ArenaStore::create(
         Box::new(FillTo {
             cap: DEFAULT_ARENA_CAP,
