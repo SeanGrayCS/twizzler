@@ -18,7 +18,6 @@ pub enum GraphError {
     StaleVersion { found: u32, expected: u32 },
     UnknownIndexSchema { bits: u32 },
     IndexingDisabled,
-    RebuildSourceUnimplemented,
 }
 
 impl From<TwzError> for GraphError {
@@ -36,12 +35,6 @@ impl fmt::Display for GraphError {
                 "unknown index schema bits {bits:#x}: this graph was written by a \
                  newer engine, and guessing a policy would answer name lookups \
                  wrongly rather than not at all"
-            ),
-            GraphError::RebuildSourceUnimplemented => write!(
-                f,
-                "index rebuild source `Roots` is not implemented yet; use `Scan` \
-                 (it is refused rather than downgraded so a measurement cannot \
-                 silently describe the wrong strategy)"
             ),
             GraphError::IndexingDisabled => write!(
                 f,

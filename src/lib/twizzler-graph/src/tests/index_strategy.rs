@@ -132,13 +132,46 @@ fn unindexed_lookup_reports_not_indexed_not_not_found() {
 }
 
 #[test]
-fn unimplemented_rebuild_source_is_refused() {
-    let r = Graph::reset_arena_with_index(
-        "t-a8-roots-refused",
-        DEFAULT_ARENA_CAP,
+fn roots_list_covers_only_indexed_records() {
+    let mut g = fresh_with(
+        "t-a8-roots-scope",
         IndexSchema::new(IndexStrategy::LazyLabel).rebuild(RebuildSource::Roots),
     );
-    assert!(matches!(r, Err(GraphError::RebuildSourceUnimplemented)));
+    g.set_label_indexed("person", true).expect("declare");
+    for i in 0..8 {
+        g.add_vertex("person", &format!("p{i}"), ObjID::new(0))
+            .expect("add");
+        // Ten unindexed records per indexed one: the ratio that makes the
+        // difference at SF0.1 (~1.5 k Person among ~2 M records).
+        for j in 0..10 {
+            g.add_vertex("comment", &format!("c{i}_{j}"), ObjID::new(0))
+                .expect("add");
+        }
+    }
+    assert_eq!(
+        g.indexed_root_count(),
+        8,
+        "the roots list must track indexed records only, not all 88"
+    );
+}
+
+#[test]
+fn roots_rebuild_skips_deleted_roots() {
+    let name = "t-a8-roots-dead";
+    {
+        let mut g = fresh_with(
+            name,
+            IndexSchema::new(IndexStrategy::LazyLabel).rebuild(RebuildSource::Roots),
+        );
+        g.set_label_indexed("n", true).expect("declare");
+        let doomed = g.add_vertex("n", "doomed", ObjID::new(0)).expect("add");
+        g.add_vertex("n", "kept", ObjID::new(0)).expect("add");
+        g.delete_vertex(doomed).expect("delete");
+        g.sync().expect("sync");
+    }
+    let g = Graph::open_or_create_arena(name, DEFAULT_ARENA_CAP).expect("reopen");
+    assert_eq!(g.find_vertex("n", "doomed"), Lookup::NotFound);
+    assert!(g.find_vertex("n", "kept").found().is_some());
 }
 
 #[test]
@@ -173,7 +206,6 @@ fn scans_are_counted() {
 }
 
 #[test]
-#[ignore = "A8-AC11: RebuildSource::Roots not implemented; gated on the AC8 measurement"]
 fn roots_rebuild_matches_scan_rebuild() {
     for (name, source) in [
         ("t-a8-rb-scan", RebuildSource::Scan),

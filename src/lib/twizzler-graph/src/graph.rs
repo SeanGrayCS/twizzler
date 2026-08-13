@@ -72,7 +72,7 @@ pub(crate) const VERSION: u32 = 5;
 /// Reading a format-8 graph with this build would interpret padding as a
 /// generation, mismatch every adjacency entry, and silently return a graph with
 /// no edges. Clear the disk image.
-pub(crate) const VERSION_ARENA: u32 = 13;
+pub(crate) const VERSION_ARENA: u32 = 14;
 
 /// No longer reclaimable as of format 9. It was, while 8 differed from 7
 /// only in a trailing root field; format 9 moved the *record* layout, and the
@@ -157,6 +157,7 @@ pub(crate) struct GraphRoot {
     pub(crate) arena_cap: u32,
     pub(crate) index_bits: u32,
     pub(crate) index_labels_raw: u128,
+    pub(crate) index_roots_raw: u128,
 }
 unsafe impl Invariant for GraphRoot {}
 impl BaseType for GraphRoot {}
@@ -183,6 +184,20 @@ pub(crate) struct IndexedLabel {
     pub(crate) indexed: u32,
 }
 unsafe impl Invariant for IndexedLabel {}
+
+/// Append-only, and not authoritative for liveness. A deleted record's id
+/// stays here; the rebuild checks `locs` and skips it. So the list is bounded by
+/// indexed records *ever created*, not live ones — accepted at 16 B per indexed
+/// record, and recorded rather than solved. Compaction belongs with the
+/// generational-id work already deferred for `locs`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct RootEntry {
+    pub(crate) id: u64,
+    pub(crate) label: u32,
+    pub(crate) _pad: u32,
+}
+unsafe impl Invariant for RootEntry {}
 unsafe impl Invariant for LabelEntry {}
 
 /// Key for the vertex index: a (label id, name) pair.
@@ -204,6 +219,7 @@ pub struct Graph {
     schema: IndexSchema,
     /// The append-only record of which labels are indexed.
     index_labels: SegVec<IndexedLabel>,
+    index_roots: SegVec<RootEntry>,
     /// `index_labels` folded to its current state. Derived, never authoritative
     /// — the log on disk is.
     indexed_set: RefCell<HashSet<u32>>,
@@ -285,7 +301,6 @@ impl Graph {
         arena_cap: usize,
         schema: IndexSchema,
     ) -> Result<Graph> {
-        Self::validate_schema(schema)?;
         if cap == 0 || cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
@@ -298,7 +313,16 @@ impl Graph {
         if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
             let root =
                 Object::<GraphRoot>::map(node.id.into(), MapFlags::READ | MapFlags::PERSIST)?;
-            let (magic, version, seg_cap, labels_raw, vindex_raw, index_bits, index_labels_raw) = {
+            let (
+                magic,
+                version,
+                seg_cap,
+                labels_raw,
+                vindex_raw,
+                index_bits,
+                index_labels_raw,
+                index_roots_raw,
+            ) = {
                 let r = root.base();
                 (
                     r.magic,
@@ -308,6 +332,7 @@ impl Graph {
                     r.vindex_raw,
                     r.index_bits,
                     r.index_labels_raw,
+                    r.index_roots_raw,
                 )
             };
             if magic == MAGIC && version_supported(version) {
@@ -315,8 +340,7 @@ impl Graph {
                 let cap = seg_cap as usize;
                 let schema = IndexSchema::from_bits(index_bits)
                     .ok_or(GraphError::UnknownIndexSchema { bits: index_bits })?;
-                Self::validate_schema(schema)?;
-                // Only the persistent strategy has an object to map. Mapping
+                        // Only the persistent strategy has an object to map. Mapping
                 // `ObjID::new(0)` under the others would fault.
                 let vindex = if schema.strategy == IndexStrategy::Persistent {
                     let vbacking: Object<PersistentHashMapBase<VKey, u64>> =
@@ -326,6 +350,7 @@ impl Graph {
                     None
                 };
                 let index_labels = SegVec::<IndexedLabel>::open(index_labels_raw, cap)?;
+                let index_roots = SegVec::<RootEntry>::open(index_roots_raw, cap)?;
                 let indexed_set = Self::fold_indexed(&index_labels);
                 // `version_supported` above already rejected anything but
                 // VERSION_ARENA, so there is exactly one layout to open.
@@ -353,6 +378,7 @@ impl Graph {
                     labels: SegVec::open(labels_raw, cap)?,
                     schema,
                     index_labels,
+                    index_roots,
                     indexed_set: RefCell::new(indexed_set),
                     vindex,
                     volatile: RefCell::new(VolatileIndex::default()),
@@ -370,6 +396,7 @@ impl Graph {
 
         let labels = SegVec::create(cap)?;
         let index_labels = SegVec::<IndexedLabel>::create(cap)?;
+        let index_roots = SegVec::<RootEntry>::create(cap)?;
         let vindex = if schema.strategy == IndexStrategy::Persistent {
             Some(VIndex::new_persist()?)
         } else {
@@ -388,6 +415,7 @@ impl Graph {
                 vindex_raw: vindex.as_ref().map_or(0, |v| v.object().id().raw()),
                 index_bits: schema.to_bits(),
                 index_labels_raw: index_labels.dir_raw(),
+                index_roots_raw: index_roots.dir_raw(),
                 arena_dir_raw,
                 arena_locs_raw,
                 arena_cap: arena_cap as u32,
@@ -401,6 +429,7 @@ impl Graph {
             labels,
             schema,
             index_labels,
+            index_roots,
             indexed_set: RefCell::new(HashSet::new()),
             vindex,
             volatile: RefCell::new(VolatileIndex::default()),
@@ -459,7 +488,6 @@ impl Graph {
         arena_cap: usize,
         schema: IndexSchema,
     ) -> Result<()> {
-        Self::validate_schema(schema)?;
         if arena_cap == 0 || arena_cap > u32::MAX as usize {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
         }
@@ -490,7 +518,7 @@ impl Graph {
             return Ok(0); // nothing registered
         };
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
-        let (is_graph, version, cap, l, x, ad, al, il) = {
+        let (is_graph, version, cap, l, x, ad, al, il, ir) = {
             let r = root.base();
             (
                 r.magic == MAGIC,
@@ -501,6 +529,7 @@ impl Graph {
                 r.arena_dir_raw,
                 r.arena_locs_raw,
                 r.index_labels_raw,
+                r.index_roots_raw,
             )
         };
         if !is_graph {
@@ -544,6 +573,9 @@ impl Graph {
             if let Ok(sv) = SegVec::<IndexedLabel>::open(il, cap) {
                 ids.extend(sv.object_ids());
             }
+            if let Ok(sv) = SegVec::<RootEntry>::open(ir, cap) {
+                ids.extend(sv.object_ids());
+            }
             if x != 0 {
                 ids.push(x);
             }
@@ -565,6 +597,7 @@ impl Graph {
             b.arena_locs_raw = 0;
             b.arena_cap = 0;
             b.index_labels_raw = 0;
+            b.index_roots_raw = 0;
             Ok(())
         })?;
 
@@ -669,6 +702,7 @@ impl Graph {
         // Fresh, empty registries.
         let labels = SegVec::<LabelEntry>::create(cap)?;
         let index_labels = SegVec::<IndexedLabel>::create(cap)?;
+        let index_roots = SegVec::<RootEntry>::create(cap)?;
         let vindex = if schema.strategy == IndexStrategy::Persistent {
             Some(VIndex::new_persist()?)
         } else {
@@ -695,6 +729,7 @@ impl Graph {
             b.arena_cap = arena_cap as u32;
             b.index_bits = schema.to_bits();
             b.index_labels_raw = index_labels.dir_raw();
+            b.index_roots_raw = index_roots.dir_raw();
             Ok(())
         })?;
 
@@ -792,17 +827,21 @@ impl Graph {
                 self.volatile
                     .borrow_mut()
                     .insert_if_built(lbl, NameKey::new(name), id);
+                if self.schema.rebuild == RebuildSource::Roots {
+                    self.index_roots.push_nosync(RootEntry {
+                        id,
+                        label: lbl,
+                        _pad: 0,
+                    })?;
+                }
             }
             IndexStrategy::None => {}
         }
         Ok(())
     }
 
-    fn validate_schema(schema: IndexSchema) -> Result<()> {
-        if schema.rebuild == RebuildSource::Roots {
-            return Err(GraphError::RebuildSourceUnimplemented);
-        }
-        Ok(())
+    pub fn indexed_root_count(&self) -> usize {
+        self.index_roots.len()
     }
 
     pub fn index_strategy(&self) -> IndexStrategy {
@@ -993,12 +1032,25 @@ impl Graph {
                     }
                 }
             }
-            // Unreachable: `validate_schema` refuses `Roots` at open/create, so
-            // a graph configured this way never gets far enough to rebuild.
-            // Deliberately not falling through to `Scan` — quietly running a
-            // different strategy than the schema asks for is how a measurement
-            // ends up describing something other than what it claims.
-            RebuildSource::Roots => unreachable!("Roots is refused by validate_schema"),
+            RebuildSource::Roots => {
+                for i in 0..self.index_roots.len() {
+                    let Some(e) = self.index_roots.get_ref(i).map(|r| *r) else {
+                        continue;
+                    };
+                    if !indexed.contains(&e.label) {
+                        // The label was un-declared since the entry was written.
+                        continue;
+                    }
+                    // The list is append-only and keeps ids of deleted records,
+                    // so `locs` — which is authoritative for liveness — decides.
+                    if !self.is_vertex_alive(VertexId(e.id)) {
+                        continue;
+                    }
+                    if let Some(k) = self.store.vertex_name_key(e.id) {
+                        map.insert((e.label, k), e.id);
+                    }
+                }
+            }
         }
         self.volatile.borrow_mut().install(map);
     }
@@ -1152,6 +1204,7 @@ impl Graph {
         // `verts` is vestigial on v4 but still allocated, and still freed.
         ids.extend(self.labels.object_ids());
         ids.extend(self.index_labels.object_ids());
+        ids.extend(self.index_roots.object_ids());
         ids.extend(self.index_object_ids());
         ids
     }
@@ -1269,6 +1322,8 @@ impl Graph {
     pub fn sync(&mut self) -> Result<()> {
         self.store.sync_all()?;
         self.labels.flush()?;
+        self.index_roots.flush()?;
+        self.index_labels.flush()?;
         Ok(())
     }
 
@@ -1399,6 +1454,7 @@ impl Graph {
             schema,
             indexed_set,
             volatile,
+            index_roots,
             ..
         } = self;
         // Only the persistent strategy has a transaction to open. Under the
@@ -1416,6 +1472,7 @@ impl Graph {
             schema: *schema,
             indexed: indexed_set,
             volatile,
+            roots: index_roots,
         };
         f(&mut b)
     }
@@ -1431,6 +1488,7 @@ pub struct BulkInsert<'a> {
     schema: IndexSchema,
     indexed: &'a RefCell<HashSet<u32>>,
     volatile: &'a RefCell<VolatileIndex>,
+    roots: &'a mut SegVec<RootEntry>,
 }
 
 impl BulkInsert<'_> {
@@ -1460,6 +1518,18 @@ impl BulkInsert<'_> {
                         .insert_if_built(lbl, NameKey::new(name), id);
                 }
                 (None, _) => {}
+            }
+            if self.schema.strategy == IndexStrategy::LazyLabel
+                && self.schema.rebuild == RebuildSource::Roots
+            {
+                // `push_nosync` for the same reason as `Graph::index_on_insert`
+                // — and this is the path that matters most, since `bulk_insert`
+                // *is* the load path.
+                self.roots.push_nosync(RootEntry {
+                    id,
+                    label: lbl,
+                    _pad: 0,
+                })?;
             }
         }
         Ok(VertexId(id))
