@@ -32,5 +32,7 @@ pub use props::PropValue;
 pub use arena_store::{ArenaStat, ArenaStore, FillTo, OnePerArena, Placement};
 pub use name::NameKey;
 pub use record::RecordId;
-pub use traversal::{EdgeTraversal, TraversalSource, VertexTraversal};
+pub use traversal::{
+    EdgeTraversal, Repeat, StrictRepeat, TraversalSource, VertexTraversal, DEFAULT_MAX_DEPTH,
+};
 pub use vertex::{Labels, VertexHandle, VertexId, VertexInfo, VertexView};

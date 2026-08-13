@@ -18,6 +18,7 @@ pub enum GraphError {
     StaleVersion { found: u32, expected: u32 },
     UnknownIndexSchema { bits: u32 },
     IndexingDisabled,
+    WalkTruncated,
 }
 
 impl From<TwzError> for GraphError {
@@ -35,6 +36,12 @@ impl fmt::Display for GraphError {
                 "unknown index schema bits {bits:#x}: this graph was written by a \
                  newer engine, and guessing a policy would answer name lookups \
                  wrongly rather than not at all"
+            ),
+            GraphError::WalkTruncated => write!(
+                f,
+                "recursive traversal stopped at its depth cap: the result is \
+                 truncated, not complete (use `max_depth` and check \
+                 `hit_depth_cap()` to accept a partial answer)"
             ),
             GraphError::IndexingDisabled => write!(
                 f,

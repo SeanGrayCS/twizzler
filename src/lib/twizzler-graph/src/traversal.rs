@@ -32,6 +32,7 @@
 
 use std::collections::HashSet;
 
+use crate::error::{GraphError, Result};
 use crate::{EdgeId, Graph, Labels, PropValue, VertexId, VertexInfo};
 
 impl Graph {
@@ -63,6 +64,7 @@ impl<'a> TraversalSource<'a> {
             graph: self.graph,
             current,
             paths,
+            truncated: false,
         }
     }
     /// Start from every vertex with the given label.
@@ -73,6 +75,7 @@ impl<'a> TraversalSource<'a> {
             graph: self.graph,
             current,
             paths,
+            truncated: false,
         }
     }
     /// Start from one vertex (empty if it is deleted).
@@ -87,6 +90,7 @@ impl<'a> TraversalSource<'a> {
             graph: self.graph,
             current,
             paths,
+            truncated: false,
         }
     }
     /// Start from a set of vertices (deleted ones are dropped).
@@ -101,6 +105,7 @@ impl<'a> TraversalSource<'a> {
             graph: self.graph,
             current,
             paths,
+            truncated: false,
         }
     }
 }
@@ -110,6 +115,12 @@ pub struct VertexTraversal<'a> {
     graph: &'a Graph,
     current: Vec<VertexId>,
     paths: Paths,
+    /// Sticky. Every step carries it forward, because a truncated walk taints
+    /// everything computed from it — clearing it on the next `.out()` would
+    /// recreate the silent-short-answer problem one step removed. The cost is
+    /// that it names the chain rather than the step: you learn *that* something
+    /// truncated, not which repeat did.
+    truncated: bool,
 }
 
 impl<'a> VertexTraversal<'a> {
@@ -456,6 +467,7 @@ impl<'a> EdgeTraversal<'a> {
             graph: g,
             current: vs,
             paths,
+            truncated: false,
         }
     }
 }
@@ -464,4 +476,290 @@ enum End {
     From,
     To,
     Both,
+}
+
+// Not Gremlin's higher-order `repeat(step)`. An anonymous step fights an
+// ownership model where every step consumes `self`; `repeat_out(labels)` plus a
+// builder expresses every criterion, including IS6's
+// `repeat(out(replyOf)).until(no outgoing replyOf)`. The closure form stays open
+// if a query ever needs a compound per-hop step.
+
+enum HopFilter<'a> {
+    Label(String),
+    Prop(String, PropValue),
+    Pred(Box<dyn Fn(&VertexInfo) -> bool + 'a>),
+}
+
+/// How a walk stops.
+enum Stop<'a> {
+    /// Exactly k hops.
+    Times(usize),
+    Until(Box<dyn Fn(&VertexInfo) -> bool + 'a>),
+    /// Until nothing new is reachable. Returns the last non-empty frontier —
+    /// the end of the chain, which is what IS6 wants.
+    Exhausted,
+}
+
+/// Default depth cap. Deep enough for any realistic `replyOf` chain (LDBC's are
+/// single digits), shallow enough that a cyclic or adversarial graph stops
+/// promptly. The visited set already guarantees termination on a finite graph;
+/// this is the second line, against depth rather than repetition.
+pub const DEFAULT_MAX_DEPTH: usize = 64;
+
+struct RepeatCfg<'a> {
+    dir: Dir,
+    labels: Labels<'a>,
+    emit: bool,
+    max_depth: usize,
+    filters: Vec<HopFilter<'a>>,
+}
+
+impl<'a> RepeatCfg<'a> {
+    fn passes(&self, g: &Graph, v: VertexId) -> bool {
+        if self.filters.is_empty() {
+            return true;
+        }
+        let Some(info) = g.vertex_info(v) else {
+            return false;
+        };
+        self.filters.iter().all(|f| match f {
+            HopFilter::Label(l) => info.label == *l,
+            HopFilter::Prop(k, val) => g.get_vertex_prop(v, k) == Some(*val),
+            HopFilter::Pred(p) => p(&info),
+        })
+    }
+}
+
+/// Builder for a recursive walk. Configure, then terminate with `times`,
+/// `until`, or `until_exhausted`.
+pub struct Repeat<'a> {
+    base: VertexTraversal<'a>,
+    cfg: RepeatCfg<'a>,
+}
+
+/// As [`Repeat`], but truncation at the depth cap is an error rather than a
+/// queryable flag.
+///
+/// A distinct type on purpose: if strictness were a flag on `Repeat`, a caller
+/// could set it and then call a terminator that cannot fail, silently getting
+/// the lax behaviour they explicitly asked against. Here the terminators return
+/// `Result`, so the choice cannot be ignored.
+pub struct StrictRepeat<'a> {
+    inner: Repeat<'a>,
+}
+
+impl<'a> VertexTraversal<'a> {
+    /// Walk outgoing edges repeatedly. See [`Repeat`].
+    pub fn repeat_out(self, labels: Labels<'a>) -> Repeat<'a> {
+        Repeat::new(self, Dir::Out, labels)
+    }
+    /// Walk incoming edges repeatedly.
+    pub fn repeat_in(self, labels: Labels<'a>) -> Repeat<'a> {
+        Repeat::new(self, Dir::In, labels)
+    }
+    /// Walk edges in either direction repeatedly.
+    pub fn repeat_both(self, labels: Labels<'a>) -> Repeat<'a> {
+        Repeat::new(self, Dir::Both, labels)
+    }
+
+    pub fn hit_depth_cap(&self) -> bool {
+        self.truncated
+    }
+}
+
+impl<'a> Repeat<'a> {
+    fn new(base: VertexTraversal<'a>, dir: Dir, labels: Labels<'a>) -> Self {
+        Repeat {
+            base,
+            cfg: RepeatCfg {
+                dir,
+                labels,
+                emit: false,
+                max_depth: DEFAULT_MAX_DEPTH,
+                filters: Vec::new(),
+            },
+        }
+    }
+
+    /// Collect every vertex visited, in first-visit order, rather than only the
+    /// final frontier. The start vertices are not re-emitted.
+    pub fn emit(mut self) -> Self {
+        self.cfg.emit = true;
+        self
+    }
+
+    /// Bound the walk. Truncation is reported by
+    /// [`VertexTraversal::hit_depth_cap`]; see [`Repeat::strict_depth`] to make
+    /// it an error instead.
+    pub fn max_depth(mut self, n: usize) -> Self {
+        self.cfg.max_depth = n;
+        self
+    }
+
+    /// Bound the walk and make truncation an error.
+    pub fn strict_depth(mut self, n: usize) -> StrictRepeat<'a> {
+        self.cfg.max_depth = n;
+        StrictRepeat { inner: self }
+    }
+
+    /// Keep only vertices with this label, per hop.
+    pub fn has_label(mut self, label: &str) -> Self {
+        self.cfg.filters.push(HopFilter::Label(label.to_string()));
+        self
+    }
+
+    /// Keep only vertices with this property value, per hop.
+    pub fn has(mut self, key: &str, value: PropValue) -> Self {
+        self.cfg
+            .filters
+            .push(HopFilter::Prop(key.to_string(), value));
+        self
+    }
+
+    /// Keep only vertices satisfying `pred`, per hop.
+    pub fn filter(mut self, pred: impl Fn(&VertexInfo) -> bool + 'a) -> Self {
+        self.cfg.filters.push(HopFilter::Pred(Box::new(pred)));
+        self
+    }
+
+    /// Apply the hop exactly `k` times.
+    pub fn times(self, k: usize) -> VertexTraversal<'a> {
+        walk(self.base, self.cfg, Stop::Times(k))
+    }
+
+    /// Walk until a frontier contains a vertex satisfying `pred`, returning
+    /// only the matching vertices. If nothing ever matches the result is
+    /// empty; if that was because the cap was reached, `hit_depth_cap` says so.
+    pub fn until(self, pred: impl Fn(&VertexInfo) -> bool + 'a) -> VertexTraversal<'a> {
+        walk(self.base, self.cfg, Stop::Until(Box::new(pred)))
+    }
+
+    /// Walk until nothing new is reachable, returning the last non-empty
+    /// frontier — or, with `emit`, everything visited.
+    pub fn until_exhausted(self) -> VertexTraversal<'a> {
+        walk(self.base, self.cfg, Stop::Exhausted)
+    }
+}
+
+impl<'a> StrictRepeat<'a> {
+    pub fn emit(mut self) -> Self {
+        self.inner = self.inner.emit();
+        self
+    }
+    pub fn has_label(mut self, label: &str) -> Self {
+        self.inner = self.inner.has_label(label);
+        self
+    }
+    pub fn has(mut self, key: &str, value: PropValue) -> Self {
+        self.inner = self.inner.has(key, value);
+        self
+    }
+    pub fn filter(mut self, pred: impl Fn(&VertexInfo) -> bool + 'a) -> Self {
+        self.inner = self.inner.filter(pred);
+        self
+    }
+
+    pub fn times(self, k: usize) -> Result<VertexTraversal<'a>> {
+        check(self.inner.times(k))
+    }
+    pub fn until(self, pred: impl Fn(&VertexInfo) -> bool + 'a) -> Result<VertexTraversal<'a>> {
+        check(self.inner.until(pred))
+    }
+    pub fn until_exhausted(self) -> Result<VertexTraversal<'a>> {
+        check(self.inner.until_exhausted())
+    }
+}
+
+fn check(t: VertexTraversal<'_>) -> Result<VertexTraversal<'_>> {
+    if t.truncated {
+        return Err(GraphError::WalkTruncated);
+    }
+    Ok(t)
+}
+
+/// The walk itself: breadth-first, one visited set, per-hop filtering before
+/// expansion.
+fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -> VertexTraversal<'a> {
+    let g = base.graph;
+    // Seeded with the start, so a cycle back to it neither loops nor re-emits.
+    let mut visited: HashSet<u64> = base.current.iter().map(|v| v.0).collect();
+    let mut frontier = std::mem::take(&mut base.current);
+    let mut fpaths = std::mem::take(&mut base.paths);
+    let mut last_nonempty = (frontier.clone(), fpaths.clone());
+    let mut emitted: Vec<VertexId> = Vec::new();
+    let mut epaths: Paths = Vec::new();
+
+    let limit = match stop {
+        Stop::Times(k) => k.min(cfg.max_depth),
+        _ => cfg.max_depth,
+    };
+
+    let mut depth = 0usize;
+    while depth < limit && !frontier.is_empty() {
+        let mut next = Vec::new();
+        let mut npaths = Vec::new();
+        for (v, p) in frontier.iter().zip(fpaths.iter()) {
+            let neighbors = match cfg.dir {
+                Dir::Out => g.out_neighbors(*v, cfg.labels),
+                Dir::In => g.in_neighbors(*v, cfg.labels),
+                Dir::Both => g.both_neighbors(*v, cfg.labels),
+            };
+            for n in neighbors {
+                if !visited.insert(n.0) {
+                    continue;
+                }
+                if !cfg.passes(g, n) {
+                    continue;
+                }
+                let mut path = p.clone();
+                path.push(n);
+                next.push(n);
+                npaths.push(path);
+            }
+        }
+        depth += 1;
+        frontier = next;
+        fpaths = npaths;
+        if !frontier.is_empty() {
+            last_nonempty = (frontier.clone(), fpaths.clone());
+        }
+        if cfg.emit {
+            emitted.extend(frontier.iter().copied());
+            epaths.extend(fpaths.iter().cloned());
+        }
+
+        if let Stop::Until(pred) = &stop {
+            let hits: Vec<usize> = frontier
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| g.vertex_info(**v).map(|i| pred(&i)).unwrap_or(false))
+                .map(|(i, _)| i)
+                .collect();
+            if !hits.is_empty() {
+                base.current = hits.iter().map(|&i| frontier[i]).collect();
+                base.paths = hits.iter().map(|&i| fpaths[i].clone()).collect();
+                return base;
+            }
+        }
+    }
+
+    if depth == cfg.max_depth && !frontier.is_empty() {
+        base.truncated = true;
+    }
+
+    let (cur, ps) = if cfg.emit {
+        (emitted, epaths)
+    } else {
+        match stop {
+            // The last non-empty frontier: the end of the chain.
+            Stop::Exhausted => last_nonempty,
+            // `until` that never matched yields nothing; `hit_depth_cap`
+            // distinguishes "no match" from "gave up".
+            Stop::Until(_) => (Vec::new(), Vec::new()),
+            Stop::Times(_) => (frontier, fpaths),
+        }
+    };
+    base.current = cur;
+    base.paths = ps;
+    base
 }

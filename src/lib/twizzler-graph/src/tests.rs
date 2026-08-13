@@ -24,6 +24,8 @@ mod names;
 mod persistence;
 #[cfg(feature = "test-query")]
 mod props;
+#[cfg(feature = "test-query")]
+mod repeat;
 #[cfg(feature = "test-storage")]
 mod reclaim;
 
