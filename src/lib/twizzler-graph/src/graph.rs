@@ -22,9 +22,10 @@ use twizzler::{
 use twizzler_rt_abi::error::ArgumentError;
 
 use crate::{
-    arena_store::{ArenaStore, FillTo, PropSlot},
+    arena_store::{ArenaStore, FillTo, PropSlot, MAX_TEXT_LEN},
     edge::{EdgeId, EdgeInfo},
     error::{GraphError, Result},
+    blobstore::BlobStore,
     index::{
         IndexSchema, IndexStrategy, Lookup, RebuildSource, UnindexedLookup, VolatileIndex,
     },
@@ -72,7 +73,7 @@ pub(crate) const VERSION: u32 = 5;
 /// Reading a format-8 graph with this build would interpret padding as a
 /// generation, mismatch every adjacency entry, and silently return a graph with
 /// no edges. Clear the disk image.
-pub(crate) const VERSION_ARENA: u32 = 14;
+pub(crate) const VERSION_ARENA: u32 = 15;
 
 /// No longer reclaimable as of format 9. It was, while 8 differed from 7
 /// only in a trailing root field; format 9 moved the *record* layout, and the
@@ -158,6 +159,7 @@ pub(crate) struct GraphRoot {
     pub(crate) index_bits: u32,
     pub(crate) index_labels_raw: u128,
     pub(crate) index_roots_raw: u128,
+    pub(crate) blob_dir_raw: u128,
 }
 unsafe impl Invariant for GraphRoot {}
 impl BaseType for GraphRoot {}
@@ -220,6 +222,7 @@ pub struct Graph {
     /// The append-only record of which labels are indexed.
     index_labels: SegVec<IndexedLabel>,
     index_roots: SegVec<RootEntry>,
+    blobs: BlobStore,
     /// `index_labels` folded to its current state. Derived, never authoritative
     /// — the log on disk is.
     indexed_set: RefCell<HashSet<u32>>,
@@ -322,6 +325,7 @@ impl Graph {
                 index_bits,
                 index_labels_raw,
                 index_roots_raw,
+                blob_dir_raw,
             ) = {
                 let r = root.base();
                 (
@@ -333,6 +337,7 @@ impl Graph {
                     r.index_bits,
                     r.index_labels_raw,
                     r.index_roots_raw,
+                    r.blob_dir_raw,
                 )
             };
             if magic == MAGIC && version_supported(version) {
@@ -351,6 +356,7 @@ impl Graph {
                 };
                 let index_labels = SegVec::<IndexedLabel>::open(index_labels_raw, cap)?;
                 let index_roots = SegVec::<RootEntry>::open(index_roots_raw, cap)?;
+                let blobs = BlobStore::open(blob_dir_raw, cap)?;
                 let indexed_set = Self::fold_indexed(&index_labels);
                 // `version_supported` above already rejected anything but
                 // VERSION_ARENA, so there is exactly one layout to open.
@@ -379,6 +385,7 @@ impl Graph {
                     schema,
                     index_labels,
                     index_roots,
+                    blobs,
                     indexed_set: RefCell::new(indexed_set),
                     vindex,
                     volatile: RefCell::new(VolatileIndex::default()),
@@ -397,6 +404,7 @@ impl Graph {
         let labels = SegVec::create(cap)?;
         let index_labels = SegVec::<IndexedLabel>::create(cap)?;
         let index_roots = SegVec::<RootEntry>::create(cap)?;
+        let blobs = BlobStore::create(cap)?;
         let vindex = if schema.strategy == IndexStrategy::Persistent {
             Some(VIndex::new_persist()?)
         } else {
@@ -416,6 +424,7 @@ impl Graph {
                 index_bits: schema.to_bits(),
                 index_labels_raw: index_labels.dir_raw(),
                 index_roots_raw: index_roots.dir_raw(),
+                blob_dir_raw: blobs.dir_raw(),
                 arena_dir_raw,
                 arena_locs_raw,
                 arena_cap: arena_cap as u32,
@@ -430,6 +439,7 @@ impl Graph {
             schema,
             index_labels,
             index_roots,
+            blobs,
             indexed_set: RefCell::new(HashSet::new()),
             vindex,
             volatile: RefCell::new(VolatileIndex::default()),
@@ -518,7 +528,7 @@ impl Graph {
             return Ok(0); // nothing registered
         };
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
-        let (is_graph, version, cap, l, x, ad, al, il, ir) = {
+        let (is_graph, version, cap, l, x, ad, al, il, ir, bd) = {
             let r = root.base();
             (
                 r.magic == MAGIC,
@@ -530,6 +540,7 @@ impl Graph {
                 r.arena_locs_raw,
                 r.index_labels_raw,
                 r.index_roots_raw,
+                r.blob_dir_raw,
             )
         };
         if !is_graph {
@@ -576,6 +587,9 @@ impl Graph {
             if let Ok(sv) = SegVec::<RootEntry>::open(ir, cap) {
                 ids.extend(sv.object_ids());
             }
+            if let Ok(bs) = BlobStore::open(bd, cap) {
+                ids.extend(bs.object_ids());
+            }
             if x != 0 {
                 ids.push(x);
             }
@@ -598,6 +612,7 @@ impl Graph {
             b.arena_cap = 0;
             b.index_labels_raw = 0;
             b.index_roots_raw = 0;
+            b.blob_dir_raw = 0;
             Ok(())
         })?;
 
@@ -703,6 +718,7 @@ impl Graph {
         let labels = SegVec::<LabelEntry>::create(cap)?;
         let index_labels = SegVec::<IndexedLabel>::create(cap)?;
         let index_roots = SegVec::<RootEntry>::create(cap)?;
+        let blobs = BlobStore::create(cap)?;
         let vindex = if schema.strategy == IndexStrategy::Persistent {
             Some(VIndex::new_persist()?)
         } else {
@@ -730,6 +746,7 @@ impl Graph {
             b.index_bits = schema.to_bits();
             b.index_labels_raw = index_labels.dir_raw();
             b.index_roots_raw = index_roots.dir_raw();
+            b.blob_dir_raw = blobs.dir_raw();
             Ok(())
         })?;
 
@@ -1205,6 +1222,7 @@ impl Graph {
         ids.extend(self.labels.object_ids());
         ids.extend(self.index_labels.object_ids());
         ids.extend(self.index_roots.object_ids());
+        ids.extend(self.blobs.object_ids());
         ids.extend(self.index_object_ids());
         ids
     }
@@ -1257,6 +1275,13 @@ impl Graph {
 
     /// A vertex property, or `None` if unset or the vertex is dead.
     pub fn get_vertex_prop(&self, v: VertexId, key: &str) -> Option<PropValue> {
+        match self.raw_prop(v, key) {
+            Some(PropValue::TextRef { .. }) | Some(PropValue::BlobRef { .. }) => None,
+            other => other,
+        }
+    }
+
+    fn raw_prop(&self, v: VertexId, key: &str) -> Option<PropValue> {
         if !self.is_vertex_alive(v) {
             return None;
         }
@@ -1269,6 +1294,69 @@ impl Graph {
             .into_iter()
             .find(|s| s.key_id == key_id)
             .map(|s| s.val)
+    }
+
+    /// Longer input is refused, not truncated — quietly shortening a value
+    /// is the defect this whole task exists to remove, so the new API is not
+    /// able to commit it.
+    pub fn set_vertex_text(&mut self, v: VertexId, key: &str, text: &str) -> Result<()> {
+        if text.len() > MAX_TEXT_LEN {
+            return Err(GraphError::TextTooLong {
+                len: text.len(),
+                max: MAX_TEXT_LEN,
+            });
+        }
+        self.set_long(v, key, text.as_bytes(), true)
+    }
+
+    pub fn get_vertex_text(&self, v: VertexId, key: &str) -> Option<String> {
+        match self.raw_prop(v, key)? {
+            PropValue::TextRef { seg, off, len } => {
+                String::from_utf8(self.blobs.read(seg, off, len)?).ok()
+            }
+            // A blob is not text: returning its bytes here would reintroduce
+            // truncation at the 255-byte boundary through the other door.
+            _ => None,
+        }
+    }
+
+    pub fn set_vertex_blob(&mut self, v: VertexId, key: &str, bytes: &[u8]) -> Result<()> {
+        self.set_long(v, key, bytes, false)
+    }
+
+    pub fn get_vertex_blob(&self, v: VertexId, key: &str) -> Option<Vec<u8>> {
+        match self.raw_prop(v, key)? {
+            PropValue::BlobRef { seg, off, len } => self.blobs.read(seg, off, len),
+            _ => None,
+        }
+    }
+
+    fn set_long(&mut self, v: VertexId, key: &str, bytes: &[u8], text: bool) -> Result<()> {
+        if !self.is_vertex_alive(v) {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        let (seg, off, len) = self.blobs.append(bytes)?;
+        let val = if text {
+            PropValue::TextRef { seg, off, len }
+        } else {
+            PropValue::BlobRef { seg, off, len }
+        };
+        let key_id = self.intern_label(key)?;
+        // Same precedence as `set_vertex_prop`: update an inline slot in place
+        // if the key already has one, or two values would exist for one key.
+        if self.store.set_traversal_prop(v.0, key_id, val) == Some(true) {
+            return Ok(());
+        }
+        self.store.set_data_prop(v.0, key_id, val)?;
+        Ok(())
+    }
+
+    pub fn blob_object_count(&self) -> usize {
+        self.blobs.object_count()
+    }
+
+    pub(crate) fn text_eq(&self, v: VertexId, key: &str, want: &str) -> bool {
+        self.get_vertex_text(v, key).as_deref() == Some(want)
     }
 
     /// All of a vertex's properties (empty if dead/unset).
@@ -1324,6 +1412,7 @@ impl Graph {
         self.labels.flush()?;
         self.index_roots.flush()?;
         self.index_labels.flush()?;
+        self.blobs.sync_all()?;
         Ok(())
     }
 

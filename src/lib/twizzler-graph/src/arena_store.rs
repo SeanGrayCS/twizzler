@@ -113,6 +113,23 @@ pub(crate) const fn data_block_size(cap: u16) -> usize {
 
 /// Bytes occupied by a record carrying `nprops` inline traversal properties.
 #[allow(dead_code)] // wired up with the record format
+/// 255 because it is the natural bound for a byte length, and because the
+/// measured LDBC SF0.1 maximum among filtered columns is
+/// `organisation.name` at 124 bytes — a 128-byte limit would have ~3% headroom
+/// and be outgrown by a larger scale factor, silently truncating filtered values
+/// again. Storage is per-value, so an unused limit costs nothing.
+pub const MAX_TEXT_LEN: usize = 255;
+
+/// Exported so a test can pin it numerically. Arena *count* cannot catch a
+/// regression here — an arena holds a fixed number of records, not a fixed
+/// number of bytes — so a widened record would pass any count-based assertion
+/// while inflating all 1.48 M LDBC edge records.
+pub const fn record_size_for(nprops: u16) -> usize {
+    record_size(nprops)
+}
+
+pub const RECORD_SIZE_NO_PROPS: usize = size_of::<ArenaRecordHead>();
+
 pub(crate) const fn record_size(nprops: u16) -> usize {
     size_of::<ArenaRecordHead>() + nprops as usize * size_of::<PropSlot>()
 }

@@ -28,6 +28,8 @@ pub enum PropValue {
     ObjId(u128),
     /// A short string; truncates byte-wise at 31 like all `NameKey`s.
     Str(NameKey),
+    TextRef { seg: u32, off: u64, len: u32 },
+    BlobRef { seg: u32, off: u64, len: u32 },
 }
 unsafe impl Invariant for PropValue {}
 

@@ -16,8 +16,24 @@ pub enum GraphError {
     /// The on-disk graph has an incompatible format. The graph is left intact;
     /// the caller must explicitly reset it to discard it.
     StaleVersion { found: u32, expected: u32 },
+    /// The graph's index schema bits are not ones this build understands —
+    /// written by a newer engine. Refusing is deliberate: reinterpreting
+    /// unknown bits as the default would index the wrong labels and answer
+    /// lookups wrongly rather than failing.
     UnknownIndexSchema { bits: u32 },
+    /// `set_label_indexed` under [`crate::IndexStrategy::None`], which
+    /// indexes nothing by definition. Erroring rather than silently accepting
+    /// the call, so a workload cannot believe it declared an index it did not.
     IndexingDisabled,
+    /// A text property exceeded the inline limit. Refused rather than
+    /// truncated: the API must not be able to silently shorten a value. Use a
+    /// blob for values with no length bound; blobs are not queryable, which is
+    /// the trade.
+    TextTooLong { len: usize, max: usize },
+    /// Strict mode: a `repeat` stopped at its depth cap, so the result would
+    /// be short rather than complete. Returned only by `StrictRepeat`'s
+    /// terminators; the lax path reports the same condition through
+    /// `VertexTraversal::hit_depth_cap`.
     WalkTruncated,
 }
 
@@ -42,6 +58,11 @@ impl fmt::Display for GraphError {
                 "recursive traversal stopped at its depth cap: the result is \
                  truncated, not complete (use `max_depth` and check \
                  `hit_depth_cap()` to accept a partial answer)"
+            ),
+            GraphError::TextTooLong { len, max } => write!(
+                f,
+                "text property is {len} bytes, over the {max}-byte limit for a \
+                 queryable value; store it as a blob (not filterable) or shorten it"
             ),
             GraphError::IndexingDisabled => write!(
                 f,

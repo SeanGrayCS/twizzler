@@ -175,6 +175,12 @@ impl<'a> VertexTraversal<'a> {
         self.retain(|v| g.get_vertex_prop(v, key) == Some(value));
         self
     }
+
+    pub fn has_text(mut self, key: &str, value: &str) -> Self {
+        let g = self.graph;
+        self.retain(|v| g.text_eq(v, key, value));
+        self
+    }
     /// Collect the current vertices' values for property `key`, in traversal
     /// order, skipping vertices that lack it (≈ Gremlin `values`).
     pub fn values(&self, key: &str) -> Vec<PropValue> {

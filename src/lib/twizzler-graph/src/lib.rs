@@ -12,6 +12,7 @@ mod edge;
 mod error;
 mod graph;
 mod arena_store;
+mod blobstore;
 mod index;
 mod name;
 mod props;
@@ -29,7 +30,10 @@ pub use error::GraphError;
 pub use graph::{BulkInsert, Graph, DEFAULT_ARENA_CAP, DEFAULT_SEG_CAP};
 pub use index::{IndexSchema, IndexStrategy, Lookup, RebuildSource, UnindexedLookup};
 pub use props::PropValue;
-pub use arena_store::{ArenaStat, ArenaStore, FillTo, OnePerArena, Placement};
+pub use arena_store::{
+    record_size_for, ArenaStat, ArenaStore, FillTo, OnePerArena, Placement, MAX_TEXT_LEN,
+    RECORD_SIZE_NO_PROPS,
+};
 pub use name::NameKey;
 pub use record::RecordId;
 pub use traversal::{

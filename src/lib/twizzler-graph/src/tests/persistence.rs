@@ -1,12 +1,8 @@
 //! Lifecycle: reopen-by-name, reset semantics, the format guard, index
 //! persistence, and graph isolation.
 //!
-//! These tests do not demonstrate durability across a reboot, and nothing
-//! in this suite can: every test runs inside a single QEMU session, so the
-//! strongest claim available here is that a graph survives dropping its
-//! handles and being re-opened *within one boot* — which exercises remapping,
-//! not the write-back path to the disk image. A graph could in principle live
-//! entirely in mapped memory and pass every test in this file.
+//! Every test runs inside a single QEMU session, so reopening here exercises
+//! remapping within one boot, not durability across a reboot.
 
 use crate::Lookup;
 use twizzler::object::ObjID;
@@ -51,6 +47,9 @@ fn vertex_index_find_delete_and_persist() {
     let _ = Graph::reset(name);
     let (t, deleted) = {
         let mut g = Graph::open_or_create(name).unwrap();
+        // Declared here because this test opens directly rather than via
+        // `fresh`. The declaration persists, so the reopen below inherits it
+        // and rebuilds the index from records.
         super::declare_test_labels(&mut g);
         let t = g.add_vertex("tag", "thesis", ObjID::new(0)).unwrap();
         let d = g.add_vertex("tag", "gone", ObjID::new(0)).unwrap();
@@ -84,6 +83,7 @@ fn delete_persists_on_reopen() {
     let _ = Graph::reset(name);
 }
 
+/// An on-disk version-2 root is refused intact; explicit reset recovers.
 #[test]
 fn stale_v2_root_detected_and_resettable() {
     use naming::{static_naming_factory, GetFlags};
@@ -119,9 +119,13 @@ fn stale_v2_root_detected_and_resettable() {
                 arena_dir_raw: 0,
                 arena_locs_raw: 0,
                 arena_cap: 0,
+                // Zeroed like every other field: this fixture exists to be
+                // rejected as a stale version, so the values only need to be
+                // well-formed, not meaningful.
                 index_bits: 0,
                 index_labels_raw: 0,
                 index_roots_raw: 0,
+                blob_dir_raw: 0,
             })
             .unwrap();
         namer.put(&path, root.id()).unwrap();
@@ -131,6 +135,7 @@ fn stale_v2_root_detected_and_resettable() {
     match Graph::open_or_create(name) {
         Err(GraphError::StaleVersion { found, expected }) => {
             assert_eq!(found, 2);
+            // The guard names the arena layout as the only readable format.
             assert_eq!(expected, VERSION_ARENA);
         }
         Ok(_) => panic!("expected StaleVersion, but the stale graph opened"),
@@ -143,6 +148,8 @@ fn stale_v2_root_detected_and_resettable() {
     assert!(g.vertices().is_empty());
 }
 
+/// Graphs registered under different names are fully isolated — separate
+/// roots, registries, and indexes.
 #[test]
 fn multiple_graphs_coexist() {
     let mut g1 = fresh("t-multi-a");

@@ -27,6 +27,8 @@ mod props;
 #[cfg(feature = "test-query")]
 mod repeat;
 #[cfg(feature = "test-storage")]
+mod text_blob;
+#[cfg(feature = "test-storage")]
 mod reclaim;
 
 /// Vertices per arena for the general suite. Large on purpose.
