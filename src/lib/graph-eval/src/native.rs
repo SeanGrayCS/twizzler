@@ -296,31 +296,32 @@ pub fn is5_creator(g: &Graph, message: &str) -> Option<Profile> {
 /// contained by a forum directly, so this walks the `replyOf` chain to the
 /// root post first.
 ///
-/// **DSL GAP.** That walk is unbounded in principle — a reply chain has no
-/// fixed depth — and the DSL is fixed-depth (each `out` is exactly one hop),
-/// so the loop lives here. This is precisely what board task **B3**
-/// (`repeat`/`until`) would express: `repeat(out(replyOf)).until(no outgoing
-/// replyOf)`. The loop is bounded defensively so a cycle cannot hang a query.
+/// **DSL GAP closed by B3 (2026-08-11).** This was a hand-rolled loop with its
+/// own hop counter, because the DSL was fixed-depth and a reply chain is not.
+/// It is now the one step B3 was built for. The counter, the cycle guard and the
+/// `parents.first()` bookkeeping are all gone: the visited set is always on, and
+/// the depth cap is the engine's.
+///
+/// **The IndraDB baseline keeps its hand-rolled walk**, deliberately. It cannot
+/// use this DSL, so the equivalence suite now checks `repeat_out` against an
+/// independent implementation of the same query on every run — a stronger check
+/// than freezing both, which is what B3-AC9 originally asked for.
+///
+/// Truncation is not silently accepted: a chain deeper than the cap would return
+/// a wrong forum rather than none, so it is reported as no result.
 pub fn is6_forum(g: &Graph, message: &str) -> Option<ForumRow> {
-    let mut cur = resolve(g, MESSAGE, message)?;
-    let mut hops = 0usize;
-    loop {
-        let parents = g
-            .traversal()
-            .v(cur)
-            .out(Labels::these(&[REPLY_OF]))
-            .to_ids();
-        match parents.first() {
-            Some(p) => {
-                cur = *p;
-                hops += 1;
-                if hops > 64 {
-                    return None; // cycle or pathological depth
-                }
-            }
-            None => break,
-        }
+    let start = resolve(g, MESSAGE, message)?;
+    let walk = g
+        .traversal()
+        .v(start)
+        .repeat_out(Labels::these(&[REPLY_OF]))
+        .until_exhausted();
+    if walk.hit_depth_cap() {
+        return None;
     }
+    // The last non-empty frontier is the root post — or `start` itself when the
+    // message is already a root and the walk took no hops.
+    let cur = walk.first().unwrap_or(start);
     let forum = g
         .traversal()
         .v(cur)
