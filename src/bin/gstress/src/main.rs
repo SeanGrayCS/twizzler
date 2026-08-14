@@ -34,6 +34,7 @@ pub(crate) fn declare_lookup_labels(g: &mut Graph) {
 pub(crate) const HARNESS_REV: &str = "2026-08-04f";
 
 mod index_probe;
+mod is2_probe;
 mod ldbc_indradb;
 mod ldbc_load;
 mod ldbc_query;
@@ -424,6 +425,18 @@ fn main() {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1000);
         ldbc_query::run(iters);
+        return;
+    }
+
+    // IS2: the ordering cost, decomposed. Separate from `ldbc-query` because it
+    // runs one term per boot — see is2_probe.rs.
+    if arg1.as_deref() == Some("is2") {
+        let arm = std::env::args().nth(2).unwrap_or_else(|| "full".into());
+        let iters = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(200);
+        is2_probe::run(&arm, iters);
         return;
     }
 
