@@ -1104,6 +1104,32 @@ impl Graph {
         self.arena_neighbors(id, labels, true, true)
     }
 
+    /// This costs nothing extra. `arena_adjacency` already yields
+    /// `(edge_id, label, neighbour_id)` because `AdjRef` stores the edge id
+    /// beside the neighbour — the plain neighbour query has always read it and
+    /// dropped it on the floor. That drop is what made `path()` vertex-only.
+    pub fn out_neighbors_with_edges(
+        &self,
+        id: VertexId,
+        labels: Labels,
+    ) -> Vec<(EdgeId, VertexId)> {
+        self.arena_neighbors_with_edges(id, labels, true, false)
+    }
+    pub fn in_neighbors_with_edges(
+        &self,
+        id: VertexId,
+        labels: Labels,
+    ) -> Vec<(EdgeId, VertexId)> {
+        self.arena_neighbors_with_edges(id, labels, false, true)
+    }
+    pub fn both_neighbors_with_edges(
+        &self,
+        id: VertexId,
+        labels: Labels,
+    ) -> Vec<(EdgeId, VertexId)> {
+        self.arena_neighbors_with_edges(id, labels, true, true)
+    }
+
     // --- arena seams for the DSL (`vertex.rs`) ------------------------------
 
     /// `(edge_id, edge_label, neighbour_id)` in traversal order. `VertexView`
@@ -1150,14 +1176,31 @@ impl Graph {
         out: bool,
         inc: bool,
     ) -> Vec<VertexId> {
-        // Routed through `arena_adjacency` rather than the store's own
-        // `neighbors_labeled` so the dead-edge filter applies here too — the
-        // two must not have separate notions of which entries count.
+        // A projection of the edge-carrying form rather than a second walk, so
+        // the two cannot drift apart on which entries count or in what order —
+        // the same reason that one is routed through `arena_adjacency` rather
+        // than the store's own `neighbors_labeled`.
+        self.arena_neighbors_with_edges(id, labels, out, inc)
+            .into_iter()
+            .map(|(_, nb)| nb)
+            .collect()
+    }
+
+    /// Label-filtered adjacency as `(edge, neighbour)` pairs, in traversal
+    /// order. The dead-edge filter lives in `arena_adjacency`, so it applies
+    /// here and to every projection of this.
+    fn arena_neighbors_with_edges(
+        &self,
+        id: VertexId,
+        labels: Labels,
+        out: bool,
+        inc: bool,
+    ) -> Vec<(EdgeId, VertexId)> {
         let filter = self.resolve_labels(labels);
         self.arena_adjacency(id, out, inc)
             .into_iter()
             .filter(|(_, l, _)| filter.as_ref().map_or(true, |ls| ls.contains(l)))
-            .map(|(_, _, nb)| VertexId(nb))
+            .map(|(e, _, nb)| (EdgeId(e), VertexId(nb)))
             .collect()
     }
 

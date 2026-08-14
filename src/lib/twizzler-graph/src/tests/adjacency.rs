@@ -66,13 +66,50 @@ fn directionality_out_in_both() {
     let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
     let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
     let c = g.add_vertex("n", "c", ObjID::new(0)).unwrap();
-    g.add_edge(a, "e", b).unwrap(); // a -> b
-    g.add_edge(c, "e", a).unwrap(); // c -> a
+    let ab = g.add_edge(a, "e", b).unwrap(); // a -> b
+    let ca = g.add_edge(c, "e", a).unwrap(); // c -> a
 
     let view = g.vertex_view(a).unwrap();
     assert_eq!(view.out_neighbors(Labels::any()), vec![b]);
     assert_eq!(view.in_neighbors(Labels::any()), vec![c]);
     assert_eq!(view.both_neighbors(Labels::any()).len(), 2);
+
+    // The edge-carrying form names the edge crossed, in each direction.
+    assert_eq!(g.out_neighbors_with_edges(a, Labels::any()), vec![(ab, b)]);
+    assert_eq!(g.in_neighbors_with_edges(a, Labels::any()), vec![(ca, c)]);
+    // `both` is out then in, matching the plain form's documented ordering.
+    assert_eq!(
+        g.both_neighbors_with_edges(a, Labels::any()),
+        vec![(ab, b), (ca, c)]
+    );
+
+    // The plain form is a projection of the pair form: same elements, same
+    // order.
+    for (pairs, plain) in [
+        (
+            g.out_neighbors_with_edges(a, Labels::any()),
+            g.out_neighbors(a, Labels::any()),
+        ),
+        (
+            g.in_neighbors_with_edges(a, Labels::any()),
+            g.in_neighbors(a, Labels::any()),
+        ),
+        (
+            g.both_neighbors_with_edges(a, Labels::any()),
+            g.both_neighbors(a, Labels::any()),
+        ),
+    ] {
+        assert_eq!(pairs.iter().map(|(_, n)| *n).collect::<Vec<_>>(), plain);
+    }
+
+    // Label filtering selects entries, so it reaches the pair form too.
+    assert!(g
+        .out_neighbors_with_edges(a, Labels::these(&["nope"]))
+        .is_empty());
+    assert_eq!(
+        g.out_neighbors_with_edges(a, Labels::these(&["e"])),
+        vec![(ab, b)]
+    );
 }
 
 #[test]
@@ -140,6 +177,8 @@ fn recursive_traversal_with_visited_set() {
     assert_eq!(visited.len(), 3);
 }
 
+/// A self-loop appears once in the out list and once in the in list, so
+/// `both` reports it twice; deleting the loop edge clears both directions.
 #[test]
 fn self_loop_edge() {
     let mut g = fresh("t-selfloop");
@@ -157,6 +196,8 @@ fn self_loop_edge() {
     assert!(g.in_neighbors(a, Labels::any()).is_empty());
 }
 
+/// Parallel edges are distinct records, each with its own adjacency entry;
+/// `dedup` collapses them at query level; deleting one leaves the other.
 #[test]
 fn parallel_edges() {
     let mut g = fresh("t-paredge");
@@ -173,7 +214,20 @@ fn parallel_edges() {
         vec![b]
     );
 
+    // The plain form cannot say which edge reached which `b`; the pair form
+    // can, in insertion order.
+    assert_eq!(
+        g.out_neighbors_with_edges(a, Labels::any()),
+        vec![(e1, b), (e2, b)]
+    );
+
     g.delete_edge(e1).unwrap();
     assert_eq!(g.out_neighbors(a, Labels::any()), vec![b]);
     assert!(g.edge_info(e2).is_some());
+    // The survivor is identified, not merely counted.
+    assert_eq!(
+        g.out_neighbors_with_edges(a, Labels::any()),
+        vec![(e2, b)],
+        "the deleted edge leaves the pair form too"
+    );
 }

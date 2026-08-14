@@ -3,7 +3,7 @@
 use twizzler::object::ObjID;
 
 use super::fresh;
-use crate::{Graph, Labels, PropValue};
+use crate::{Graph, Labels, PathElem, PropValue};
 
 #[test]
 fn dsl_multi_hop_and_filter() {
@@ -53,6 +53,7 @@ fn dsl_edge_steps() {
     assert_eq!(vs, vec![b]);
 }
 
+/// `limit`, `first`, and `to_infos` terminals; empty-set behavior.
 #[test]
 fn dsl_limit_first_and_infos() {
     let mut g = fresh("t-dsl-lim");
@@ -75,6 +76,8 @@ fn dsl_limit_first_and_infos() {
     assert!(g.traversal().with_label("missing").first().is_none());
 }
 
+/// `both`, `in_e`/`both_e`, and edge-to-vertex steps (`out_v`, `both_v`) with
+/// their ordering (out list before in list).
 #[test]
 fn dsl_both_and_edge_directions() {
     let mut g = fresh("t-dsl-both");
@@ -101,6 +104,8 @@ fn dsl_both_and_edge_directions() {
     );
 }
 
+/// `has(key, value)` keeps exactly the matching vertices; `values(key)`
+/// collects present values in traversal order, skipping absent ones.
 #[test]
 fn dsl_has_and_values() {
     let mut g = fresh("t-dsl-prop");
@@ -145,6 +150,8 @@ fn dsl_has_and_values() {
     );
 }
 
+/// `has` composes with `out`/`dedup`/`limit`: files tagged X whose project has
+/// a property.
 #[test]
 fn dsl_has_composes_in_chain() {
     let mut g = fresh("t-dsl-chain");
@@ -182,6 +189,8 @@ fn dsl_has_composes_in_chain() {
     );
 }
 
+/// Property steps read persistent objects, so they behave identically after
+/// reopen-by-name.
 #[test]
 fn dsl_has_after_reopen() {
     let name = "t-dsl-prop-reopen";
@@ -206,6 +215,7 @@ fn dsl_has_after_reopen() {
     let _ = Graph::reset(name);
 }
 
+/// `has`/`values` on an edge traversal.
 #[test]
 fn dsl_edge_has_and_values() {
     let mut g = fresh("t-dsl-eprop");
@@ -231,6 +241,8 @@ fn dsl_edge_has_and_values() {
     );
 }
 
+/// `vertex_path()` records the vertices traversed, one path per current
+/// element, in first-seen order — including across a fork.
 #[test]
 fn dsl_path_records_traversal() {
     let mut g = fresh("t-dsl-path");
@@ -250,7 +262,7 @@ fn dsl_path_records_traversal() {
         .out(Labels::these(&["tagged"]))
         .has_name("t1")
         .out(Labels::these(&["in_project"]))
-        .path();
+        .vertex_path();
     assert_eq!(paths, vec![vec![a, t1, p]]);
 
     // Fork: both two-hop routes reach p, each with its own path.
@@ -259,10 +271,12 @@ fn dsl_path_records_traversal() {
         .v(a)
         .out(Labels::these(&["tagged"]))
         .out(Labels::these(&["in_project"]))
-        .path();
+        .vertex_path();
     assert_eq!(paths, vec![vec![a, t1, p], vec![a, t2, p]]);
 }
 
+/// Paths stay aligned with the current elements through filtering steps —
+/// `dedup` and `limit` drop the corresponding paths, not others.
 #[test]
 fn dsl_path_stays_aligned_through_dedup_and_limit() {
     let mut g = fresh("t-dsl-path2");
@@ -274,7 +288,7 @@ fn dsl_path_stays_aligned_through_dedup_and_limit() {
 
     // Both starts reach hub: two elements, two paths.
     let t = g.traversal().vs(&[a, b]).out(Labels::any());
-    assert_eq!(t.path(), vec![vec![a, hub], vec![b, hub]]);
+    assert_eq!(t.vertex_path(), vec![vec![a, hub], vec![b, hub]]);
 
     // dedup keeps the first occurrence — and its path.
     let paths = g
@@ -282,7 +296,7 @@ fn dsl_path_stays_aligned_through_dedup_and_limit() {
         .vs(&[a, b])
         .out(Labels::any())
         .dedup()
-        .path();
+        .vertex_path();
     assert_eq!(paths, vec![vec![a, hub]]);
 
     // limit truncates elements and paths together.
@@ -291,7 +305,7 @@ fn dsl_path_stays_aligned_through_dedup_and_limit() {
         .vs(&[a, b])
         .out(Labels::any())
         .limit(1)
-        .path();
+        .vertex_path();
     assert_eq!(paths, vec![vec![a, hub]]);
 
     // A filter that drops everything leaves no paths.
@@ -300,10 +314,12 @@ fn dsl_path_stays_aligned_through_dedup_and_limit() {
         .vs(&[a, b])
         .out(Labels::any())
         .has_name("nope")
-        .path();
+        .vertex_path();
     assert!(paths.is_empty());
 }
 
+/// `order_by_name` sorts ascending with id as the tiebreak, and composes with
+/// `limit` to give top-N semantics.
 #[test]
 fn dsl_order_by_name() {
     let mut g = fresh("t-dsl-order");
@@ -332,10 +348,9 @@ fn dsl_order_by_name() {
         g.traversal().with_label("n").order_by_name().limit(2).to_ids(),
         vec![a, b]
     );
-    // Descending reverses the *names* only: the id tiebreak stays ascending,
-    // so the two "dup" vertices keep insertion order. This is LDBC's own
-    // convention ("... desc, then id asc"), and it keeps the tiebreak's
-    // meaning independent of the sort direction.
+    // Descending reverses the names only: the id tiebreak stays ascending, so
+    // the two "dup" vertices keep insertion order and the tiebreak's meaning
+    // is independent of the sort direction.
     assert_eq!(
         g.traversal().with_label("n").order_by_name_desc().to_ids(),
         vec![d1, d2, c, b, a]
@@ -351,6 +366,8 @@ fn dsl_order_by_name() {
     );
 }
 
+/// Ordering by a property value: elements missing the key sort last in both
+/// directions, so `limit(n)` never surfaces them ahead of real data.
 #[test]
 fn dsl_order_by_prop() {
     let mut g = fresh("t-dsl-orderp");
@@ -376,7 +393,7 @@ fn dsl_order_by_prop() {
         vec![a, c, b, none],
         "descending, missing key still last"
     );
-    // Newest-first with a cap — the LDBC short-read shape.
+    // Newest-first with a cap.
     assert_eq!(
         g.traversal()
             .with_label("n")
@@ -387,6 +404,8 @@ fn dsl_order_by_prop() {
     );
 }
 
+/// Empty and deleted-start traversals have no paths, and an edge hop projected
+/// to vertices contributes only the destination.
 #[test]
 fn dsl_path_edge_cases_and_edge_steps() {
     let mut g = fresh("t-dsl-path3");
@@ -395,20 +414,27 @@ fn dsl_path_edge_cases_and_edge_steps() {
     g.add_edge(a, "e", b).unwrap();
 
     // Empty traversal.
-    assert!(g.traversal().with_label("missing").path().is_empty());
+    assert!(g.traversal().with_label("missing").vertex_path().is_empty());
 
-    // Vertex-only paths: the edge hop adds only the destination vertex.
+    // Projected to vertices, the edge hop contributes only the destination.
     assert_eq!(
-        g.traversal().v(a).out_e(Labels::any()).in_v().path(),
+        g.traversal().v(a).out_e(Labels::any()).in_v().vertex_path(),
         vec![vec![a, b]]
     );
 
     // Deleted start vertex yields nothing at all.
     g.delete_vertex(a).unwrap();
-    assert!(g.traversal().v(a).path().is_empty());
-    assert!(g.traversal().v(a).out(Labels::any()).path().is_empty());
+    assert!(g.traversal().v(a).vertex_path().is_empty());
+    assert!(g
+        .traversal()
+        .v(a)
+        .out(Labels::any())
+        .vertex_path()
+        .is_empty());
 }
 
+/// `has_name`, arbitrary `filter` predicates, and `vs` multiset semantics
+/// (duplicates persist until `dedup`, as in Gremlin).
 #[test]
 fn dsl_has_name_and_filter() {
     let mut g = fresh("t-dsl-has");
@@ -438,4 +464,242 @@ fn dsl_has_name_and_filter() {
     // vs() keeps duplicates (multiset) until dedup.
     assert_eq!(g.traversal().vs(&[d, d]).count(), 2);
     assert_eq!(g.traversal().vs(&[d, d]).dedup().count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Edge-carrying paths
+// ---------------------------------------------------------------------------
+
+/// Every path alternates vertex, edge, vertex, …, starting with a vertex — so a
+/// path ending on a vertex has odd length and one ending on an edge has even
+/// length. Checked structurally rather than against a literal, because the
+/// invariant is what the other assertions are entitled to assume.
+fn assert_alternates(paths: &[Vec<PathElem>]) {
+    for p in paths {
+        for (i, el) in p.iter().enumerate() {
+            let ok = match el {
+                PathElem::Vertex(_) => i % 2 == 0,
+                PathElem::Edge(_) => i % 2 == 1,
+            };
+            assert!(ok, "path does not alternate at index {i}: {p:?}");
+        }
+    }
+}
+
+/// `path()` records the edges crossed as well as the vertices reached, and
+/// `vertex_path()` projects back to the vertex-only answer.
+#[test]
+fn dsl_path_carries_edges() {
+    let mut g = fresh("t-dsl-b6-carry");
+    let a = g.add_vertex("file", "a", ObjID::new(0)).unwrap();
+    let t = g.add_vertex("tag", "t", ObjID::new(0)).unwrap();
+    let p = g.add_vertex("project", "p", ObjID::new(0)).unwrap();
+    let e1 = g.add_edge(a, "tagged", t).unwrap();
+    let e2 = g.add_edge(t, "in_project", p).unwrap();
+
+    let paths = g
+        .traversal()
+        .v(a)
+        .out(Labels::these(&["tagged"]))
+        .out(Labels::these(&["in_project"]))
+        .path();
+    assert_eq!(
+        paths,
+        vec![vec![
+            PathElem::Vertex(a),
+            PathElem::Edge(e1),
+            PathElem::Vertex(t),
+            PathElem::Edge(e2),
+            PathElem::Vertex(p),
+        ]]
+    );
+    assert_alternates(&paths);
+    assert_eq!(paths[0].len(), 5, "two hops: odd length, ends on a vertex");
+
+    // The same chain, projected: exactly the vertex-only answer.
+    assert_eq!(
+        g.traversal()
+            .v(a)
+            .out(Labels::these(&["tagged"]))
+            .out(Labels::these(&["in_project"]))
+            .vertex_path(),
+        vec![vec![a, t, p]]
+    );
+
+    // A chain ending on an edge has even length.
+    let epaths = g.traversal().v(a).out_e(Labels::any()).path();
+    assert_alternates(&epaths);
+    assert_eq!(epaths, vec![vec![PathElem::Vertex(a), PathElem::Edge(e1)]]);
+
+    // Degenerate cases.
+    assert_eq!(g.traversal().v(a).path(), vec![vec![PathElem::Vertex(a)]]);
+    assert_eq!(g.traversal().v(a).vertex_path(), vec![vec![a]]);
+    assert!(g.traversal().with_label("missing").path().is_empty());
+}
+
+/// Parallel edges give paths that differ in their edge element — the case a
+/// vertex-only path cannot express. A deleted edge leaves subsequent paths.
+#[test]
+fn dsl_path_distinguishes_parallel_edges() {
+    let mut g = fresh("t-dsl-b6-parallel");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let e1 = g.add_edge(a, "reads", b).unwrap();
+    let e2 = g.add_edge(a, "writes", b).unwrap();
+    assert_ne!(e1, e2, "distinct edges, or the test proves nothing");
+
+    let paths = g.traversal().v(a).out(Labels::any()).path();
+    assert_alternates(&paths);
+    assert_eq!(paths.len(), 2);
+
+    // Vertex-only, the two are indistinguishable.
+    assert_eq!(
+        g.traversal().v(a).out(Labels::any()).vertex_path(),
+        vec![vec![a, b], vec![a, b]]
+    );
+
+    // Carrying edges, they are not.
+    let mut edges: Vec<_> = paths
+        .iter()
+        .map(|p| p[1].as_edge().expect("element 1 should be an edge"))
+        .collect();
+    edges.sort();
+    let mut expected = vec![e1, e2];
+    expected.sort();
+    assert_eq!(edges, expected, "both edges appear, and they differ");
+
+    // The deleted edge leaves the paths; the surviving one stays.
+    g.delete_edge(e1).unwrap();
+    let paths = g.traversal().v(a).out(Labels::any()).path();
+    assert_eq!(
+        paths,
+        vec![vec![
+            PathElem::Vertex(a),
+            PathElem::Edge(e2),
+            PathElem::Vertex(b)
+        ]]
+    );
+}
+
+/// After `both(..)` the crossed edge's endpoints say which way the hop went,
+/// and `out_e().in_v()` produces the same path as `out()`.
+#[test]
+fn dsl_edge_path_direction_and_edge_steps() {
+    let mut g = fresh("t-dsl-b6-dir");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let c = g.add_vertex("n", "c", ObjID::new(0)).unwrap();
+    let out_e = g.add_edge(a, "e", b).unwrap(); // a -> b
+    let in_e = g.add_edge(c, "e", a).unwrap(); // c -> a
+
+    let paths = g.traversal().v(a).both(Labels::any()).path();
+    assert_alternates(&paths);
+    assert_eq!(paths.len(), 2);
+
+    // Direction is recoverable from the edge element alone.
+    let mut saw_out = false;
+    let mut saw_in = false;
+    for p in &paths {
+        let PathElem::Edge(e) = p[1] else {
+            panic!("element 1 should be an edge: {p:?}")
+        };
+        let info = g.edge_info(e).expect("edge is live");
+        if info.from == a {
+            saw_out = true;
+            assert_eq!(e, out_e);
+            assert_eq!(p[2], PathElem::Vertex(b));
+        } else {
+            saw_in = true;
+            assert_eq!(info.to, a);
+            assert_eq!(e, in_e);
+            assert_eq!(p[2], PathElem::Vertex(c));
+        }
+    }
+    assert!(saw_out && saw_in, "both directions crossed through both()");
+
+    // The edge step ends the path on the edge, and extending it to the far
+    // endpoint agrees with the plain neighbour hop.
+    let via_edge = g
+        .traversal()
+        .v(a)
+        .out_e(Labels::any())
+        .in_v()
+        .path();
+    let via_hop = g.traversal().v(a).out(Labels::any()).path();
+    assert_eq!(via_edge, via_hop, "two routes, one path");
+    assert_eq!(
+        via_hop,
+        vec![vec![
+            PathElem::Vertex(a),
+            PathElem::Edge(out_e),
+            PathElem::Vertex(b)
+        ]]
+    );
+}
+
+/// `repeat` carries edges but still dedups by vertex, so parallel edges to the
+/// same neighbour yield one path, not two; truncation reporting is unaffected.
+#[test]
+fn dsl_repeat_carries_edges() {
+    let mut g = fresh("t-dsl-b6-repeat");
+    let a = g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+    let b = g.add_vertex("n", "b", ObjID::new(0)).unwrap();
+    let c = g.add_vertex("n", "c", ObjID::new(0)).unwrap();
+    let e1 = g.add_edge(a, "e", b).unwrap();
+    let _e2 = g.add_edge(a, "e", b).unwrap(); // parallel: same endpoints
+    let e3 = g.add_edge(b, "e", c).unwrap();
+
+    // One path per vertex reached, even though two edges reach `b`.
+    let t = g.traversal().v(a).repeat_out(Labels::any()).times(1);
+    let paths = t.path();
+    assert_eq!(
+        paths.len(),
+        1,
+        "repeat dedups by vertex (B3-AC3), so parallel edges collapse"
+    );
+    assert_alternates(&paths);
+    assert_eq!(
+        paths[0],
+        vec![
+            PathElem::Vertex(a),
+            PathElem::Edge(e1),
+            PathElem::Vertex(b)
+        ],
+        "the first edge in adjacency order wins — arbitrary but deterministic"
+    );
+
+    // Two hops carries both edges.
+    assert_eq!(
+        g.traversal()
+            .v(a)
+            .repeat_out(Labels::any())
+            .times(2)
+            .path(),
+        vec![vec![
+            PathElem::Vertex(a),
+            PathElem::Edge(e1),
+            PathElem::Vertex(b),
+            PathElem::Edge(e3),
+            PathElem::Vertex(c),
+        ]]
+    );
+
+    // The depth cap still reports truncation, with edges in the paths.
+    let t = g
+        .traversal()
+        .v(a)
+        .repeat_out(Labels::any())
+        .max_depth(1)
+        .times(5);
+    assert!(t.hit_depth_cap(), "stopped at the cap with somewhere to go");
+    assert_alternates(&t.path());
+
+    // And the strict form is still an error rather than a short answer.
+    assert!(g
+        .traversal()
+        .v(a)
+        .repeat_out(Labels::any())
+        .strict_depth(1)
+        .times(5)
+        .is_err());
 }

@@ -37,6 +37,7 @@ pub use arena_store::{
 pub use name::NameKey;
 pub use record::RecordId;
 pub use traversal::{
-    EdgeTraversal, Repeat, StrictRepeat, TraversalSource, VertexTraversal, DEFAULT_MAX_DEPTH,
+    EdgeTraversal, Path, PathElem, Paths, Repeat, StrictRepeat, TraversalSource, VertexTraversal,
+    DEFAULT_MAX_DEPTH,
 };
 pub use vertex::{Labels, VertexHandle, VertexId, VertexInfo, VertexView};

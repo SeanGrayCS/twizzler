@@ -22,13 +22,10 @@
 //! `limit`), and terminals (`to_ids`, `to_infos`, `values(key)`, `path`,
 //! `count`, `first`).
 //!
-//! Paths. Every traversal records, for each current element, the vertices
-//! it came through; [`VertexTraversal::path`] returns them. Paths are
-//! vertex-only: an edge hop (`out_e(..).in_v()`) carries the path through
-//! and records the destination vertex, not the edge — Gremlin records both,
-//! and narrowing that keeps the path type `Vec<VertexId>`. Tracking is always
-//! on rather than opt-in, so `path()` works at the end of any chain; the cost
-//! is one `Vec` per element, which suits the eager, QEMU-sized model.
+//! Paths. Every traversal records, for each current element, the route it
+//! came by: the vertices reached *and the edges crossed*, alternating.
+//! [`VertexTraversal::path`] returns that; [`VertexTraversal::vertex_path`]
+//! projects it down to the vertices alone.
 
 use std::collections::HashSet;
 
@@ -47,12 +44,57 @@ pub struct TraversalSource<'a> {
     graph: &'a Graph,
 }
 
-/// One path per element: the vertices traversed to reach it.
-type Paths = Vec<Vec<VertexId>>;
+/// One element of a path: a vertex reached, or an edge crossed to reach the
+/// next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PathElem {
+    /// A vertex the traversal reached.
+    Vertex(VertexId),
+    /// An edge the traversal crossed.
+    Edge(EdgeId),
+}
+
+impl PathElem {
+    /// This element's id, whichever kind it is. Prefer [`Self::as_vertex`] or
+    /// [`Self::as_edge`] where the kind matters — the ids are drawn from one
+    /// space, so nothing downstream can tell them apart again.
+    pub fn id(self) -> VertexId {
+        match self {
+            PathElem::Vertex(v) => v,
+            PathElem::Edge(e) => e,
+        }
+    }
+    /// The vertex id, or `None` if this element is an edge.
+    pub fn as_vertex(self) -> Option<VertexId> {
+        match self {
+            PathElem::Vertex(v) => Some(v),
+            PathElem::Edge(_) => None,
+        }
+    }
+    /// The edge id, or `None` if this element is a vertex.
+    pub fn as_edge(self) -> Option<EdgeId> {
+        match self {
+            PathElem::Edge(e) => Some(e),
+            PathElem::Vertex(_) => None,
+        }
+    }
+}
+
+/// The route to one element: `[V, E, V, E, …]`, always starting with a vertex.
+/// It ends on a vertex in a [`VertexTraversal`] and on an edge in an
+/// [`EdgeTraversal`], so its length is odd or even respectively.
+pub type Path = Vec<PathElem>;
+
+/// One [`Path`] per current element, aligned with the element list.
+pub type Paths = Vec<Path>;
 
 /// Seed a path for each starting vertex.
 fn seed_paths(current: &[VertexId]) -> Paths {
-    current.iter().map(|v| vec![*v]).collect()
+    current.iter().map(|v| vec![PathElem::Vertex(*v)]).collect()
+}
+
+fn project_vertices(p: Path) -> Vec<VertexId> {
+    p.into_iter().filter_map(PathElem::as_vertex).collect()
 }
 
 impl<'a> TraversalSource<'a> {
@@ -247,11 +289,17 @@ impl<'a> VertexTraversal<'a> {
             .filter_map(|v| g.vertex_info(v))
             .collect()
     }
-    /// The vertices traversed to reach each current element, one path per
-    /// element, aligned with [`Self::to_ids`]. See the module docs for the
-    /// vertex-only convention.
+    /// The route to each current element — vertices reached and edges crossed,
+    /// alternating — one path per element, aligned with [`Self::to_ids`].
+    ///
+    /// Each path starts with a start vertex and ends with the current one, so
+    /// its length is odd: `[V(a), E(e), V(b)]` for a one-hop traversal.
     pub fn path(self) -> Paths {
         self.paths
+    }
+    /// [`Self::path`] with the edges dropped: just the vertices traversed.
+    pub fn vertex_path(self) -> Vec<Vec<VertexId>> {
+        self.paths.into_iter().map(project_vertices).collect()
     }
     /// Number of current vertices.
     pub fn count(self) -> usize {
@@ -287,7 +335,7 @@ impl<'a> VertexTraversal<'a> {
     /// through a cached-key sort needs a wrapper type whose `Ord` depends on
     /// `desc` — more machinery for the same `n` reads.
     fn sort_by_key_opt<K: Ord>(&mut self, key: impl Fn(VertexId) -> Option<K>, desc: bool) {
-        let mut zipped: Vec<(Option<K>, VertexId, Vec<VertexId>)> = self
+        let mut zipped: Vec<(Option<K>, VertexId, Path)> = self
             .current
             .drain(..)
             .zip(self.paths.drain(..))
@@ -308,20 +356,22 @@ impl<'a> VertexTraversal<'a> {
         }
     }
 
-    /// Neighbor hop: each neighbor inherits its source's path, extended.
+    /// Neighbor hop: each neighbor inherits its source's path, extended by the
+    /// edge crossed and then the neighbor itself.
     fn hop(mut self, dir: Dir, labels: Labels) -> Self {
         let g = self.graph;
         let mut next = Vec::new();
         let mut next_paths = Vec::new();
         for (v, p) in self.current.iter().zip(self.paths.iter()) {
             let neighbors = match dir {
-                Dir::Out => g.out_neighbors(*v, labels),
-                Dir::In => g.in_neighbors(*v, labels),
-                Dir::Both => g.both_neighbors(*v, labels),
+                Dir::Out => g.out_neighbors_with_edges(*v, labels),
+                Dir::In => g.in_neighbors_with_edges(*v, labels),
+                Dir::Both => g.both_neighbors_with_edges(*v, labels),
             };
-            for n in neighbors {
+            for (e, n) in neighbors {
                 let mut path = p.clone();
-                path.push(n);
+                path.push(PathElem::Edge(e));
+                path.push(PathElem::Vertex(n));
                 next.push(n);
                 next_paths.push(path);
             }
@@ -343,9 +393,12 @@ impl<'a> VertexTraversal<'a> {
                     Dir::Both => view.both_edges(labels),
                 };
                 for e in found {
+                    // The path now ends *on* the edge; `endpoints` appends the
+                    // far vertex, so `out_e(..).in_v()` and `out(..)` agree.
+                    let mut path = p.clone();
+                    path.push(PathElem::Edge(e));
                     edges.push(e);
-                    // Vertex-only paths: the edge itself is not recorded.
-                    paths.push(p.clone());
+                    paths.push(path);
                 }
             }
         }
@@ -423,10 +476,16 @@ impl<'a> EdgeTraversal<'a> {
     pub fn to_ids(self) -> Vec<EdgeId> {
         self.current
     }
-    /// The vertex paths that reached each current edge (the edge itself is
-    /// not recorded — see the module docs).
+    /// The route to each current edge, ending on that edge — so these paths
+    /// have even length, `[V(a), E(e)]` after one step.
     pub fn path(self) -> Paths {
         self.paths
+    }
+    /// [`Self::path`] with the edges dropped: just the vertices traversed. The
+    /// current edge contributes nothing, so this ends at the vertex the edge
+    /// step started from.
+    pub fn vertex_path(self) -> Vec<Vec<VertexId>> {
+        self.paths.into_iter().map(project_vertices).collect()
     }
     /// Number of current edges.
     pub fn count(self) -> usize {
@@ -459,8 +518,9 @@ impl<'a> EdgeTraversal<'a> {
         for (e, p) in self.current.iter().zip(self.paths.iter()) {
             let Some(info) = g.edge_info(*e) else { continue };
             let mut push = |v: VertexId| {
+                // `p` already ends on this edge, so the path stays alternating.
                 let mut path = p.clone();
-                path.push(v);
+                path.push(PathElem::Vertex(v));
                 vs.push(v);
                 paths.push(path);
             };
@@ -710,11 +770,11 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
         let mut npaths = Vec::new();
         for (v, p) in frontier.iter().zip(fpaths.iter()) {
             let neighbors = match cfg.dir {
-                Dir::Out => g.out_neighbors(*v, cfg.labels),
-                Dir::In => g.in_neighbors(*v, cfg.labels),
-                Dir::Both => g.both_neighbors(*v, cfg.labels),
+                Dir::Out => g.out_neighbors_with_edges(*v, cfg.labels),
+                Dir::In => g.in_neighbors_with_edges(*v, cfg.labels),
+                Dir::Both => g.both_neighbors_with_edges(*v, cfg.labels),
             };
-            for n in neighbors {
+            for (e, n) in neighbors {
                 if !visited.insert(n.0) {
                     continue;
                 }
@@ -722,7 +782,8 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
                     continue;
                 }
                 let mut path = p.clone();
-                path.push(n);
+                path.push(PathElem::Edge(e));
+                path.push(PathElem::Vertex(n));
                 next.push(n);
                 npaths.push(path);
             }
@@ -772,4 +833,82 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
     base.current = cur;
     base.paths = ps;
     base
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the path types in isolation — no graph, no naming, no
+    //! objects, so unlike the suite in `src/tests/` these cost nothing against
+    //! the memory budget a boot has to fit inside.
+    //!
+    //! Ids are built by value here, which `edge.rs` warns against. That warning
+    //! is about ids that have to *name a record*; there is no graph in scope, so
+    //! these assert the shape of `PathElem` and its projection and nothing about
+    //! what any id refers to.
+
+    use super::{project_vertices, seed_paths, PathElem};
+    use crate::{EdgeId, VertexId};
+
+    #[test]
+    fn path_elem_accessors_follow_the_tag() {
+        let v = PathElem::Vertex(VertexId(1));
+        let e = PathElem::Edge(EdgeId(2));
+
+        assert_eq!(v.as_vertex(), Some(VertexId(1)));
+        assert_eq!(v.as_edge(), None);
+        assert_eq!(e.as_edge(), Some(EdgeId(2)));
+        assert_eq!(e.as_vertex(), None);
+
+        // `id()` deliberately ignores the tag.
+        assert_eq!(v.id(), VertexId(1));
+        assert_eq!(e.id(), EdgeId(2));
+    }
+
+    #[test]
+    fn same_id_different_kind_is_not_equal() {
+        let v = PathElem::Vertex(VertexId(7));
+        let e = PathElem::Edge(EdgeId(7));
+        assert_ne!(v, e);
+        assert_eq!(v.id(), e.id(), "same id underneath, different kind");
+    }
+
+    #[test]
+    fn seed_is_one_single_vertex_path_per_start() {
+        assert_eq!(
+            seed_paths(&[VertexId(1), VertexId(2)]),
+            vec![
+                vec![PathElem::Vertex(VertexId(1))],
+                vec![PathElem::Vertex(VertexId(2))],
+            ]
+        );
+        assert!(seed_paths(&[]).is_empty());
+    }
+
+    #[test]
+    fn projection_drops_edges_and_keeps_vertex_order() {
+        let p = vec![
+            PathElem::Vertex(VertexId(1)),
+            PathElem::Edge(EdgeId(10)),
+            PathElem::Vertex(VertexId(2)),
+            PathElem::Edge(EdgeId(11)),
+            PathElem::Vertex(VertexId(3)),
+        ];
+        assert_eq!(
+            project_vertices(p),
+            vec![VertexId(1), VertexId(2), VertexId(3)]
+        );
+    }
+
+    /// An `EdgeTraversal`'s path ends on an edge; projecting it yields the
+    /// vertices before that edge, with nothing standing in for it.
+    #[test]
+    fn projection_of_an_edge_terminated_path() {
+        let p = vec![PathElem::Vertex(VertexId(1)), PathElem::Edge(EdgeId(10))];
+        assert_eq!(project_vertices(p), vec![VertexId(1)]);
+    }
+
+    #[test]
+    fn projection_of_empty_is_empty() {
+        assert!(project_vertices(Vec::new()).is_empty());
+    }
 }
