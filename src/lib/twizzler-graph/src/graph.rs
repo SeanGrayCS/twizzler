@@ -229,6 +229,7 @@ pub struct Graph {
     vindex: Option<VIndex>,
     volatile: RefCell<VolatileIndex>,
     scans: Cell<usize>,
+    prop_reads: Cell<usize>,
     /// Vertices and adjacency — the whole graph, in packed arenas.
     store: ArenaStore,
 }
@@ -390,6 +391,7 @@ impl Graph {
                     vindex,
                     volatile: RefCell::new(VolatileIndex::default()),
                     scans: Cell::new(0),
+                    prop_reads: Cell::new(0),
                     store,
                 });
             }
@@ -444,6 +446,7 @@ impl Graph {
             vindex,
             volatile: RefCell::new(VolatileIndex::default()),
             scans: Cell::new(0),
+            prop_reads: Cell::new(0),
             store,
         })
     }
@@ -873,6 +876,16 @@ impl Graph {
         self.scans.get()
     }
 
+    pub fn prop_reads(&self) -> usize {
+        self.prop_reads.get()
+    }
+
+    /// Zero the property-lookup counter, so a measurement can bracket one
+    /// traversal rather than a whole session.
+    pub fn reset_prop_reads(&self) {
+        self.prop_reads.set(0);
+    }
+
     pub fn index_builds(&self) -> usize {
         self.volatile.borrow().builds()
     }
@@ -1282,6 +1295,12 @@ impl Graph {
     }
 
     fn raw_prop(&self, v: VertexId, key: &str) -> Option<PropValue> {
+        // Counted here rather than in `get_vertex_prop`, so the text and blob
+        // paths are counted too: they pay the same lookup, and a decomposition
+        // that omitted them would flatter whichever query reads long values.
+        // Counted before the early returns, because a lookup that finds nothing
+        // still spent the liveness check and the label scan.
+        self.prop_reads.set(self.prop_reads.get() + 1);
         if !self.is_vertex_alive(v) {
             return None;
         }

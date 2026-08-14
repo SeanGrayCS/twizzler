@@ -280,25 +280,29 @@ impl<'a> VertexTraversal<'a> {
 
     /// Sort elements and paths together by an optional key: `None` sorts last
     /// regardless of direction, ties break by vertex id.
+    ///
+    /// Decorate–sort–undecorate rather than `slice::sort_by_cached_key`,
+    /// because the order is not `K`'s natural one: `None` sorts last in *both*
+    /// directions and the id tiebreak is always ascending. Expressing that
+    /// through a cached-key sort needs a wrapper type whose `Ord` depends on
+    /// `desc` — more machinery for the same `n` reads.
     fn sort_by_key_opt<K: Ord>(&mut self, key: impl Fn(VertexId) -> Option<K>, desc: bool) {
-        let mut zipped: Vec<(VertexId, Vec<VertexId>)> = self
+        let mut zipped: Vec<(Option<K>, VertexId, Vec<VertexId>)> = self
             .current
             .drain(..)
             .zip(self.paths.drain(..))
+            .map(|(v, p)| (key(v), v, p))
             .collect();
-        zipped.sort_by(|(a, _), (b, _)| {
-            let (ka, kb) = (key(*a), key(*b));
-            match (ka, kb) {
-                (Some(x), Some(y)) => {
-                    let ord = if desc { y.cmp(&x) } else { x.cmp(&y) };
-                    ord.then(a.0.cmp(&b.0))
-                }
-                (Some(_), None) => core::cmp::Ordering::Less,
-                (None, Some(_)) => core::cmp::Ordering::Greater,
-                (None, None) => a.0.cmp(&b.0),
+        zipped.sort_by(|(ka, a, _), (kb, b, _)| match (ka, kb) {
+            (Some(x), Some(y)) => {
+                let ord = if desc { y.cmp(x) } else { x.cmp(y) };
+                ord.then(a.0.cmp(&b.0))
             }
+            (Some(_), None) => core::cmp::Ordering::Less,
+            (None, Some(_)) => core::cmp::Ordering::Greater,
+            (None, None) => a.0.cmp(&b.0),
         });
-        for (v, p) in zipped {
+        for (_, v, p) in zipped {
             self.current.push(v);
             self.paths.push(p);
         }
