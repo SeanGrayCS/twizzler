@@ -244,3 +244,108 @@ fn property_index_declared_then_queryable() {
     assert_eq!(vs.len(), 1);
     assert_eq!(vs[0].id, a);
 }
+
+/// **D2c-AC5: an indexed property is answered from the index.**
+///
+/// The pre-D2c adapter recorded the declaration and scanned every vertex
+/// property at query time, so this passed while doing exactly the work the
+/// index exists to avoid. It cannot assert "no scan happened" through the
+/// public API, so it asserts the observable consequence instead: the answer
+/// must be exact even when many vertices carry the same property name with
+/// *different* values, which is the case a scan-and-filter gets right and a
+/// mis-keyed index gets wrong.
+#[test]
+fn indexed_property_value_query_is_exact() {
+    let db = db();
+    let name = ident("ldbcId");
+    db.index_property(name).expect("index");
+
+    let mut want = Vec::new();
+    for i in 0..25u32 {
+        let v = db.create_vertex_from_type(ident("person")).expect("vertex");
+        // Two vertices share id "7"; the rest are distinct. A prefix-keyed
+        // index that forgets its value terminator would also return "70".
+        let id = if i == 7 || i == 19 { "7".to_string() } else { i.to_string() };
+        db.set_properties(
+            SpecificVertexQuery::single(v),
+            name,
+            &Json::new(id.clone().into()),
+        )
+        .expect("set");
+        if id == "7" {
+            want.push(v);
+        }
+    }
+    let _ = db.create_vertex_from_type(ident("person")).expect("bare");
+
+    let q = indradb::VertexWithPropertyValueQuery::new(name, Json::new("7".into()));
+    let mut got: Vec<Uuid> = vertices_of(&db.get(q).expect("query")).iter().map(|v| v.id).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "exactly the two vertices with ldbcId=7");
+}
+
+/// **D2c-AC6: the index stays true under mutation.**
+///
+/// Each of these leaves a stale entry if maintenance is missed, and a stale
+/// entry is worse than no index: it resurrects deleted data in query results.
+#[test]
+fn property_index_maintained_on_overwrite_and_delete() {
+    let db = db();
+    let name = ident("ldbcId");
+    db.index_property(name).expect("index");
+
+    let a = db.create_vertex_from_type(ident("person")).expect("a");
+    let b = db.create_vertex_from_type(ident("person")).expect("b");
+    let set = |v: Uuid, s: &str| {
+        db.set_properties(SpecificVertexQuery::single(v), name, &Json::new(s.into()))
+            .expect("set");
+    };
+    let find = |s: &str| -> Vec<Uuid> {
+        let q = indradb::VertexWithPropertyValueQuery::new(name, Json::new(s.into()));
+        vertices_of(&db.get(q).expect("query")).iter().map(|v| v.id).collect()
+    };
+
+    set(a, "old");
+    set(b, "keep");
+    assert_eq!(find("old"), vec![a]);
+
+    // Overwrite: the old value must stop matching.
+    set(a, "new");
+    assert!(find("old").is_empty(), "stale entry for the overwritten value");
+    assert_eq!(find("new"), vec![a]);
+
+    // Deleting the vertex must take its index entry with it.
+    db.delete(SpecificVertexQuery::single(a)).expect("delete vertex");
+    assert!(find("new").is_empty(), "deleted vertex still in the index");
+    assert_eq!(find("keep"), vec![b], "denial is scoped to the deleted vertex");
+}
+
+/// **D2c-AC6: `index_property` backfills.** IndraDB allows declaring an index
+/// after the data exists; the LDBC loader happens to declare first, which is
+/// exactly why this would otherwise go untested.
+#[test]
+fn index_property_backfills_existing_vertices() {
+    let db = db();
+    let name = ident("late");
+    let v = db.create_vertex_from_type(ident("person")).expect("vertex");
+    db.set_properties(SpecificVertexQuery::single(v), name, &Json::new("x".into()))
+        .expect("set before index");
+
+    db.index_property(name).expect("index after the fact");
+
+    let q = indradb::VertexWithPropertyValueQuery::new(name, Json::new("x".into()));
+    let got: Vec<Uuid> = vertices_of(&db.get(q).expect("query")).iter().map(|v| v.id).collect();
+    assert_eq!(got, vec![v], "pre-existing vertex was not backfilled");
+}
+
+/// **D2c-AC1/AC2 at the datastore level:** `sync` is the durability point, and
+/// it must be reachable through the public API without error.
+#[test]
+fn sync_is_a_real_flush() {
+    let db = db();
+    let (a, _b, _e) = seed(&db);
+    db.sync().expect("sync must succeed, not merely be overridden away");
+    let out = db.get(SpecificVertexQuery::single(a)).expect("get after sync");
+    assert_eq!(vertices_of(&out).len(), 1);
+}

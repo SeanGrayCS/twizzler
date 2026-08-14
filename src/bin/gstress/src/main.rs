@@ -34,6 +34,9 @@ pub(crate) fn declare_lookup_labels(g: &mut Graph) {
 pub(crate) const HARNESS_REV: &str = "2026-08-04f";
 
 mod index_probe;
+mod ldbc_indradb;
+mod ldbc_load;
+mod ldbc_query;
 mod reclaim_probe;
 mod indradb_mode;
 mod props_probe;
@@ -407,6 +410,34 @@ fn main() {
             .unwrap_or(20_000);
         let arm = std::env::args().nth(3).unwrap_or_else(|| "graph".into());
         index_probe::run(n, &arm);
+        return;
+    }
+
+    if arg1.as_deref() == Some("ldbc") {
+        ldbc_load::run();
+        return;
+    }
+
+    if arg1.as_deref() == Some("ldbc-query") {
+        let iters = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        ldbc_query::run(iters);
+        return;
+    }
+
+    if arg1.as_deref() == Some("ldbc-indradb-load") {
+        ldbc_indradb::load();
+        return;
+    }
+
+    if arg1.as_deref() == Some("ldbc-indradb") {
+        let iters = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        ldbc_indradb::run(iters);
         return;
     }
 

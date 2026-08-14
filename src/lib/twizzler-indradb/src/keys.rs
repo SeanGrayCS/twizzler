@@ -33,9 +33,14 @@ const NS_REV_EDGE: u8 = 0x03;
 const NS_VERTEX_PROP: u8 = 0x04;
 const NS_EDGE_PROP: u8 = 0x05;
 const NS_INDEXED: u8 = 0x06;
+const NS_PROP_VALUE: u8 = 0x07;
 
-/// Namespace tags for whole-namespace scans (property-index queries sweep
-/// every property key, since indexes are declared rather than built).
+/// Namespace tags for whole-namespace scans.
+///
+/// *Property queries used to sweep `VERTEX_PROP_TAG` and filter*, because
+/// `index_property` recorded a declaration and built nothing. `NS_PROP_VALUE`
+/// (D2c) makes an indexed lookup a prefix scan instead; these tags remain for
+/// the unindexed and edge paths.
 pub(crate) const VERTEX_PROP_TAG: u8 = NS_VERTEX_PROP;
 pub(crate) const EDGE_PROP_TAG: u8 = NS_EDGE_PROP;
 
@@ -390,4 +395,52 @@ mod tests {
         assert!(decode_edge_prop_key(&keys[3]).is_none());
         assert!(decode_indexed_key(&keys[0]).is_none());
     }
+}
+
+// --- property-value index (D2c) --------------------------------------------
+//
+// `NS_PROP_VALUE | name \0 | value \0 | uuid`, so:
+//   - every value of one property is a prefix scan on `name`, and
+//   - one exact value is a prefix scan on `name` + `value`.
+//
+// **The terminator after the value is load-bearing.** JSON encoding never
+// emits a raw NUL (control characters are escaped as `\uXXXX`), so `0x00`
+// cannot occur inside `value` and sorts below every byte that can. Without it,
+// scanning for `"7"` would also match `"70"` — the same prefix-containment trap
+// the module docs describe for `Identifier`, and the case
+// `indexed_property_value_query_is_exact` pins.
+
+pub(crate) fn prop_value_key(name: &Identifier, value: &[u8], id: Uuid) -> Vec<u8> {
+    let mut k = Vec::with_capacity(40 + value.len());
+    k.push(NS_PROP_VALUE);
+    push_ident(&mut k, name);
+    k.extend_from_slice(value);
+    k.push(TERM);
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+/// Prefix matching every indexed value of one property.
+pub(crate) fn prop_value_name_prefix(name: &Identifier) -> Vec<u8> {
+    let mut k = Vec::with_capacity(16);
+    k.push(NS_PROP_VALUE);
+    push_ident(&mut k, name);
+    k
+}
+
+/// Prefix matching one exact value of one property.
+pub(crate) fn prop_value_exact_prefix(name: &Identifier, value: &[u8]) -> Vec<u8> {
+    let mut k = prop_value_name_prefix(name);
+    k.extend_from_slice(value);
+    k.push(TERM);
+    k
+}
+
+/// The vertex id trailing a `NS_PROP_VALUE` key.
+pub(crate) fn decode_prop_value_id(k: &[u8]) -> Option<Uuid> {
+    if k.first() != Some(&NS_PROP_VALUE) || k.len() < 17 {
+        return None;
+    }
+    let arr: [u8; 16] = k[k.len() - 16..].try_into().ok()?;
+    Some(Uuid::from_bytes(arr))
 }

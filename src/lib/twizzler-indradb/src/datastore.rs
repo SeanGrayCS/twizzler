@@ -20,7 +20,7 @@
 //! stated, not assumed. Crash atomicity for *our* engine is board task F2;
 //! the same gap here is recorded in the capability matrix.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use indradb::{
     Datastore, DynIter, Edge, Error, Identifier, Json, Result, Transaction, Vertex,
@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{keys, kv::KvStore};
 
 const MAGIC: u64 = 0x4931_4E44_5241_4442; // "I1NDRADB"
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // 2: `sorted` persisted (D2c)
 
 /// Root record: finds the two KV objects after a reboot.
 #[derive(Clone, Copy)]
@@ -45,6 +45,13 @@ pub(crate) struct KvRoot {
     version: u32,
     data_raw: u128,
     index_raw: u128,
+    /// How much of the index was sorted at the last `sync`.
+    ///
+    /// Without this, `open` had to assume nothing and re-sort the whole store,
+    /// which is what made the SF0.1 query boot unopenable. Treated as a hint —
+    /// `KvStore::open` clamps it and merges any tail — so a crash between a
+    /// write and a `sync` costs performance, not correctness.
+    sorted: u64,
 }
 unsafe impl Invariant for KvRoot {}
 impl BaseType for KvRoot {}
@@ -75,8 +82,101 @@ fn json_from_bytes(b: &[u8]) -> Result<Json> {
     serde_json::from_slice(b).map_err(Error::from)
 }
 
-/// Box an owned collection as a `DynIter`. Materializing is what lets reads
-/// return without holding the `RefCell` borrow.
+/// Entries fetched per chunk by [`ChunkScan`].
+const SCAN_CHUNK: usize = 1024;
+
+/// A **lazy** range cursor, materialized `SCAN_CHUNK` entries at a time.
+///
+/// # Why this exists
+///
+/// `range_edges` means "every edge at or after this offset". IndraDB's executor
+/// uses it to get one vertex's edges: it asks from `(v, ..)` and take-whiles off
+/// the front. Returning that range eagerly materializes the rest of the
+/// namespace — up to 1.48 M entries at SF0.1, each an allocated key `Vec` plus a
+/// decoded `Edge` — so the executor can keep a handful. Across 1000 query
+/// iterations that is what exhausted the frame pool *long after* the merge had
+/// finished, which is the detail that pointed here.
+///
+/// A real KV backend (sled, RocksDB) hands back a lazy range cursor and stops
+/// after a few reads. This fakes one: each chunk takes the `RefCell` borrow,
+/// copies at most `SCAN_CHUNK` entries, and drops the borrow before yielding —
+/// so laziness costs a re-borrow per chunk rather than a held borrow.
+struct ChunkScan<'a, T> {
+    ds: &'a TwizzlerDatastore,
+    /// Inclusive start of the next chunk; `None` once the range is exhausted.
+    next: Option<Vec<u8>>,
+    prefix: Vec<u8>,
+    buf: std::vec::IntoIter<T>,
+    decode: fn(&[u8], &[u8]) -> Option<T>,
+}
+
+impl<T> Iterator for ChunkScan<'_, T> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(v) = self.buf.next() {
+                return Some(Ok(v));
+            }
+            let start = self.next.take()?;
+            let entries = {
+                let kv = self.ds.kv.borrow();
+                kv.scan_range_limited(&start, &self.prefix, SCAN_CHUNK)
+            };
+            if entries.is_empty() {
+                return None;
+            }
+            // Resume strictly after the last key. Appending 0x00 gives the
+            // immediate successor under byte-lexicographic order, so no entry is
+            // seen twice and none is skipped.
+            self.next = if entries.len() < SCAN_CHUNK {
+                None
+            } else {
+                let mut k = entries[entries.len() - 1].0.clone();
+                k.push(0);
+                Some(k)
+            };
+            let items: Vec<T> = entries
+                .iter()
+                .filter_map(|(k, v)| (self.decode)(k, v))
+                .collect();
+            self.buf = items.into_iter();
+        }
+    }
+}
+
+fn chunk_scan<'a, T: 'a>(
+    ds: &'a TwizzlerDatastore,
+    start: Vec<u8>,
+    prefix: Vec<u8>,
+    decode: fn(&[u8], &[u8]) -> Option<T>,
+) -> DynIter<'a, T> {
+    Box::new(ChunkScan {
+        ds,
+        next: Some(start),
+        prefix,
+        buf: Vec::new().into_iter(),
+        decode,
+    })
+}
+
+fn decode_edge(k: &[u8], _v: &[u8]) -> Option<Edge> {
+    keys::decode_edge_key(k)
+}
+
+fn decode_rev_edge(k: &[u8], _v: &[u8]) -> Option<Edge> {
+    keys::decode_rev_edge_key(k)
+}
+
+fn decode_vertex(k: &[u8], v: &[u8]) -> Option<Vertex> {
+    let id = keys::decode_vertex_key(k)?;
+    let t = ident_from_bytes(v).ok()?;
+    Some(Vertex::with_id(id, t))
+}
+
+/// Box an owned collection as a `DynIter`. Still used where the result set is
+/// bounded by the query itself (specific ids, index hits) rather than by a
+/// namespace range.
 fn iter_of<T: 'static>(items: Vec<T>) -> DynIter<'static, T> {
     Box::new(items.into_iter().map(Ok))
 }
@@ -84,6 +184,20 @@ fn iter_of<T: 'static>(items: Vec<T>) -> DynIter<'static, T> {
 /// An IndraDB datastore backed by Twizzler persistent objects.
 pub struct TwizzlerDatastore {
     kv: RefCell<KvStore>,
+    /// Retained so `sync` can persist the sorted boundary. `None` for an
+    /// unregistered store (`new_db`), which has no root to write.
+    root: RefCell<Option<Object<KvRoot>>>,
+    /// Last value written to `root.sorted`, so `sync` can skip the write when
+    /// nothing changed.
+    ///
+    /// **This is on the hot path.** `sync` runs every `SYNC_EVERY` rows, but
+    /// `sorted` only moves at a merge — 3 times in an SF0.1 load — so ~97 of
+    /// ~100 root writes stored a value that was already there. Each one is an
+    /// `Object::sync`, and the 2026-08-10 run 3 showed flushes of 900+ s on
+    /// files far too small to have dirtied anything (`forum_hasModerator_person`:
+    /// 13,750 edges, 960 s flush), which says those syncs were *waiting*, not
+    /// writing.
+    persisted_sorted: Cell<u64>,
 }
 
 impl TwizzlerDatastore {
@@ -93,6 +207,8 @@ impl TwizzlerDatastore {
         let kv = KvStore::create().map_err(twz_err)?;
         Ok(indradb::Database::new(TwizzlerDatastore {
             kv: RefCell::new(kv),
+            root: RefCell::new(None),
+            persisted_sorted: Cell::new(0),
         }))
     }
 
@@ -120,6 +236,7 @@ impl TwizzlerDatastore {
             b.version = VERSION;
             b.data_raw = data_raw;
             b.index_raw = index_raw;
+            b.sorted = 0;
             Ok(())
         })
         .map_err(twz_err)?;
@@ -134,14 +251,14 @@ impl TwizzlerDatastore {
         let path = format!("data/{name}");
 
         if let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) {
-            let root = Object::<KvRoot>::map(
-                node.id.into(),
-                MapFlags::READ | MapFlags::PERSIST,
-            )
-            .map_err(twz_err)?;
-            let (magic, version, data_raw, index_raw) = {
+            // **Mapped rw**, not read-only: `sync` writes the sorted boundary
+            // back here. `MapFlags::READ` and `READ|WRITE|PERSIST` are
+            // different mappings on this platform, so this cannot be upgraded
+            // later without remapping.
+            let root = Object::<KvRoot>::map(node.id.into(), rw()).map_err(twz_err)?;
+            let (magic, version, data_raw, index_raw, sorted) = {
                 let r = root.base();
-                (r.magic, r.version, r.data_raw, r.index_raw)
+                (r.magic, r.version, r.data_raw, r.index_raw, r.sorted)
             };
             if magic != MAGIC || version != VERSION {
                 return Err(twz_err(format!(
@@ -149,9 +266,11 @@ impl TwizzlerDatastore {
                      (found version {version}, expected {VERSION})"
                 )));
             }
-            let kv = KvStore::open(data_raw, index_raw).map_err(twz_err)?;
+            let kv = KvStore::open(data_raw, index_raw, sorted as usize).map_err(twz_err)?;
             return Ok(indradb::Database::new(TwizzlerDatastore {
                 kv: RefCell::new(kv),
+                root: RefCell::new(Some(root)),
+                persisted_sorted: Cell::new(sorted),
             }));
         }
 
@@ -164,13 +283,28 @@ impl TwizzlerDatastore {
                 version: VERSION,
                 data_raw,
                 index_raw,
+                sorted: 0,
             })
             .map_err(twz_err)?;
         let _ = namer.remove(&path);
         namer.put(&path, root.id()).map_err(twz_err)?;
         Ok(indradb::Database::new(TwizzlerDatastore {
             kv: RefCell::new(kv),
+            root: RefCell::new(Some(root)),
+            persisted_sorted: Cell::new(0),
         }))
+    }
+}
+
+impl TwizzlerDatastore {
+    /// (data bytes, index bytes) in the backing store.
+    ///
+    /// Exposed for the LDBC harness: the 2026-08-10 OOM was diagnosed from
+    /// pager log lines that only report the *dirty* delta, which left the
+    /// store's actual size a matter of inference. A measurement beats an
+    /// inference, and this one costs two field reads.
+    pub fn store_bytes(&self) -> (usize, usize) {
+        self.kv.borrow().sizes()
     }
 }
 
@@ -202,17 +336,6 @@ impl TwizzlerTransaction<'_> {
 
     fn is_indexed(&self, name: &Identifier) -> bool {
         self.ds.kv.borrow().get(&keys::indexed_key(name)).is_some()
-    }
-
-    fn decode_vertices(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<Vertex>> {
-        let mut out = Vec::with_capacity(entries.len());
-        for (k, v) in entries {
-            let Some(id) = keys::decode_vertex_key(&k) else {
-                continue;
-            };
-            out.push(Vertex::with_id(id, ident_from_bytes(&v)?));
-        }
-        Ok(out)
     }
 
     /// Every edge touching `id`, in real orientation (outbound scan + inbound
@@ -261,17 +384,21 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
     }
 
     fn all_vertices(&'a self) -> Result<DynIter<'a, Vertex>> {
-        let entries = self.ds.kv.borrow().scan_prefix(&keys::vertex_prefix());
-        Ok(iter_of(Self::decode_vertices(entries)?))
+        Ok(chunk_scan(
+            self.ds,
+            keys::vertex_prefix(),
+            keys::vertex_prefix(),
+            decode_vertex,
+        ))
     }
 
     fn range_vertices(&'a self, offset: Uuid) -> Result<DynIter<'a, Vertex>> {
-        let entries = self
-            .ds
-            .kv
-            .borrow()
-            .scan_range(&keys::vertex_key(offset), &keys::vertex_prefix());
-        Ok(iter_of(Self::decode_vertices(entries)?))
+        Ok(chunk_scan(
+            self.ds,
+            keys::vertex_key(offset),
+            keys::vertex_prefix(),
+            decode_vertex,
+        ))
     }
 
     fn specific_vertices(&'a self, ids: Vec<Uuid>) -> Result<DynIter<'a, Vertex>> {
@@ -291,19 +418,17 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
         if !self.is_indexed(&name) {
             return Ok(None); // "not indexed" is a value here, not an error
         }
+        // D2c: a prefix scan of the index, not a sweep of every vertex
+        // property. This is the operation IS1-IS7 use to resolve an LDBC id.
         let entries = self
             .ds
             .kv
             .borrow()
-            .scan_prefix(&[keys::VERTEX_PROP_TAG]);
-        let mut out = Vec::new();
-        for (k, _) in entries {
-            if let Some((id, n)) = keys::decode_vertex_prop_key(&k) {
-                if n == name {
-                    out.push(id);
-                }
-            }
-        }
+            .scan_prefix(&keys::prop_value_name_prefix(&name));
+        let out: Vec<Uuid> = entries
+            .iter()
+            .filter_map(|(k, _)| keys::decode_prop_value_id(k))
+            .collect();
         Ok(Some(iter_of(out)))
     }
 
@@ -320,15 +445,11 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
             .ds
             .kv
             .borrow()
-            .scan_prefix(&[keys::VERTEX_PROP_TAG]);
-        let mut out = Vec::new();
-        for (k, v) in entries {
-            if let Some((id, n)) = keys::decode_vertex_prop_key(&k) {
-                if n == name && v == want {
-                    out.push(id);
-                }
-            }
-        }
+            .scan_prefix(&keys::prop_value_exact_prefix(&name, &want));
+        let out: Vec<Uuid> = entries
+            .iter()
+            .filter_map(|(k, _)| keys::decode_prop_value_id(k))
+            .collect();
         Ok(Some(iter_of(out)))
     }
 
@@ -339,41 +460,33 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
     }
 
     fn all_edges(&'a self) -> Result<DynIter<'a, Edge>> {
-        let entries = self.ds.kv.borrow().scan_prefix(&keys::edge_prefix());
-        let out = entries
-            .into_iter()
-            .filter_map(|(k, _)| keys::decode_edge_key(&k))
-            .collect();
-        Ok(iter_of(out))
+        Ok(chunk_scan(
+            self.ds,
+            keys::edge_prefix(),
+            keys::edge_prefix(),
+            decode_edge,
+        ))
     }
 
     fn range_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>> {
-        let entries = self
-            .ds
-            .kv
-            .borrow()
-            .scan_range(&keys::edge_key(&offset), &keys::edge_prefix());
-        let out = entries
-            .into_iter()
-            .filter_map(|(k, _)| keys::decode_edge_key(&k))
-            .collect();
-        Ok(iter_of(out))
+        Ok(chunk_scan(
+            self.ds,
+            keys::edge_key(&offset),
+            keys::edge_prefix(),
+            decode_edge,
+        ))
     }
 
     fn range_reversed_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>> {
         // `offset` arrives in reversed form, which is how the reverse index is
         // keyed; flip it to build the start key, and yield reversed form back.
         let start = keys::rev_edge_key(&keys::flip(&offset));
-        let entries = self
-            .ds
-            .kv
-            .borrow()
-            .scan_range(&start, &keys::rev_edge_prefix());
-        let out = entries
-            .into_iter()
-            .filter_map(|(k, _)| keys::decode_rev_edge_key(&k))
-            .collect();
-        Ok(iter_of(out))
+        Ok(chunk_scan(
+            self.ds,
+            start,
+            keys::rev_edge_prefix(),
+            decode_rev_edge,
+        ))
     }
 
     fn specific_edges(&'a self, edges: Vec<Edge>) -> Result<DynIter<'a, Edge>> {
@@ -512,12 +625,17 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
             for e in &incident {
                 Self::purge_edge(&mut kv, e)?;
             }
-            let prop_keys: Vec<Vec<u8>> = kv
-                .scan_prefix(&keys::vertex_props_prefix(v.id))
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect();
-            for k in prop_keys {
+            // **Values are kept, not just keys**: retiring an index entry
+            // needs the value it was filed under. A stale entry is worse than
+            // no index — it resurrects a deleted vertex in query results.
+            let props = kv.scan_prefix(&keys::vertex_props_prefix(v.id));
+            for (k, val) in props {
+                if let Some((pid, n)) = keys::decode_vertex_prop_key(&k) {
+                    if kv.get(&keys::indexed_key(&n)).is_some() {
+                        kv.delete(&keys::prop_value_key(&n, &val, pid))
+                            .map_err(twz_err)?;
+                    }
+                }
                 kv.delete(&k).map_err(twz_err)?;
             }
             kv.delete(&keys::vertex_key(v.id)).map_err(twz_err)?;
@@ -536,8 +654,14 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
     fn delete_vertex_properties(&mut self, props: Vec<(Uuid, Identifier)>) -> Result<()> {
         let mut kv = self.ds.kv.borrow_mut();
         for (id, name) in props {
-            kv.delete(&keys::vertex_prop_key(id, &name))
-                .map_err(twz_err)?;
+            let key = keys::vertex_prop_key(id, &name);
+            if kv.get(&keys::indexed_key(&name)).is_some() {
+                if let Some(old) = kv.get(&key) {
+                    kv.delete(&keys::prop_value_key(&name, &old, id))
+                        .map_err(twz_err)?;
+                }
+            }
+            kv.delete(&key).map_err(twz_err)?;
         }
         Ok(())
     }
@@ -550,11 +674,27 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
         Ok(())
     }
 
+    /// Declare **and build**. *Was recorded-only*, which left
+    /// `vertex_ids_with_property_value` sweeping every vertex property — the
+    /// exact operation the LDBC short reads depend on (D2c).
     fn index_property(&mut self, name: Identifier) -> Result<()> {
-        // Recorded, not built: queries below scan and filter. Correct, not
-        // fast — declared as such in the capability matrix (board D2b AC7).
         let mut kv = self.ds.kv.borrow_mut();
+        if kv.get(&keys::indexed_key(&name)).is_some() {
+            return Ok(()); // idempotent: backfilling a second time is wasted work
+        }
         kv.put(&keys::indexed_key(&name), &[]).map_err(twz_err)?;
+        // IndraDB allows declaring an index after the data exists, so the
+        // declaration has to backfill. The LDBC loader declares first, which is
+        // precisely why this path would otherwise go untested.
+        let existing = kv.scan_prefix(&[keys::VERTEX_PROP_TAG]);
+        for (k, val) in existing {
+            if let Some((id, n)) = keys::decode_vertex_prop_key(&k) {
+                if n == name {
+                    kv.put(&keys::prop_value_key(&name, &val, id), &[])
+                        .map_err(twz_err)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -565,10 +705,23 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
         value: &Json,
     ) -> Result<()> {
         let bytes = json_to_bytes(value)?;
+        // **Resolved before the mutable borrow**: `is_indexed` reads the same
+        // `RefCell`, and taking it while `borrow_mut` is held would panic.
+        let indexed = self.is_indexed(&name);
         let mut kv = self.ds.kv.borrow_mut();
         for id in vertices {
-            kv.put(&keys::vertex_prop_key(id, &name), &bytes)
-                .map_err(twz_err)?;
+            let key = keys::vertex_prop_key(id, &name);
+            if indexed {
+                // Retire the previous value's entry first — otherwise an
+                // overwrite leaves the vertex findable under both values.
+                if let Some(old) = kv.get(&key) {
+                    kv.delete(&keys::prop_value_key(&name, &old, id))
+                        .map_err(twz_err)?;
+                }
+                kv.put(&keys::prop_value_key(&name, &bytes, id), &[])
+                    .map_err(twz_err)?;
+            }
+            kv.put(&key, &bytes).map_err(twz_err)?;
         }
         Ok(())
     }
@@ -588,9 +741,35 @@ impl<'a> Transaction<'a> for TwizzlerTransaction<'a> {
         Ok(())
     }
 
-    /// Every `put` already syncs its objects (see `kv`), so there is no
-    /// deferred state to flush. Overridden because the default errors out.
+    /// **The durability point** (D2c).
+    ///
+    /// *Was a no-op*, on the grounds that every `put` already synced its
+    /// objects. That was true and was the defect: it made each write
+    /// individually durable at ~1.2-1.7 MB/s writeback, ~21 object syncs per
+    /// LDBC row, while our own engine batched via `push_nosync` +
+    /// `Graph::sync`. IndraDB exposes `sync` so a datastore *can* defer —
+    /// RocksDB buffers in a memtable and flushes on demand — and the port now
+    /// uses it as intended.
     fn sync(&self) -> Result<()> {
+        let sorted = {
+            let mut kv = self.ds.kv.borrow_mut();
+            kv.flush().map_err(twz_err)?;
+            kv.sorted_len() as u64
+        };
+        // Persist the boundary *after* the data is durable: a root claiming
+        // more sortedness than the index has would be worse than one claiming
+        // less, since `open` repairs a short claim but cannot detect a long one
+        // beyond clamping.
+        if sorted != self.ds.persisted_sorted.get() {
+            if let Some(root) = self.ds.root.borrow_mut().as_mut() {
+                root.with_tx(|tx| {
+                    tx.base_mut().sorted = sorted;
+                    Ok(())
+                })
+                .map_err(twz_err)?;
+            }
+            self.ds.persisted_sorted.set(sorted);
+        }
         Ok(())
     }
 }
