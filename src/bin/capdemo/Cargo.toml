@@ -1,0 +1,21 @@
+[package]
+name = "capdemo"
+version = "0.1.0"
+edition = "2021"
+
+# capdemo — RQ3 / task-board G1. Two-compartment capability probe.
+#
+# Not part of `--tests`: it spawns itself as a second compartment, so it has to
+# run from the Twizzler shell. `capdemo` runs the whole sequence; `capdemo child
+# <step> ...` is the spawned side and is not meant to be invoked by hand.
+#
+# Every step asserts. The exit code is 0 only if every check passed, so this is
+# a test that happens to live in a binary, not a transcript to be read and
+# agreed with. See docs/handoffs/G1-NOTES.md for what it is checking and why.
+
+[dependencies]
+twizzler = { path = "../../lib/twizzler" }
+twizzler-abi = { path = "../../lib/twizzler-abi" }
+twizzler-rt-abi = "0.99"
+twizzler-security = { workspace = true, features = ["user"] }
+twizzler-graph = { path = "../../lib/twizzler-graph" }

@@ -440,6 +440,24 @@ fn main() {
         return;
     }
 
+    if arg1.as_deref() == Some("ldbc-query-equiv") {
+        let iters = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        ldbc_query::equiv(iters);
+        return;
+    }
+
+    if arg1.as_deref() == Some("ldbc-indradb-equiv") {
+        let iters = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        ldbc_indradb::equiv(iters);
+        return;
+    }
+
     if arg1.as_deref() == Some("ldbc-indradb-load") {
         ldbc_indradb::load();
         return;

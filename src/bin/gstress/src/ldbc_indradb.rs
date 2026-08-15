@@ -379,6 +379,18 @@ pub(crate) fn load() {
 /// Query pass. Opens the datastore the load left behind, in a fresh boot, so
 /// both arms are measured cold. See the note at the end of `load`.
 pub(crate) fn run(iters: usize) {
+    run_inner(iters, false)
+}
+
+/// Same queries, same code path, emitting a per-iteration result digest
+/// instead of latencies. Deliberately not a second implementation: an
+/// equivalence check written alongside the benchmark can agree with itself
+/// while both differ from the engine under test.
+pub(crate) fn equiv(iters: usize) {
+    run_inner(iters, true)
+}
+
+fn run_inner(iters: usize, digest: bool) {
     println!(
         "GSTRESS STAMP harness={} mode=ldbc-indradb iters={}",
         crate::HARNESS_REV,
@@ -406,6 +418,14 @@ pub(crate) fn run(iters: usize) {
         println!("GSTRESS IDBQ FAILED: no interactive_*_param.txt in {DIR}");
         return;
     }
+
+    // Digest mode does exactly one pass over the parameter list.
+    //
+    // The list cycles (87 ids), so iterations beyond it are exact repeats: no
+    // new information for an equivalence check, and 1000 lines killed the
+    // guest's stdout outright ("I/O error: data loss" at ~330 lines). Equiv is
+    // not timed, so there is nothing to average over either.
+    let iters = if digest { persons.len() } else { iters };
 
     let mut is1 = Lat::new("IS1");
     let mut is2 = Lat::new("IS2");
@@ -437,6 +457,7 @@ pub(crate) fn run(iters: usize) {
         }
         is1.us.push(t.elapsed().as_micros());
         is1.results += rows;
+        let r1 = rows;
 
         // IS2 — same shape as the native arm: gather the person's messages,
         // order by creationDate descending, take 10.
@@ -458,8 +479,12 @@ pub(crate) fn run(iters: usize) {
         }
         is2.us.push(t.elapsed().as_micros());
         is2.results += rows;
+        let r2 = rows;
 
         let Some(m0) = first else {
+            if digest && i < persons.len() {
+                println!("EQUIV {pid} is1={r1} is2={r2} mid=- NOMSG");
+            }
             no_msg += 1;
             continue;
         };
@@ -472,6 +497,7 @@ pub(crate) fn run(iters: usize) {
         }
         is3.us.push(t.elapsed().as_micros());
         is3.results += rows;
+        let r3 = rows;
 
         let t = Instant::now();
         let mut rows = 0;
@@ -482,6 +508,7 @@ pub(crate) fn run(iters: usize) {
         }
         is4.us.push(t.elapsed().as_micros());
         is4.results += rows;
+        let r4 = rows;
 
         let t = Instant::now();
         let mut rows = 0;
@@ -490,6 +517,7 @@ pub(crate) fn run(iters: usize) {
         }
         is5.us.push(t.elapsed().as_micros());
         is5.results += rows;
+        let r5 = rows;
 
         let t = Instant::now();
         let mut rows = 0;
@@ -513,6 +541,7 @@ pub(crate) fn run(iters: usize) {
         }
         is6.us.push(t.elapsed().as_micros());
         is6.results += rows;
+        let r6 = rows;
 
         let t = Instant::now();
         let mut rows = 0;
@@ -521,6 +550,14 @@ pub(crate) fn run(iters: usize) {
         }
         is7.us.push(t.elapsed().as_micros());
         is7.results += rows;
+        let r7 = rows;
+
+        if digest && i < persons.len() {
+            println!(
+                "EQUIV {pid} is1={r1} is2={r2} mid={mid} is3={r3} is4={r4} \
+                 is5={r5} is6={r6} is7={r7}"
+            );
+        }
 
         if (i + 1) % 100 == 0 {
             println!("GSTRESS IDBQ .. {}/{iters}", i + 1);

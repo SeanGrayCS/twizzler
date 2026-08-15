@@ -88,6 +88,18 @@ fn str_prop(g: &Graph, v: VertexId, key: &str) -> String {
 }
 
 pub(crate) fn run(iters: usize) {
+    run_inner(iters, false)
+}
+
+/// Same queries, same code path, emitting a per-iteration result digest
+/// instead of latencies. Deliberately not a second implementation: an
+/// equivalence check written alongside the benchmark can agree with itself
+/// while both differ from the engine under test.
+pub(crate) fn equiv(iters: usize) {
+    run_inner(iters, true)
+}
+
+fn run_inner(iters: usize, digest: bool) {
     println!(
         "GSTRESS STAMP harness={} mode=ldbc-query iters={}",
         crate::HARNESS_REV,
@@ -122,6 +134,14 @@ pub(crate) fn run(iters: usize) {
     }
     println!("GSTRESS LDBCQ params: {} LDBC person ids", persons.len());
 
+    // Digest mode does exactly one pass over the parameter list.
+    //
+    // The list cycles (87 ids), so iterations beyond it are exact repeats:
+    // no new information for an equivalence check, and 1000 lines killed the
+    // guest's stdout outright ("I/O error: data loss" at ~330 lines). Equiv is
+    // not timed, so there is nothing to average over either.
+    let iters = if digest { persons.len() } else { iters };
+
     let mut is1 = Lat::new("IS1");
     let mut is2 = Lat::new("IS2");
     let mut is3 = Lat::new("IS3");
@@ -153,6 +173,7 @@ pub(crate) fn run(iters: usize) {
         }
         is1.us.push(t.elapsed().as_micros());
         is1.results += rows;
+        let r1 = rows;
 
         // IS2 — a person's 10 most recent messages, newest first. Its result
         // supplies the message id for IS4-IS7, which is how the LDBC driver
@@ -173,10 +194,20 @@ pub(crate) fn run(iters: usize) {
         }
         is2.us.push(t.elapsed().as_micros());
         is2.results += rows;
+        let r2 = rows;
 
         let Some(m0) = msg else {
             // This person authored nothing; IS4-IS7 have no parameter, and
             // timing them against a missing id would measure the miss path.
+            //
+            // IS3 is skipped here too, and does not need to be. It reads
+            // `both(knows)` from the person and never touches a message id; it
+            // is excluded only because it sits below this guard. That biases
+            // IS3's sample toward persons who authored something — a
+            // restriction rather than a requirement.
+            if digest && i < persons.len() {
+                println!("EQUIV {pid} is1={r1} is2={r2} mid=- NOMSG");
+            }
             no_msg += 1;
             continue;
         };
@@ -191,6 +222,7 @@ pub(crate) fn run(iters: usize) {
         }
         is3.us.push(t.elapsed().as_micros());
         is3.results += rows;
+        let r3 = rows;
 
         // IS4 — a message's content and creation date.
         let t = Instant::now();
@@ -202,6 +234,7 @@ pub(crate) fn run(iters: usize) {
         }
         is4.us.push(t.elapsed().as_micros());
         is4.results += rows;
+        let r4 = rows;
 
         // IS5 — a message's creator.
         let t = Instant::now();
@@ -215,6 +248,7 @@ pub(crate) fn run(iters: usize) {
         }
         is5.us.push(t.elapsed().as_micros());
         is5.results += rows;
+        let r5 = rows;
 
         let t = Instant::now();
         let mut rows = 0;
@@ -232,6 +266,7 @@ pub(crate) fn run(iters: usize) {
         }
         is6.us.push(t.elapsed().as_micros());
         is6.results += rows;
+        let r6 = rows;
 
         // IS7 — direct replies to a message.
         let t = Instant::now();
@@ -246,6 +281,14 @@ pub(crate) fn run(iters: usize) {
         }
         is7.us.push(t.elapsed().as_micros());
         is7.results += rows;
+        let r7 = rows;
+
+        if digest && i < persons.len() {
+            println!(
+                "EQUIV {pid} is1={r1} is2={r2} mid={mid} is3={r3} is4={r4} \
+                 is5={r5} is6={r6} is7={r7}"
+            );
+        }
 
         if (i + 1) % 200 == 0 {
             println!("GSTRESS LDBCQ .. {}/{iters}", i + 1);
@@ -261,8 +304,11 @@ pub(crate) fn run(iters: usize) {
          message ids come from IS2's own result, as the driver chains them. Not \
          an audited result — the official driver also controls issue rate, mix \
          and dependency time. `MSG` spans `comment`+`post` because the engine \
-         has no type hierarchy. {no_msg} of {iters} persons authored nothing, so \
-         IS4-IS7 have fewer samples than IS1-IS3."
+         has no type hierarchy. {no_msg} of {iters} person *draws* resolved to a \
+         person who authored nothing (a smaller number of distinct ids, each \
+         drawn repeatedly), so IS3-IS7 have fewer samples than IS1-IS2 — those \
+         iterations stop after IS2. IS3 needs no message id and is excluded only \
+         because it sits below that guard; see the report's Appendix B."
     );
     let _ = MSG;
 }
