@@ -41,6 +41,10 @@ mod tests_datastore;
 
 pub use datastore::{TwizzlerDatastore, TwizzlerTransaction};
 
+/// Read-path counters (E7) — see `kv`'s module docs. Exported so `gstress` can
+/// reset them around a measured phase and report them after it.
+pub use kv::stats as kv_stats;
+
 #[cfg(all(test, feature = "tests"))]
 mod tests {
     use indradb::{

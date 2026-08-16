@@ -35,6 +35,13 @@ const MSG: Labels<'static> = Labels::These(&["comment", "post"]);
 struct Lat {
     name: &'static str,
     us: Vec<u128>,
+    /// Samples split by whether this iteration was the first use of its
+    /// person id. The parameter list cycles 87 ids over 1000 iterations, so
+    /// 8.7% of iterations touch data for the first time and the rest find it
+    /// warm — which means first touches land in the top ~9% of the combined
+    /// distribution, i.e. exactly where p95 and p99 are read.
+    cold: Vec<u128>,
+    warm: Vec<u128>,
     results: usize,
 }
 
@@ -43,8 +50,45 @@ impl Lat {
         Lat {
             name,
             us: Vec::new(),
+            cold: Vec::new(),
+            warm: Vec::new(),
             results: 0,
         }
+    }
+
+    fn push(&mut self, us: u128, first_touch: bool) {
+        self.us.push(us);
+        if first_touch {
+            self.cold.push(us);
+        } else {
+            self.warm.push(us);
+        }
+    }
+
+    /// p50/p99 for first-touch and repeat samples separately.
+    ///
+    /// If the tail is parameter reuse, `cold` p50 lands near the combined p99
+    /// and `warm` p99 collapses toward `warm` p50. If the tail is inherent, the
+    /// two distributions have similar shape and both keep a long tail.
+    fn report_split(&mut self) {
+        let pct = |v: &mut Vec<u128>, p: f64| -> u128 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[(((v.len() - 1) as f64) * p) as usize]
+        };
+        let (cn, wn) = (self.cold.len(), self.warm.len());
+        let (c50, c99) = (pct(&mut self.cold, 0.50), pct(&mut self.cold, 0.99));
+        let (w50, w99) = (pct(&mut self.warm, 0.50), pct(&mut self.warm, 0.99));
+        println!(
+            "GSTRESS LDBCSPLIT {:<6} cold n={cn} p50 {c50}us p99 {c99}us | \
+             warm n={wn} p50 {w50}us p99 {w99}us | cold/warm p50 {:.1}x | \
+             warm p99/p50 {:.1}x",
+            self.name,
+            if w50 > 0 { c50 as f64 / w50 as f64 } else { 0.0 },
+            if w50 > 0 { w99 as f64 / w50 as f64 } else { 0.0 }
+        );
     }
     fn report(&mut self) {
         if self.us.is_empty() {
@@ -153,6 +197,9 @@ fn run_inner(iters: usize, digest: bool) {
     let mut no_msg = 0usize;
     for i in 0..iters {
         let pid = &persons[i % persons.len()];
+        // The list cycles, so the first pass over it is every id's first touch
+        // and everything after is a repeat. No per-id tracking needed.
+        let first_touch = i < persons.len();
 
         // IS1 — profile of a person.
         let t = Instant::now();
@@ -171,7 +218,7 @@ fn run_inner(iters: usize, digest: bool) {
                 .out(Labels::these(&["isLocatedIn"]))
                 .count();
         }
-        is1.us.push(t.elapsed().as_micros());
+        is1.push(t.elapsed().as_micros(), first_touch);
         is1.results += rows;
         let r1 = rows;
 
@@ -192,7 +239,7 @@ fn run_inner(iters: usize, digest: bool) {
             rows = ids.len();
             msg = ids.first().copied();
         }
-        is2.us.push(t.elapsed().as_micros());
+        is2.push(t.elapsed().as_micros(), first_touch);
         is2.results += rows;
         let r2 = rows;
 
@@ -220,7 +267,7 @@ fn run_inner(iters: usize, digest: bool) {
         if let Lookup::Found(p) = g.find_vertex("person", pid) {
             rows = g.traversal().v(p).both(Labels::these(&["knows"])).count();
         }
-        is3.us.push(t.elapsed().as_micros());
+        is3.push(t.elapsed().as_micros(), first_touch);
         is3.results += rows;
         let r3 = rows;
 
@@ -232,7 +279,7 @@ fn run_inner(iters: usize, digest: bool) {
             let c = str_prop(&g, m, "content");
             rows = usize::from(!c.is_empty());
         }
-        is4.us.push(t.elapsed().as_micros());
+        is4.push(t.elapsed().as_micros(), first_touch);
         is4.results += rows;
         let r4 = rows;
 
@@ -246,7 +293,7 @@ fn run_inner(iters: usize, digest: bool) {
                 .out(Labels::these(&["hasCreator"]))
                 .count();
         }
-        is5.us.push(t.elapsed().as_micros());
+        is5.push(t.elapsed().as_micros(), first_touch);
         is5.results += rows;
         let r5 = rows;
 
@@ -264,7 +311,7 @@ fn run_inner(iters: usize, digest: bool) {
                 }
             }
         }
-        is6.us.push(t.elapsed().as_micros());
+        is6.push(t.elapsed().as_micros(), first_touch);
         is6.results += rows;
         let r6 = rows;
 
@@ -279,7 +326,7 @@ fn run_inner(iters: usize, digest: bool) {
                 .has_label("comment")
                 .count();
         }
-        is7.us.push(t.elapsed().as_micros());
+        is7.push(t.elapsed().as_micros(), first_touch);
         is7.results += rows;
         let r7 = rows;
 
@@ -298,6 +345,13 @@ fn run_inner(iters: usize, digest: bool) {
     println!("GSTRESS LDBCQ RESULTS (LDBC-SNB Interactive short reads, SF0.1):");
     for l in [&mut is1, &mut is2, &mut is3, &mut is4, &mut is5, &mut is6, &mut is7] {
         l.report();
+    }
+    // First-touch versus repeat. See `Lat::report_split` — this is the test of
+    // whether the reported tail is the engine's cold path or an artefact of the
+    // parameter list cycling 87 ids over 1000 iterations.
+    println!("GSTRESS LDBCQ SPLIT (first touch of each id vs repeats):");
+    for l in [&mut is1, &mut is2, &mut is3, &mut is4, &mut is5, &mut is6, &mut is7] {
+        l.report_split();
     }
     println!(
         "GSTRESS LDBCQ NOTE: person ids are LDBC's substitution parameters; \

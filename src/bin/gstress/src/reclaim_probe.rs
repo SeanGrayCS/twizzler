@@ -16,15 +16,13 @@
 //! - `keep` — each cycle builds a differently named graph and never destroys
 //!   it, so every arena ever created stays in the object table.
 //!
-//! `keep` is the control and it is not optional. There is no userspace frame
-//! counter on this platform (`print_tracker_stats` is reachable only from
-//! `MemoryTracker::wait`, i.e. once a thread is already blocked for memory), so
-//! the ceiling cannot be read directly — it can only be located by running into
-//! it. The first draft of this probe instead *assumed* a ~3 M-record ceiling and
-//! sized itself under it; `noindex` had already reached 10 M records in an
-//! earlier session, so that version would have printed a pass whether or not
-//! `Delete` freed a single frame. A run of `destroy` alone still means nothing.
-//! Report the pair or report neither.
+//! `keep` is the control and it is not optional. The first draft of this
+//! probe *assumed* a ~3 M-record ceiling and sized itself under it; `noindex`
+//! had already reached 10 M records in an earlier session, so that version would
+//! have printed a pass whether or not `Delete` freed a single frame. A run of
+//! `destroy` alone still means nothing. Report the pair or report neither.
+//!
+//! Two further consequences worth stating, since both were planned around:
 //!
 //! # Reading it: there is no single wall
 //!
@@ -200,6 +198,13 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
         let ins_s = t_ins.elapsed().as_secs_f64();
         let arenas = g.arena_count();
 
+        let (live_objs, live_pages) = g.resident_pages();
+        println!(
+            "GSTRESS RECLAIM RESIDENT {arm} c{c} {live_objs} objects \
+             {live_pages} pages ({:.2}% of 2962166 frames, lower bound)",
+            live_pages as f64 * 100.0 / 2_962_166.0
+        );
+
         let t_drop = Instant::now();
         drop(g);
         let drop_s = t_drop.elapsed().as_secs_f64();
@@ -208,7 +213,48 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
         let freed = if keep {
             0
         } else {
-            Graph::destroy(&name).expect("destroy")
+            let rep = Graph::destroy_measured(&name).expect("destroy");
+            println!(
+                "GSTRESS RECLAIM RECLAIM {arm} c{c} pages {}->{} returned {} \
+                 ({}) | ids {} accepted {} still-resolving {} | root {}->{}",
+                rep.pages_before,
+                rep.pages_after,
+                rep.returned_pages(),
+                match rep.returned_fraction() {
+                    Some(f) => format!("{:.1}%", f * 100.0),
+                    None => "undefined".to_string(),
+                },
+                rep.attempted,
+                rep.accepted,
+                rep.present_after,
+                rep.root_pages_before,
+                rep.root_pages_after,
+            );
+            if c == 1 {
+                println!("GSTRESS RECLAIM INVENTORY {arm} c1 (per-structure):");
+                for line in rep.report_lines() {
+                    println!("GSTRESS RECLAIM INVENTORY {line}");
+                }
+            }
+            if rep.present_after > 0 {
+                println!(
+                    "GSTRESS RECLAIM ANOMALY {arm} c{c}: {} ids still resolve \
+                     after an accepted delete. **A5-AC13b fails**, and that \
+                     supersedes the returned fraction — the residue would be \
+                     objects that never left the table rather than pages the \
+                     platform retained.",
+                    rep.present_after
+                );
+            }
+            if rep.grew() {
+                println!(
+                    "GSTRESS RECLAIM ANOMALY {arm} c{c}: resident pages ROSE \
+                     across the destroy ({} -> {}). Deletion must not increase \
+                     residency; treat this run as void until explained.",
+                    rep.pages_before, rep.pages_after
+                );
+            }
+            rep.accepted
         };
         let del_s = t_del.elapsed().as_secs_f64();
 

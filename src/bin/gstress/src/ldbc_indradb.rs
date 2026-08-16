@@ -174,6 +174,14 @@ impl Beat {
 struct Lat {
     name: &'static str,
     us: Vec<u128>,
+    /// First-touch versus repeat, mirroring `ldbc_query::Lat`. The baseline
+    /// needs this split more than the native arm does, not less: it is the
+    /// control. Its work is uniform keyed lookups, so if the tail is a cold-path
+    /// effect the baseline should show far less separation than the engine, and
+    /// if both split the same way the effect is the measurement rather than
+    /// either design.
+    cold: Vec<u128>,
+    warm: Vec<u128>,
     results: usize,
 }
 
@@ -182,8 +190,40 @@ impl Lat {
         Lat {
             name,
             us: Vec::new(),
+            cold: Vec::new(),
+            warm: Vec::new(),
             results: 0,
         }
+    }
+
+    fn push(&mut self, us: u128, first_touch: bool) {
+        self.us.push(us);
+        if first_touch {
+            self.cold.push(us);
+        } else {
+            self.warm.push(us);
+        }
+    }
+
+    fn report_split(&mut self) {
+        let pct = |v: &mut Vec<u128>, p: f64| -> u128 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[(((v.len() - 1) as f64) * p) as usize]
+        };
+        let (cn, wn) = (self.cold.len(), self.warm.len());
+        let (c50, c99) = (pct(&mut self.cold, 0.50), pct(&mut self.cold, 0.99));
+        let (w50, w99) = (pct(&mut self.warm, 0.50), pct(&mut self.warm, 0.99));
+        println!(
+            "GSTRESS IDBSPLIT {:<6} cold n={cn} p50 {c50}us p99 {c99}us | \
+             warm n={wn} p50 {w50}us p99 {w99}us | cold/warm p50 {:.1}x | \
+             warm p99/p50 {:.1}x",
+            self.name,
+            if w50 > 0 { c50 as f64 / w50 as f64 } else { 0.0 },
+            if w50 > 0 { w99 as f64 / w50 as f64 } else { 0.0 }
+        );
     }
     fn report(&mut self) {
         if self.us.is_empty() {
@@ -382,6 +422,17 @@ pub(crate) fn run(iters: usize) {
     run_inner(iters, false)
 }
 
+/// The default arm has no index at read time — the store builds its map on the
+/// write path only — so every lookup binary-searches the sorted region. The
+/// native arm builds its index in 11.4 s at open and that cost is excluded from
+/// its latencies. Excluding both setups is only fair if both produce an index,
+/// so this arm builds one and excludes it the same way. The difference between
+/// the two arms is the part of the read gap attributable to that asymmetry
+/// rather than to KV-on-objects.
+pub(crate) fn run_indexed(iters: usize) {
+    run_inner_indexed(iters, false, true)
+}
+
 /// Same queries, same code path, emitting a per-iteration result digest
 /// instead of latencies. Deliberately not a second implementation: an
 /// equivalence check written alongside the benchmark can agree with itself
@@ -391,12 +442,30 @@ pub(crate) fn equiv(iters: usize) {
 }
 
 fn run_inner(iters: usize, digest: bool) {
+    run_inner_indexed(iters, digest, false)
+}
+
+fn run_inner_indexed(iters: usize, digest: bool, build_index: bool) {
     println!(
-        "GSTRESS STAMP harness={} mode=ldbc-indradb iters={}",
+        "GSTRESS STAMP harness={} mode=ldbc-indradb iters={} index={}",
         crate::HARNESS_REV,
-        iters
+        iters,
+        build_index
     );
-    let db = TwizzlerDatastore::open_db(DB).expect("open datastore");
+    // Excluded from the latencies below, exactly as the native arm's 11.4 s
+    // query-entry index build is excluded. The cost itself is a result: one
+    // entry per key (5.49 M at SF0.1) against the native index's 327 588 roots.
+    let t = Instant::now();
+    let db = if build_index {
+        TwizzlerDatastore::open_db_indexed(DB).expect("open datastore")
+    } else {
+        TwizzlerDatastore::open_db(DB).expect("open datastore")
+    };
+    println!(
+        "GSTRESS IDBQ OPEN: {:.2}s, index={build_index} (excluded from latencies)",
+        t.elapsed().as_secs_f64()
+    );
+    twizzler_indradb::kv_stats::reset();
     // No clear, and no reload: this must read what the load boot wrote, or the
     // comparison is against an empty store.
     let probe = crate::ldbc_query::load_person_params();
@@ -438,6 +507,8 @@ fn run_inner(iters: usize, digest: bool) {
 
     for i in 0..iters {
         let pid = &persons[i % persons.len()];
+        // The list cycles, so the first pass is every id's first touch.
+        let first_touch = i < persons.len();
 
         let t = Instant::now();
         let mut rows = 0;
@@ -455,7 +526,7 @@ fn run_inner(iters: usize, digest: bool) {
             }
             rows = out_edges(&db, p, "isLocatedIn").len();
         }
-        is1.us.push(t.elapsed().as_micros());
+        is1.push(t.elapsed().as_micros(), first_touch);
         is1.results += rows;
         let r1 = rows;
 
@@ -477,7 +548,7 @@ fn run_inner(iters: usize, digest: bool) {
             rows = ms.len();
             first = ms.first().map(|(_, u)| *u);
         }
-        is2.us.push(t.elapsed().as_micros());
+        is2.push(t.elapsed().as_micros(), first_touch);
         is2.results += rows;
         let r2 = rows;
 
@@ -495,7 +566,7 @@ fn run_inner(iters: usize, digest: bool) {
         if let Some(p) = by_id(&db, "person", pid) {
             rows = out_edges(&db, p, "knows").len() + in_edges(&db, p, "knows").len();
         }
-        is3.us.push(t.elapsed().as_micros());
+        is3.push(t.elapsed().as_micros(), first_touch);
         is3.results += rows;
         let r3 = rows;
 
@@ -506,7 +577,7 @@ fn run_inner(iters: usize, digest: bool) {
             let c = vprop(&db, m, "content");
             rows = usize::from(!c.is_empty());
         }
-        is4.us.push(t.elapsed().as_micros());
+        is4.push(t.elapsed().as_micros(), first_touch);
         is4.results += rows;
         let r4 = rows;
 
@@ -515,7 +586,7 @@ fn run_inner(iters: usize, digest: bool) {
         if let Some(m) = find_message(&db, &mid) {
             rows = out_edges(&db, m, "hasCreator").len();
         }
-        is5.us.push(t.elapsed().as_micros());
+        is5.push(t.elapsed().as_micros(), first_touch);
         is5.results += rows;
         let r5 = rows;
 
@@ -539,7 +610,7 @@ fn run_inner(iters: usize, digest: bool) {
             }
             rows = in_edges(&db, cur, "containerOf").len();
         }
-        is6.us.push(t.elapsed().as_micros());
+        is6.push(t.elapsed().as_micros(), first_touch);
         is6.results += rows;
         let r6 = rows;
 
@@ -548,7 +619,7 @@ fn run_inner(iters: usize, digest: bool) {
         if let Some(m) = find_message(&db, &mid) {
             rows = in_edges(&db, m, "replyOf").len();
         }
-        is7.us.push(t.elapsed().as_micros());
+        is7.push(t.elapsed().as_micros(), first_touch);
         is7.results += rows;
         let r7 = rows;
 
@@ -570,6 +641,13 @@ fn run_inner(iters: usize, digest: bool) {
     ] {
         l.report();
     }
+    println!("GSTRESS IDBQ SPLIT (first touch of each id vs repeats):");
+    for l in [
+        &mut is1, &mut is2, &mut is3, &mut is4, &mut is5, &mut is6, &mut is7,
+    ] {
+        l.report_split();
+    }
+    twizzler_indradb::kv_stats::report(if digest { "equiv" } else { "query" });
     println!(
         "GSTRESS IDBQ NOTE: entry lookups go through a property index because \
          IndraDB has no built-in (label, name) identity — that asymmetry is the \

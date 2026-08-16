@@ -1,5 +1,16 @@
 //! A sorted key-value store over Twizzler objects (board task D2a).
 //!
+//! # Read-path instrumentation (E7)
+//!
+//! [`stats`] counts what a read actually costs, because "the baseline is
+//! slower" is not a result and the mechanism is. Two things it exists to
+//! separate: **key search** — how many binary-search comparisons, each one a
+//! dereference into a 226 MB arena at an unpredictable offset — and **range
+//! amplification**, entries materialised against entries the caller consumed.
+//! `FIND_MAP_HITS` being zero over a whole query run is itself a finding: the
+//! volatile map is built on the write path only, so a read-only boot has no
+//! index at all. See [`Kv::build_read_index`].
+//!
 //! IndraDB's `Transaction` trait is written against sorted KV backends (its
 //! upstream ones are RocksDB and sled): it needs ordered iteration
 //! (`range_vertices` by UUID, `range_edges` by edge order) and prefix scans.
@@ -61,6 +72,75 @@ type Result<T> = core::result::Result<T, TwzError>;
 
 /// `flags` bit 0: the entry is deleted.
 const TOMBSTONE: u32 = 1;
+
+use core::sync::atomic::Ordering::Relaxed;
+
+/// Read-path counters for E7. Process-global rather than per-store: the
+/// datastore hands the `KvStore` out through a `RefCell` and re-borrows it once
+/// per chunk, so a field would have to cross every borrow boundary for no gain.
+///
+/// Relaxed ordering throughout — these are read once at the end of a
+/// single-threaded run, not used for synchronisation.
+pub mod stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Calls to `find` — one per point lookup.
+    pub static FINDS: AtomicU64 = AtomicU64::new(0);
+    /// Of those, how many the volatile map served. **Zero on a read-only boot**
+    /// unless `build_read_index` was called: that is the asymmetry E7 exists to
+    /// measure, since the native arm always has its query-entry index by then.
+    pub static FIND_MAP_HITS: AtomicU64 = AtomicU64::new(0);
+    /// Binary-search key comparisons. Each one dereferences a slot into the
+    /// arena at an unpredictable offset, so this is the page-touch proxy.
+    pub static SEARCH_CMPS: AtomicU64 = AtomicU64::new(0);
+    /// Calls to the range collector.
+    pub static SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Entries copied out of the store by those calls.
+    pub static SCAN_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+    /// Entries the cursor actually yielded. The gap against
+    /// `SCAN_MATERIALIZED` is the range amplification — work done for a caller
+    /// that walked away.
+    pub static SCAN_YIELDED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        for c in [
+            &FINDS,
+            &FIND_MAP_HITS,
+            &SEARCH_CMPS,
+            &SCAN_CALLS,
+            &SCAN_MATERIALIZED,
+            &SCAN_YIELDED,
+        ] {
+            c.store(0, Relaxed);
+        }
+    }
+
+    /// Three lines, prefixed so a run can be grepped out of a serial log.
+    pub fn report(label: &str) {
+        let finds = FINDS.load(Relaxed);
+        let hits = FIND_MAP_HITS.load(Relaxed);
+        let cmps = SEARCH_CMPS.load(Relaxed);
+        let calls = SCAN_CALLS.load(Relaxed);
+        let mat = SCAN_MATERIALIZED.load(Relaxed);
+        let yld = SCAN_YIELDED.load(Relaxed);
+        println!(
+            "GSTRESS KVSTATS {label} finds={finds} map_hits={hits} indexed={}",
+            finds > 0 && hits == finds
+        );
+        println!(
+            "GSTRESS KVSTATS {label} search_cmps={cmps} per_find={:.1}",
+            if finds > 0 {
+                cmps as f64 / finds as f64
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "GSTRESS KVSTATS {label} scan_calls={calls} materialized={mat} yielded={yld} amplification={:.1}x",
+            if yld > 0 { mat as f64 / yld as f64 } else { 0.0 }
+        );
+    }
+}
 
 /// `VecObject::push` **without the per-call object sync.**
 ///
@@ -288,7 +368,9 @@ impl KvStore {
     /// binary search over the sorted region plus a scan of whatever tail
     /// remains, which costs page touches but allocates nothing.
     fn find(&self, key: &[u8]) -> Option<usize> {
+        stats::FINDS.fetch_add(1, Relaxed);
         if let Some(m) = &self.map {
+            stats::FIND_MAP_HITS.fetch_add(1, Relaxed);
             return m.get(key).copied();
         }
         let data = self.data.as_slice();
@@ -311,6 +393,27 @@ impl KvStore {
         }
         self.rebuild_map();
         Ok(())
+    }
+
+    /// Build the volatile map for a **read-only** boot (E7).
+    ///
+    /// Without this a query boot never builds the map — `ensure_map` is on the
+    /// write path — so every lookup binary-searches the whole sorted region,
+    /// touching the arena at ~log2(n) unpredictable offsets. The native arm
+    /// meanwhile builds its query-entry index at open and has that cost
+    /// excluded from the reported latencies. **Excluding both setup costs is
+    /// only symmetric if both arms actually get an index**, which is what this
+    /// makes possible; call it at open and exclude it exactly as the native
+    /// index build is excluded.
+    ///
+    /// It is not free and the cost is itself a result: the map holds one entry
+    /// per key — 5.49 M at SF0.1 against the native index's 327 588 roots —
+    /// because a KV store must index every record while index-free adjacency
+    /// indexes only query entry points.
+    pub fn build_read_index(&mut self) {
+        if self.map.is_none() {
+            self.rebuild_map();
+        }
     }
 
     /// Rebuild the volatile map from the current slot order.
@@ -566,7 +669,21 @@ impl KvStore {
     /// `limit` is honoured **only when the store is fully sorted.** With an
     /// unsorted region present, ordering the result requires seeing all of it,
     /// so a limit would silently drop entries that belong in the first `limit`.
+    /// Counting wrapper — every materialisation goes through here, so the
+    /// entries-produced side of the E7 ratio has one place to be measured.
     fn collect_limited(
+        &self,
+        start: &[u8],
+        prefix: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        stats::SCAN_CALLS.fetch_add(1, Relaxed);
+        let out = self.collect_limited_inner(start, prefix, limit);
+        stats::SCAN_MATERIALIZED.fetch_add(out.len() as u64, Relaxed);
+        out
+    }
+
+    fn collect_limited_inner(
         &self,
         start: &[u8],
         prefix: Option<&[u8]>,
@@ -625,7 +742,10 @@ impl KvStore {
     /// point. Tombstoned slots participate: they keep their sorted position
     /// so a later `put` of the same key revives the entry in place.
     fn search(slots: &[Slot], arena: &[u8], key: &[u8]) -> core::result::Result<usize, usize> {
-        slots.binary_search_by(|s| Self::key_of(arena, s).cmp(key))
+        slots.binary_search_by(|s| {
+            stats::SEARCH_CMPS.fetch_add(1, Relaxed);
+            Self::key_of(arena, s).cmp(key)
+        })
     }
 
     fn key_of<'a>(arena: &'a [u8], s: &Slot) -> &'a [u8] {

@@ -463,6 +463,15 @@ fn main() {
         return;
     }
 
+    if arg1.as_deref() == Some("ldbc-indradb-indexed") {
+        let iters = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        ldbc_indradb::run_indexed(iters);
+        return;
+    }
+
     if arg1.as_deref() == Some("ldbc-indradb") {
         let iters = std::env::args()
             .nth(2)

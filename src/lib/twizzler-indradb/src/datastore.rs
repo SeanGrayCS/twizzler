@@ -116,6 +116,12 @@ impl<T> Iterator for ChunkScan<'_, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(v) = self.buf.next() {
+                // Counted here rather than at materialisation: the point of the
+                // E7 ratio is entries the caller took against entries the store
+                // produced, and IndraDB's executor take-whiles a handful off a
+                // chunk of `SCAN_CHUNK`.
+                crate::kv::stats::SCAN_YIELDED
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return Some(Ok(v));
             }
             let start = self.next.take()?;
@@ -246,7 +252,26 @@ impl TwizzlerDatastore {
     /// Open the datastore registered at `data/<name>`, creating and
     /// registering it if absent. Survives reboot, like the engine's
     /// `Graph::open_or_create`.
+    /// Open, and build the volatile key index before handing the store over
+    /// (E7).
+    ///
+    /// The store builds its map on the **write path only**, so a query boot
+    /// otherwise binary-searches every lookup over the whole sorted region.
+    /// The native arm has its query-entry index by the time latencies are
+    /// measured, and that build is excluded from them; excluding both setups is
+    /// only symmetric if both arms have an index to show for it.
+    ///
+    /// Built before the store is handed to `indradb::Database`, so this does
+    /// not depend on the wrapper's accessor shape.
+    pub fn open_db_indexed(name: &str) -> Result<indradb::Database<Self>> {
+        Self::open_db_inner(name, true)
+    }
+
     pub fn open_db(name: &str) -> Result<indradb::Database<Self>> {
+        Self::open_db_inner(name, false)
+    }
+
+    fn open_db_inner(name: &str, index: bool) -> Result<indradb::Database<Self>> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
 
@@ -266,7 +291,10 @@ impl TwizzlerDatastore {
                      (found version {version}, expected {VERSION})"
                 )));
             }
-            let kv = KvStore::open(data_raw, index_raw, sorted as usize).map_err(twz_err)?;
+            let mut kv = KvStore::open(data_raw, index_raw, sorted as usize).map_err(twz_err)?;
+            if index {
+                kv.build_read_index();
+            }
             return Ok(indradb::Database::new(TwizzlerDatastore {
                 kv: RefCell::new(kv),
                 root: RefCell::new(Some(root)),

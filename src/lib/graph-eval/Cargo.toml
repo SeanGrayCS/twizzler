@@ -26,7 +26,7 @@ crate-type = ["rlib"]
 # add the feature) when working on this crate. See the same pattern in
 # twizzler-graph, which slices its own suite three ways.
 [features]
-default = []
+default = ["tests"]
 tests = []
 
 [dependencies]

@@ -3,8 +3,15 @@ name = "rns"
 version = "0.1.0"
 edition = "2021"
 
+# rns — the relational namespace over Twizzler's own object structure.
+# A thin client of the twizzler-graph engine: objects = vertices, and the edges
+# are relations the OS already stores (namespace membership, FOT references).
+# `naming` is a direct dependency because the index is built by enumerating
+# `data/` and reading each object's Foreign Object Table.
+
 [dependencies]
 twizzler = { path = "../../lib/twizzler" }
 twizzler-abi = "*"
 twizzler-rt-abi = "*"
 twizzler-graph = { path = "../../lib/twizzler-graph" }
+naming = { path = "../../lib/naming" }
