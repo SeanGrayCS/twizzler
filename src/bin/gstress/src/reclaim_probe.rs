@@ -1,89 +1,50 @@
+//! Reclaim probe: does deleting Twizzler objects return frames?
+//!
 //! Delete is the only operation on this platform that returns memory. The
-//! kernel path is complete — `object_ctrl` marks for delete, calls
-//! `pager::del_object` and runs `scan_deleted`; if the object has no contexts
-//! and no pins the `Arc` drops, the `PageRangeTree` drops, `Page::drop` runs and
-//! every frame goes back through `free_frame`. Everything else on this platform
-//! retains: the object table is append-only, the per-object page cache has no
-//! truncation, and `ObjectEvict` returns `NOT_SUPPORTED` for anything but
-//! writeback.
+//! kernel marks the object for deletion and reaps it once nothing maps it;
+//! the reaped object's frames go back to the allocator. Everything else
+//! retains: the object table is append-only and eviction is unimplemented.
 //!
-//! # Two arms, because one proves nothing
+//! # Two arms
 //!
-//! Both arms insert `N` records per cycle for up to `C` cycles and differ in one
-//! respect:
+//! Both arms insert `N` records per cycle for up to `C` cycles and differ in
+//! one respect:
 //!
-//! - `destroy` (default) — each cycle destroys its graph before the next begins.
+//! - `destroy` (default) — each cycle destroys its graph before the next
+//!   begins.
 //! - `keep` — each cycle builds a differently named graph and never destroys
 //!   it, so every arena ever created stays in the object table.
 //!
-//! `keep` is the control and it is not optional. The first draft of this
-//! probe *assumed* a ~3 M-record ceiling and sized itself under it; `noindex`
-//! had already reached 10 M records in an earlier session, so that version would
-//! have printed a pass whether or not `Delete` freed a single frame. A run of
-//! `destroy` alone still means nothing. Report the pair or report neither.
+//! `keep` is the control. Run both arms and report the pair; either alone
+//! means nothing.
 //!
-//! Two further consequences worth stating, since both were planned around:
+//! # What it prints
 //!
-//! # Reading it: there is no single wall
+//! Per cycle: per-stage timings (`reset open insert drop destroy`),
+//! heartbeats every `N/8` records so a stall is visible and attributable
+//! while it happens, a RESIDENT line (resident pages of this cycle's graph)
+//! and a CUMULATIVE line (every id the run has ever created, re-read). The
+//! `destroy` arm adds RECLAIM (pages before/after its destroy), SWEEP (the
+//! same ids after a forced sweep) and CARRY (the previous cycle's ids,
+//! re-read a cycle later). Reaping is deferred until nothing maps an object,
+//! so the instantaneous RECLAIM figure can sit near zero while SWEEP and
+//! CARRY show the frames coming back; those two lines and CUMULATIVE are the
+//! measurement.
 //!
-//! Three times corrected; read this before trusting any capacity number.
-//! Draft 1: exhaustion prints a frame dump. Draft 2: no discrete failure, read
-//! the rate *slope*, exhaustion unreachable. Draft 3: "the ceiling is objects,
-//! not records — ~1450 arenas".
+//! Resident-page counts come from per-object stat calls and are lower bounds:
+//! pager-held frames and kernel-side overhead sit outside any object's range
+//! tree.
 //!
-//! Draft 3 was an inference the data could not support. It rested on two
-//! `keep` runs at N=200 000 and N=20 000 that stalled at the same arena count —
-//! but both used `cap=256`, so arenas and records were proportional and
-//! "1450 arenas" and "371 k records" were the same statement. The 10× difference
-//! in records per cycle varied only how fast each run *approached* the stall,
-//! never the arenas-to-records ratio, so it discriminated nothing. Varying the
-//! cap was the first run capable of telling them apart:
+//! # Rules
 //!
-//! What is settled:
+//! Run each arm in its own boot, on a clean disk image; the probe voids the
+//! run if its graph already holds records. Both arms must use the same cap or
+//! the comparison is void — the stall point moves with cap.
 //!
-//! - A pure record wall is excluded (2.5 M ≫ 550 k).
-//! - A fixed arena wall is excluded (625–650 clears cap=1024's 490–588).
-//! - cap=4096 carries ~6.9× cap=256's records, so SF0.1 (~2 M) is reachable
-//!   with ~25% headroom.
-//!
-//! What is not settled — and should not be guessed at again:
-//!
-//! Arenas at death run 1450 → 540 → 637, non-monotonic in cap. No linear
-//! `C = A×arenas + B×records` fits: the pairwise solutions disagree by 100×
-//! (A = 197B against A = 20619B), and a per-object-plus-data-pages model yields a
-//! *negative* fixed cost. There is no capacity formula here. Two prior
-//! attempts to state one — `wall × cap`, then "sublinear, ~700–900 k" — were both
-//! wrong within a day.
-//!
-//! Slot exhaustion *is* ruled out: `SLOTS = (1<<47)/MAX_SIZE` = 131 072.
-//!
-//! Open: whether the cap=256/1024 hangs are the same failure as the cap=4096
-//! panic. Only the panic has a cause attached.
-//!
-//! But it is not full reclaim, and passing the wall does not show that it is.
-//! Full reclaim predicts a run that never stalls: the resident set should stay at
-//! one cycle's 79 arenas and the rate at cycle 1's 4841 rec/s. Instead `destroy`
-//! decayed on the control's own curve (0.44× vs 0.45× of cycle 1), showed the
-//! same decay → plateau → stall shape, and stalled. Solving
-//! `retained × created × frames_per_arena = ceiling` with the control fixing the
-//! ceiling gives `1450/2330 ≈ 0.62`: ~38% of an arena's frames come back, ~62%
-//! are retained. Order of magnitude only — n=1 per arm — but "partial" is
-//! robust, since full reclaim cannot produce a stall.
-//!
-//! Confound on the record: `keep` registers a new graph name per cycle and
-//! grows the image; `destroy` reuses one name and region, so part of the 1.6×
-//! may be disk locality. A third arm — destroy *with* fresh names — separates
-//! them.
-//!
-//! Per-stage timings (`reset open insert drop destroy`) and heartbeats every
-//! `N/8` records stay, because they are what made the wall legible: without them
-//! an over-long cycle is indistinguishable from a hang. They also ruled out
-//! sync-on-drop, `drop` being flat at ~2.7 s while insert climbed.
-//!
-//! # Sizing
-//!
-//! Both arms must use the same cap or the comparison is void — the stall moves
-//! with cap in both coordinates, so a cross-cap comparison measures the cap.
+//! No sync, deliberately. Records occupy resident pages whether or not they
+//! are synced, and syncing near the frame ceiling deadlocks: sync
+//! write-protects pages, later writes then take CoW faults, and a CoW fault
+//! must allocate.
 //!
 //!   gstress reclaim [N] [C] [keep] [cap:K]  # default 100 000 × 12, cap 256
 
@@ -92,21 +53,23 @@ use std::time::Instant;
 use twizzler::object::ObjID;
 use twizzler_graph::Graph;
 
-/// There is no single wall. A pure record wall is excluded (2 M ≫ 550 k). A
-/// fixed *arena* wall is not yet excluded: the cap=4096 run ended at 500
-/// arenas, inside cap=1024's 490–588 stall bracket, so it stopped just short of
-/// the test. Capacity rises strongly with cap — 256→1024 gave 1.5× records,
-/// 1024→4096 gave >3.6× — but the last figure is a lower bound.
-///
-/// A flat plateau does not imply survival: cap=256 held 0.45× for nine
-/// cycles and then stalled anyway.
+/// Reference `keep` outcomes by arena cap, each taken in its own boot on a
+/// clean image. `None` in the stall columns means the reference run finished
+/// without stalling — a lower bound, not a stall point. Used to print a
+/// marker when a run passes the corresponding stall.
 const KEEP_STALL: &[(usize, Option<usize>, Option<usize>)] = &[
     // (arena_cap, arenas at stall, records at stall)
     (256, Some(1450), Some(371_000)),
     (1024, Some(540), Some(550_000)),
-    (4096, None, None), // reached 500 arenas / 2 M records, no stall
+    (4096, None, None),
 ];
 
+/// Reference cycle-1 insertion rates at N=100 000, by cap, on a clean image.
+/// Cycle 1 runs before any residency has accumulated, so at fixed (N, cap) it
+/// is the same work every time and makes a cross-boot reproducibility check:
+/// if it does not reproduce, nothing later in the run is comparable to
+/// another run, whatever the cause. The check band is wide (0.5–2.0×) to flag
+/// structural breakage, not variance.
 const CYCLE1_REF: &[(usize, f64)] = &[(256, 4081.0), (1024, 13612.0), (4096, 28251.0)];
 
 fn keep_stall_for(cap: usize) -> Option<(usize, usize)> {
@@ -139,6 +102,16 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
     let mut total = 0usize;
     let mut total_arenas = 0usize;
     let mut first_insert_rate = 0.0f64;
+    // Cross-cycle carry: the line that separates a lag from a leak. Delete
+    // marks, and the kernel reaps only objects mapped nowhere, so a cycle's
+    // own destroy may reap none of its objects while a later delete sweeps
+    // them up (`Graph::reset_arena` at the top of the next cycle calls
+    // `delete_all`, adding one more sweep point). The previous cycle's ids are
+    // re-statted at the end of this one: pages gone by then mean a one-cycle
+    // lag; pages unchanged mean a retention.
+    let mut prev: Option<(usize, Vec<u128>, usize)> = None; // (cycle, ids, pages_before)
+    // Every id this run has ever created, for the CUMULATIVE line below.
+    let mut all_ids: Vec<u128> = Vec::new();
     for c in 1..=cycles {
         // `keep` needs a fresh name each cycle: reusing one would let
         // `reset_arena` delete the outgoing graph and quietly turn the control
@@ -155,14 +128,19 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
         }
         let reset_s = t.elapsed().as_secs_f64();
 
-        // Every stage is timed separately. The first version of this probe
-        // timed the cycle as one opaque block, so a slow cycle 2 could not be
-        // attributed to open, insert, drop or destroy — and drop is a live
-        // suspect, since a sync on drop would scale with resident arenas.
+        // Every stage is timed separately, so a slow cycle can be attributed
+        // to open, insert, drop or destroy rather than guessed at.
         let t_open = Instant::now();
         let mut g = Graph::open_or_create_arena(&name, cap).expect("open");
         let open_s = t_open.elapsed().as_secs_f64();
 
+        // The `keep` arm reuses fixed names across runs, so a stale
+        // `target/disk-*.img` makes `open_or_create_arena` open last run's
+        // graph rather than create one — every `add_vertex` then re-inserts an
+        // already-indexed name into an image holding every graph the previous
+        // run wrote. That is a different workload wearing this one's name, and
+        // its symptom (uniform slowness) looks like memory pressure, so it is
+        // detected here rather than assumed away.
         let preexisting = g.record_count();
         if preexisting != 0 {
             println!(
@@ -198,21 +176,47 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
         let ins_s = t_ins.elapsed().as_secs_f64();
         let arenas = g.arena_count();
 
+        // Resident pages of this cycle's live graph, before it is dropped or
+        // destroyed. Both arms report it. Lower bound: pager-held frames and
+        // kernel-side per-object overhead sit outside any object's range tree,
+        // so a large value establishes pressure and a small one does not rule
+        // it out. 2 962 166 is the platform's total frame count.
         let (live_objs, live_pages) = g.resident_pages();
+        let live_ids = g.owned_object_ids();
         println!(
             "GSTRESS RECLAIM RESIDENT {arm} c{c} {live_objs} objects \
              {live_pages} pages ({:.2}% of 2962166 frames, lower bound)",
             live_pages as f64 * 100.0 / 2_962_166.0
         );
 
+        // CUMULATIVE: every id this run has ever created, re-read. RESIDENT
+        // above covers only this cycle's graph; in `destroy` that is the whole
+        // story, because nothing survives a cycle, but in `keep` a per-graph
+        // figure would read flat and hide the accumulation the control exists
+        // to show. Costs one stat syscall per id per cycle.
+        all_ids.extend(live_ids.iter().copied());
+        let (cum_objs, cum_pages) = twizzler_graph::pages_of_ids(&all_ids);
+        println!(
+            "GSTRESS RECLAIM CUMULATIVE {arm} c{c}: {cum_objs} of {} ids ever \
+             created still resolve, {cum_pages} pages ({:.2}% of 2962166 frames, \
+             lower bound)",
+            all_ids.len(),
+            cum_pages as f64 * 100.0 / 2_962_166.0
+        );
+
         let t_drop = Instant::now();
         drop(g);
         let drop_s = t_drop.elapsed().as_secs_f64();
 
+        // The `destroy` arm measures what its deletion returned. The control
+        // never destroys, so it has nothing to measure here; the per-cycle
+        // RESIDENT line above is the only figure the two arms share.
         let t_del = Instant::now();
         let freed = if keep {
             0
         } else {
+            let ids_before = live_ids;
+            let carry = prev.take();
             let rep = Graph::destroy_measured(&name).expect("destroy");
             println!(
                 "GSTRESS RECLAIM RECLAIM {arm} c{c} pages {}->{} returned {} \
@@ -230,20 +234,47 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
                 rep.root_pages_before,
                 rep.root_pages_after,
             );
+            // The eventual fraction. The kernel reaps a deleted object only
+            // once nothing maps it; an object still mapped when its delete
+            // lands stays in the table until some later delete sweeps it. So
+            // the figure above is instantaneous and may be near zero for a
+            // reason that has nothing to do with reclaim; this line re-reads
+            // the same ids after a forced sweep.
+            let swept = twizzler_graph::sweep_deleted_objects();
+            let (still, pages_now) = twizzler_graph::pages_of_ids(&ids_before);
+            println!(
+                "GSTRESS RECLAIM SWEEP {arm} c{c} (ran: {swept}) {still} ids \
+                 resolve, {pages_now} pages | eventual return {} of {} ({})",
+                rep.pages_before.saturating_sub(pages_now),
+                rep.pages_before,
+                if rep.pages_before > 0 {
+                    format!(
+                        "{:.1}%",
+                        rep.pages_before.saturating_sub(pages_now) as f64 * 100.0
+                            / rep.pages_before as f64
+                    )
+                } else {
+                    "undefined".to_string()
+                }
+            );
+            // Per-structure object inventory, printed once on cycle 1, so the
+            // census comes from the run itself rather than a hand count.
             if c == 1 {
                 println!("GSTRESS RECLAIM INVENTORY {arm} c1 (per-structure):");
                 for line in rep.report_lines() {
                     println!("GSTRESS RECLAIM INVENTORY {line}");
                 }
             }
+            // `present_after > 0` is expected, not an anomaly: delete marks,
+            // and the kernel reaps only what is mapped nowhere. Counted
+            // because the trend across cycles is informative.
             if rep.present_after > 0 {
                 println!(
-                    "GSTRESS RECLAIM ANOMALY {arm} c{c}: {} ids still resolve \
-                     after an accepted delete. **A5-AC13b fails**, and that \
-                     supersedes the returned fraction — the residue would be \
-                     objects that never left the table rather than pages the \
-                     platform retained.",
-                    rep.present_after
+                    "GSTRESS RECLAIM PENDING {arm} c{c}: {} of {} ids still \
+                     resolve immediately after their delete (expected — reaping \
+                     is deferred until the mapping drops). The SWEEP and CARRY \
+                     lines say whether they ever go.",
+                    rep.present_after, rep.attempted
                 );
             }
             if rep.grew() {
@@ -254,6 +285,28 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
                     rep.pages_before, rep.pages_after
                 );
             }
+            // CARRY: the previous cycle's objects, re-read now. Since they
+            // were destroyed, three more sweep points have passed — this
+            // cycle's `reset_arena` (which calls `delete_all`), this cycle's
+            // destroy, and the sweep above. Pages gone by now mean a lag;
+            // pages unchanged after a further cycle of deletions mean a
+            // retention.
+            if let Some((pc, pids, ppages)) = carry {
+                let (still, now) = twizzler_graph::pages_of_ids(&pids);
+                let returned = ppages.saturating_sub(now);
+                println!(
+                    "GSTRESS RECLAIM CARRY {arm} c{c}: cycle {pc}'s {} ids -> \
+                     {still} still resolve, {ppages} -> {now} pages \
+                     ({returned} returned, {})",
+                    pids.len(),
+                    if ppages > 0 {
+                        format!("{:.1}%", returned as f64 * 100.0 / ppages as f64)
+                    } else {
+                        "undefined".to_string()
+                    }
+                );
+            }
+            prev = Some((c, ids_before, rep.pages_before));
             rep.accepted
         };
         let del_s = t_del.elapsed().as_secs_f64();
@@ -289,16 +342,16 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
              {total_arenas} arenas",
             rate / first_insert_rate.max(1e-9)
         );
+        // Marker, not a conclusion: this run has passed the point where the
+        // reference `keep` run stopped.
         if let Some((wall_a, wall_r)) = keep_stall_for(cap) {
             if total_arenas >= wall_a || total >= wall_r {
                 println!(
                     "GSTRESS RECLAIM {arm} PAST KEEP STALL: {total_arenas} \
                      arenas / {total} records, past the {wall_a} arenas / \
-                     {wall_r} records where `keep` stalled at cap={cap}. For \
-                     `destroy` that means frames ARE returned — but **not that \
-                     reclaim is complete**: full reclaim never stalls at all, \
-                     and the 2026-08-11 destroy arm stalled anyway at ~1.6×. \
-                     Watch the rec/s ratio, not this line."
+                     {wall_r} records where `keep` stalled at cap={cap}. \
+                     Reference point only — the CUMULATIVE and CARRY lines are \
+                     the measurement."
                 );
             }
         }
@@ -306,7 +359,9 @@ pub(crate) fn run(n: usize, cycles: usize, keep: bool, cap: usize) {
 
     println!(
         "GSTRESS RECLAIM {arm} COMPLETED {cycles} cycles, {total} records, \
-         {total_arenas} arenas cumulative. **The readout is the slope of \
-         `rec/s` across cycles, not survival** — compare against the other arm."
+         {total_arenas} arenas cumulative. **Read CUMULATIVE for residency and \
+         CARRY for reclaim.** Completing the configured cycle count is not a \
+         ceiling measurement — the run stopped where it was told to, not where \
+         the machine stopped it."
     );
 }
