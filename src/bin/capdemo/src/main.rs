@@ -2,8 +2,9 @@
 //! whether a graph can hide behind it.
 //!
 //! **Read `docs/handoffs/G1-NOTES.md` first.** G1's acceptance criteria as
-//! written are not achievable, for two reasons this binary is built to confirm
-//! or refute on real hardware rather than argue on paper:
+//! written are not achievable. Reasons 1 and 2 are why; 3 and 4 were found by
+//! running this binary, which is what it exists for — to confirm or refute on
+//! real hardware rather than argue on paper:
 //!
 //! 1. The engine creates every object it owns through `ObjectBuilder::default()`,
 //!    whose `def_prot` is `Protections::all()` — so every graph object is
@@ -14,6 +15,18 @@
 //!    happens at first touch and arrives as `UpcallInfo::SecurityViolation`,
 //!    which the monitor declines and turns into `sys_thread_exit(101)`. Steps
 //!    Q3/Q5 assert that the map *succeeds* and the compartment then dies.
+//!
+//! 3. An unallocated object id does not fail cheaply. **Measured 2026-08-14:**
+//!    it reaches the pager, which answers `uncategorized error: 0`, and the
+//!    request retries without bound — the process hangs. So the "wrong id"
+//!    control AC1 asked for does not exist here; P1 and Q2 are behind
+//!    `--bogus-id` and off by default, with the evidence recorded at P1.
+//!
+//! 4. The masking half of the model cannot be reached at all. The kernel
+//!    applies per-object `permmask`/`ovrmask` (`security.rs:169`) but nothing
+//!    in `twizzler-security` can populate `SecCtxBase.masks` — there is no
+//!    `insert_mask`. Step P7 asserts that against a live context, and explains
+//!    why it is what blocks confirming the report's §6.3 defect from userspace.
 //!
 //! So the capability mechanism is exercised on hand-built objects (which can be
 //! created with the right spec from outside the engine), and the engine's
@@ -43,9 +56,9 @@ use std::process::Command;
 use twizzler::object::{Object, ObjectBuilder, RawObject, TypedObject as _};
 use twizzler_abi::{
     object::{ObjID, Protections},
-    syscall::ObjectCreate,
+    syscall::{sys_thread_active_sctx_id, ObjectCreate},
 };
-use twizzler_graph::Graph;
+use twizzler_graph::{Graph, GraphError, Labels, PropValue, VertexId};
 use twizzler_rt_abi::{
     error::{ObjectError, TwzError},
     object::MapFlags,
@@ -63,9 +76,12 @@ const EXIT_MAP_ERRED: i32 = 4;
 /// violation — see the note on `Q3` about how weak a signal it is.
 const EXIT_KILLED: i32 = 101;
 
-/// An object id nothing will have allocated. Used as the "wrong id" control:
-/// this failure mode is a typed error at map time, which is what makes it
-/// distinguishable from a denial.
+/// An object id nothing will have allocated. Intended as the "wrong id"
+/// control, on the expectation that it would fail as a typed error at map time
+/// and so be distinguishable from a denial.
+///
+/// **It does not.** Mapping it hangs in the pager — see the note at P1. Only
+/// reachable behind `--bogus-id`.
 const BOGUS_ID: u128 = 0xDEAD_BEEF_0000_0000_0000_0000_CAFE_F00D;
 
 const PUBLIC_MAGIC: u64 = 0x5075_626C_6963_0001; // "Public"
@@ -123,32 +139,60 @@ fn main() {
     if args.len() > 1 && args[1] == "child" {
         child(&args[2..])
     } else {
-        parent()
+        parent(
+            args.iter().any(|a| a == "--bogus-id"),
+            args.iter().any(|a| a == "--graph"),
+        )
     }
 }
 
-fn parent() -> ! {
+fn parent(bogus: bool, graph: bool) -> ! {
     let mut c = Checks::default();
 
-    // --- P1: the "wrong object id" control -------------------------------
+    // --- P1: the "wrong object id" control (opt-in: `--bogus-id`) ---------
     //
     // AC1 warns against a test that would pass for the wrong reason — one that
-    // accepts any failure, including a mistyped object id. That failure has a
-    // *different shape*, and this pins it down: an unallocated id fails inside
-    // `sys_object_map`'s `lookup_object`, as a typed error, in-process. A
-    // denial (Q3) does not.
-    println!("P1: map an unallocated object id");
-    match unsafe { Object::<u64>::map_unchecked(ObjID::new(BOGUS_ID), MapFlags::READ) } {
-        Err(e) => c.check(
-            "P1 unallocated id yields ObjectError::NoSuchObject",
-            matches!(e, TwzError::Object(ObjectError::NoSuchObject)),
-            format!("got {e:?}"),
-        ),
-        Ok(_) => c.check(
-            "P1 unallocated id yields ObjectError::NoSuchObject",
-            false,
-            "map succeeded on an id nothing allocated",
-        ),
+    // accepts any failure, including a mistyped object id. That failure was
+    // expected to have a *different shape*: an unallocated id failing inside
+    // `sys_object_map`'s `lookup_object`, as a typed error, in-process, where a
+    // denial (Q3) is fatal and deferred to first touch.
+    //
+    // **MEASURED 2026-08-14: it does not, and this step hangs the run.** An
+    // unallocated id is not rejected by `lookup_object`. The kernel asks the
+    // pager for it, the pager answers with `uncategorized error: 0` for
+    // `ObjectInfoReq`, and the request is retried without bound — one log line
+    // per attempt, forever. `map` never returns, so `NoSuchObject` is never
+    // observed and the process cannot make progress.
+    //
+    // Two consequences, both findings rather than defects in this binary:
+    //
+    // 1. **The discrimination AC1 asked for is not available on this build.**
+    //    There is no cheap "wrong id" failure to contrast a denial against,
+    //    because the wrong-id path does not terminate. Q2 is disabled for the
+    //    same reason.
+    // 2. `G1-NOTES.md` §1.1 predicted a typed in-process error here. That
+    //    prediction is refuted, and the notes were written from source without
+    //    a run — which is exactly the class of claim this binary exists to
+    //    settle.
+    //
+    // Left in place behind a flag rather than deleted: the hang is the
+    // evidence, and re-deriving it later would cost another boot.
+    if bogus {
+        println!("P1: map an unallocated object id (WILL HANG — see the note in the source)");
+        match unsafe { Object::<u64>::map_unchecked(ObjID::new(BOGUS_ID), MapFlags::READ) } {
+            Err(e) => c.check(
+                "P1 unallocated id yields ObjectError::NoSuchObject",
+                matches!(e, TwzError::Object(ObjectError::NoSuchObject)),
+                format!("got {e:?}"),
+            ),
+            Ok(_) => c.check(
+                "P1 unallocated id yields ObjectError::NoSuchObject",
+                false,
+                "map succeeded on an id nothing allocated",
+            ),
+        }
+    } else {
+        println!("P1: skipped — unallocated ids hang the pager on this build (--bogus-id to run)");
     }
 
     // --- P2: what ObjectBuilder::default() actually creates ---------------
@@ -196,6 +240,23 @@ fn parent() -> ! {
     // compartment can already reach every graph on the machine. Must run
     // before P5, which inserts a capability into this very context.
     println!("P4: this compartment's security context");
+    // **The single most load-bearing check in this binary, as of the Q3/Q5
+    // result on 2026-08-14.** Both enforcement points short-circuit to "allow"
+    // when the thread's active security context id is 0:
+    //
+    //   * `check_security` (fault.rs:118) returns `Protections::all()`
+    //   * `check_settings` (region.rs:80) returns `Ok(())`
+    //
+    // So an active sctx of 0 means *nothing is enforced anywhere*, and every
+    // denial this binary expects would silently not happen. Q3 and Q5 observed
+    // exactly that. If this check passes in P and the child prints 0, the
+    // difference is where the explanation lives.
+    let own_sctx = sys_thread_active_sctx_id();
+    c.check(
+        "P4 active sctx id is not the kernel context (0)",
+        own_sctx.raw() != 0,
+        format!("active sctx = {:x} — all enforcement is bypassed", own_sctx.raw()),
+    );
     let ctx = SecCtx::active_ctx();
     let base = ctx.base();
     c.eq("P4 global mask is all()", base.global_mask, Protections::all());
@@ -275,6 +336,71 @@ fn parent() -> ! {
     // landed is Q4, which asks the kernel rather than the mapping.
     c.eq("P6 capability landed in the delegation context", deleg.base().map.len(), 1);
 
+    // --- P7: the masking half of the model is unreachable ------------------
+    //
+    // The security paper's effective-permission formula is
+    //
+    //     P = (caps ∪ default_prot) ∩ permmask ∩ (global_mask ∪ ovrmask)
+    //
+    // and the kernel implements the mask terms: `security.rs:169` reads
+    // `base.masks.get(&target)` and applies `permmask` and `ovrmask` to what
+    // the capabilities and default permissions gave.
+    //
+    // **Nothing can put anything in that map.** `SecCtxBase.masks` is
+    // initialised empty (`sec_ctx/base.rs:94`) and `SecCtx` exposes
+    // `insert_cap`, `insert_del` (`unimplemented!()`), `remove_cap` and
+    // `remove_del` (both `unimplemented!()`) — there is no `insert_mask`
+    // anywhere in `twizzler-security`. So the kernel's mask branch is
+    // unreachable from userspace and the per-object half of the formula is
+    // inert. These checks are that claim asked of a live context rather than
+    // of the source.
+    //
+    // **This is also why the global-mask defect in the report's §6.3 cannot be
+    // demonstrated from here**, which is worth stating at the site rather than
+    // only in the write-up. Isolating a restrictive context *is* possible —
+    // `UNDETACHABLE` stops `search_access` falling back to this compartment's
+    // own `all()` context (`security.rs:244`). But a *global* mask applies to
+    // every object, so restricting any right also strips the child's own stack,
+    // heap and text, and the compartment dies on its next stack write rather
+    // than on the object under test: exit 101 either way, proving nothing. The
+    // per-object mask is exactly the mechanism that would scope a restriction
+    // to one object, and it cannot be set. Confirming that defect needs a
+    // kernel-side test of `SecurityContext::lookup`, not a compartment.
+    println!("P7: the mask half of the formula is unreachable");
+    let own = SecCtx::active_ctx();
+    c.check(
+        "P7 this compartment's context has no per-object masks",
+        own.base().masks.is_empty(),
+        format!("{} entries", own.base().masks.len()),
+    );
+    // A context asked for an explicitly restrictive global mask: the global
+    // mask lands as given, the per-object map stays empty. That asymmetry is
+    // the finding — one half of the formula is settable and the other is not.
+    let restricted = SecCtx::new(
+        ObjectCreate::default(),
+        Protections::READ,
+        SecCtxFlags::empty(),
+    )
+    .expect("restricted context");
+    c.eq(
+        "P7 a restrictive global mask is stored as given",
+        restricted.base().global_mask,
+        Protections::READ,
+    );
+    c.check(
+        "P7 a freshly created context has no per-object masks",
+        restricted.base().masks.is_empty(),
+        format!("{} entries", restricted.base().masks.len()),
+    );
+    // `insert_cap` is the only mutation the API offers. P6 used it on `deleg`;
+    // the mask map is still empty, so the one available write path does not
+    // reach it even incidentally.
+    c.check(
+        "P7 inserting a capability leaves the mask map empty",
+        deleg.base().masks.is_empty(),
+        format!("{} entries", deleg.base().masks.len()),
+    );
+
     let pub_id = format!("{:x}", public.id().raw());
     let priv_id = format!("{:x}", private.id().raw());
     let deleg_id = format!("{:x}", deleg.id().raw());
@@ -283,9 +409,18 @@ fn parent() -> ! {
     println!("Q1: child reads a world-readable object");
     expect_exit(&mut c, "Q1 child reads the public object", 0, &["public-read", pub_id.as_str()]);
 
-    // --- Q2: the discrimination AC1 wanted --------------------------------
-    println!("Q2: child maps an unallocated id");
-    expect_exit(&mut c, "Q2 child sees NoSuchObject, not a denial", 0, &["missing"]);
+    // --- Q2: the discrimination AC1 wanted (opt-in: `--bogus-id`) ---------
+    //
+    // Disabled by default for the reason recorded at P1: an unallocated id
+    // hangs in the pager rather than returning `NoSuchObject`, so this child
+    // would never exit and the run would stop here. The contrast Q2/Q3 was
+    // built to draw is therefore unavailable on this build.
+    if bogus {
+        println!("Q2: child maps an unallocated id (WILL HANG — see P1)");
+        expect_exit(&mut c, "Q2 child sees NoSuchObject, not a denial", 0, &["missing"]);
+    } else {
+        println!("Q2: skipped — see P1");
+    }
 
     // --- Q3: the denial ----------------------------------------------------
     //
@@ -322,6 +457,21 @@ fn parent() -> ! {
         EXIT_KILLED,
         &["deleg-write", priv_id.as_str(), deleg_id.as_str()],
     );
+
+    if graph {
+        capability_graph(
+            &mut c,
+            own_sctx,
+            &deleg,
+            public.id(),
+            private.id(),
+            v_key.id(),
+            meta.default_prot,
+            pmeta.default_prot,
+        );
+    } else {
+        println!("P8: skipped — pass --graph to model this capability network as a graph");
+    }
 
     c.finish()
 }
@@ -365,6 +515,15 @@ fn explain(got: i32, want: i32) -> String {
 
 fn child(args: &[String]) -> ! {
     let step = args.first().map(String::as_str).unwrap_or("");
+    // See the note at P4. Q3 and Q5 succeeded where they should have been
+    // denied; if this prints 0, the enforcement points were short-circuited and
+    // no capability was ever consulted. Printed rather than asserted because
+    // the steps that matter are expected to die, and a dead child reports
+    // nothing.
+    println!(
+        "  [child {step}] active sctx = {:x}",
+        sys_thread_active_sctx_id().raw()
+    );
     match step {
         // Denial is scoped, not global: Q reads a world-readable object in the
         // same run in which it is denied the protected one.
@@ -472,4 +631,228 @@ fn child(args: &[String]) -> ! {
             std::process::exit(EXIT_ASSERT);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// P8 — the capability network as a graph (RQ3)
+// ---------------------------------------------------------------------------
+
+/// The graph P8 builds. Distinct from `PROBE_GRAPH` so the §2 probe and this
+/// model cannot contaminate each other.
+const CAP_GRAPH: &str = "capdemo-capgraph";
+
+/// Emit one edge per granted right, rather than one edge carrying a bitfield.
+///
+/// This is the representation decision from `docs/capability-graph.md` §2(a),
+/// and it is made for a reason the engine's layout supplies: `AdjRef` carries
+/// the edge label, so a label-filtered walk decides membership *inside the
+/// adjacency read*, while a `protections` property would cost a record-head and
+/// a data-block read per candidate edge, mid-traversal. "Every context that can
+/// write O" is then a structural query rather than an arithmetic one.
+///
+/// The full bitfield is kept as an edge property too, so a capability can be
+/// reconstructed from the graph without consulting the source it came from.
+fn grant_edges(
+    g: &mut Graph,
+    from: VertexId,
+    to: VertexId,
+    prots: Protections,
+) -> Result<(), GraphError> {
+    for (bit, label) in [
+        (Protections::READ, "grants_r"),
+        (Protections::WRITE, "grants_w"),
+        (Protections::EXEC, "grants_x"),
+    ] {
+        if prots.contains(bit) {
+            let e = g.add_edge(from, label, to)?;
+            g.set_edge_prop(e, "protections", PropValue::U64(prots.bits() as u64))?;
+        }
+    }
+    Ok(())
+}
+
+/// Model the capability network this run just created, then ask it the
+/// questions §6.3 of the report says are worth asking.
+///
+/// **What this is.** The vertices and edges below are the *real* security
+/// state of this process: the ids are the ones the kernel minted, the
+/// protections are the ones on the signed capability P6 inserted, and the
+/// default permissions are the ones read back from object metadata in P2/P5.
+/// Nothing here is synthetic.
+///
+/// **What this is not.** It is one process's view, not the system's. Modelling
+/// every context on the machine needs system-wide enumeration of security
+/// contexts, which this project has never verified is possible — see G2-AC1 in
+/// `docs/tasks.md`. That limitation is the honest boundary of the claim and is
+/// stated in the report rather than papered over.
+fn capability_graph(
+    c: &mut Checks,
+    own_ctx: ObjID,
+    deleg: &SecCtx,
+    public: ObjID,
+    private: ObjID,
+    key: ObjID,
+    public_def_prot: Protections,
+    private_def_prot: Protections,
+) {
+    println!("P8: model this capability network as a graph");
+    match build_and_query(c, own_ctx, deleg, public, private, key, public_def_prot, private_def_prot) {
+        Ok(()) => {}
+        Err(e) => c.check("P8 graph model built and queried", false, format!("{e}")),
+    }
+}
+
+fn build_and_query(
+    c: &mut Checks,
+    own_ctx: ObjID,
+    deleg: &SecCtx,
+    public: ObjID,
+    private: ObjID,
+    key: ObjID,
+    public_def_prot: Protections,
+    private_def_prot: Protections,
+) -> Result<(), GraphError> {
+    // Idempotent across runs, like every other graph this project builds.
+    Graph::reset(CAP_GRAPH)?;
+    let mut g = Graph::open_or_create(CAP_GRAPH)?;
+
+    // --- vertices: contexts, objects, keys are all just objects -----------
+    //
+    // They share one label space *because they share one id space*. That is
+    // the property the report leans on: on a data-centric OS every endpoint of
+    // a security relation is an object with a 128-bit id, so the node space is
+    // homogeneous without being made so.
+    let v_own = g.add_vertex("context", "ctx:self", own_ctx)?;
+    g.set_vertex_prop(v_own, "global_mask", PropValue::U64(Protections::all().bits() as u64))?;
+
+    let v_deleg = g.add_vertex("context", "ctx:deleg", deleg.id())?;
+    g.set_vertex_prop(
+        v_deleg,
+        "global_mask",
+        PropValue::U64(deleg.base().global_mask.bits() as u64),
+    )?;
+
+    let v_public = g.add_vertex("object", "obj:public", public)?;
+    g.set_vertex_prop(v_public, "default_prot", PropValue::U64(public_def_prot.bits() as u64))?;
+
+    let v_private = g.add_vertex("object", "obj:private", private)?;
+    g.set_vertex_prop(v_private, "default_prot", PropValue::U64(private_def_prot.bits() as u64))?;
+
+    let v_key = g.add_vertex("key", "key:private", key)?;
+
+    // --- edges -------------------------------------------------------------
+    //
+    // One `grants_*` edge per right on the capability P6 minted, and a
+    // `keyed_by` edge to the object's signing key. The second is what makes
+    // meta access control queryable: a capability for O is signed with O's
+    // key, so "who may grant access to O" is "who has read on O's key object"
+    // — two hops, below.
+    grant_edges(&mut g, v_deleg, v_private, Protections::READ)?;
+    g.add_edge(v_private, "keyed_by", v_key)?;
+
+    c.eq("P8 graph holds 5 vertices", g.traversal().vertices().count(), 5);
+
+    // --- Q(a): who can access the private object? --------------------------
+    //
+    // **This is the query the kernel cannot answer.** A security context
+    // indexes its entries by target object id, so "what may this context do to
+    // O" is fast; there is no inverse index anywhere in the system, so "who can
+    // reach O" requires enumerating every context and scanning each. Under
+    // index-free adjacency it is one label-filtered adjacency read.
+    let readers = g
+        .traversal()
+        .v(v_private)
+        .in_(Labels::these(&["grants_r"]))
+        .to_ids();
+    c.eq("P8 exactly one context can read the private object", readers.len(), 1);
+    c.check(
+        "P8 that context is the delegation context",
+        readers.first() == Some(&v_deleg),
+        "in-neighbour over grants_r was not ctx:deleg",
+    );
+
+    // Nobody can write it: the capability granted READ only, so no `grants_w`
+    // edge was ever emitted. A bitfield property would need arithmetic here;
+    // an absent label needs none.
+    c.eq(
+        "P8 no context can write the private object",
+        g.traversal().v(v_private).in_(Labels::these(&["grants_w"])).count(),
+        0,
+    );
+
+    // --- Q(b): the path, with the edge that authorised it ------------------
+    //
+    // B6 exists because of this query. A vertex-only path says ctx:deleg
+    // reached obj:private; it cannot say *which* capability let it, and a
+    // context may hold several for one target. The edge element is the answer.
+    let paths = g.traversal().v(v_deleg).out(Labels::any()).path();
+    c.eq("P8 one authorised path out of ctx:deleg", paths.len(), 1);
+    let named_edge = paths
+        .first()
+        .and_then(|p| p.get(1).copied())
+        .and_then(|e| e.as_edge())
+        .and_then(|e| g.edge_info(e))
+        .map(|i| i.label);
+    c.eq(
+        "P8 the path names the capability that authorised it",
+        named_edge.as_deref(),
+        Some("grants_r"),
+    );
+
+    // --- Q(c): meta access control -----------------------------------------
+    //
+    // §5.3 of the security paper argues that "who may grant access to O" is
+    // expressible, because issuing a capability for O requires O's signing
+    // key and read access to a key object is ordinary access control. Two
+    // hops make it *queryable*.
+    //
+    // The answer here is empty, and that is a result rather than a gap: no
+    // capability over the key object has been granted to anyone, so no context
+    // on this machine can issue a further capability for obj:private. Whoever
+    // holds the signing key does so outside the capability system entirely.
+    let granters = g
+        .traversal()
+        .v(v_private)
+        .out(Labels::these(&["keyed_by"]))
+        .in_(Labels::these(&["grants_r"]))
+        .to_ids();
+    c.eq("P8 nobody holds a capability over the private object's key", granters.len(), 0);
+
+    // --- Q(d): ambient authority -------------------------------------------
+    //
+    // Objects whose *default* permissions grant at least as much as any
+    // capability does — where the capability system is decorative because the
+    // defaults already permit everything.
+    //
+    // This reproduces P2/P3 as a query rather than as a hand-written
+    // assertion, which is the point of the exercise: the finding that every
+    // engine object is world-readable falls out of asking the graph a general
+    // question, instead of being something a human had to think to check.
+    let all_bits = Protections::all().bits() as u64;
+    // `vertices().has_label(..)` rather than `with_label(..)`: A8 made the
+    // index a schema decision, and this graph declares none, so the scan is the
+    // dependable route in a demo whose point is not lookup performance.
+    let wide: Vec<_> = g
+        .traversal()
+        .vertices()
+        .has_label("object")
+        .has("default_prot", PropValue::U64(all_bits))
+        .to_ids();
+    // The second half — "and no capability constrains it" — is a filter on a
+    // sub-traversal, which the DSL cannot express: that is B5 (`where_`), still
+    // unbuilt, and this is a second independent caller for it. Done in Rust
+    // here, and recorded rather than worked around silently.
+    let ambient: Vec<_> = wide
+        .into_iter()
+        .filter(|v| g.traversal().v(*v).in_(Labels::any()).count() == 0)
+        .collect();
+    c.eq("P8 exactly one object relies on ambient authority", ambient.len(), 1);
+    c.check(
+        "P8 the ambient-authority object is obj:public",
+        ambient.first() == Some(&v_public),
+        "expected the world-readable object",
+    );
+
+    println!("  (graph registered at data/{CAP_GRAPH}; survives reboot by name)");
+    Ok(())
 }
