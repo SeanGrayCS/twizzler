@@ -234,6 +234,99 @@ pub struct Graph {
     store: ArenaStore,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StructPages {
+    /// `arenas+locs`, `labels`, `index_labels`, `index_roots`, `blobs`, `vindex`.
+    pub label: &'static str,
+    /// Ids charged to this structure, after the cross-group dedup.
+    pub ids: usize,
+    /// Of those, how many the kernel still knew about *before* deletion. A gap
+    /// against `ids` is itself a finding: it means `destroy` is walking ids that
+    /// are already gone.
+    pub present_before: usize,
+    /// Resident pages held before deletion.
+    pub pages_before: usize,
+    /// Deletes the kernel accepted.
+    pub accepted: usize,
+    pub present_after: usize,
+    /// Resident pages still held after deletion.
+    pub pages_after: usize,
+}
+
+/// `measured` distinguishes "nothing came back" from "nobody looked". A
+/// plain `destroy` returns this struct with `measured: false` and every page
+/// field zero; reading those zeros as a reclaim result would be the same class
+/// of error the rest of this work is correcting.
+#[derive(Debug, Clone, Default)]
+pub struct DestroyReport {
+    /// False when produced by [`Graph::destroy`], which skips the stat calls.
+    pub measured: bool,
+    /// Deletes the kernel accepted — what `destroy` returns.
+    pub accepted: usize,
+    /// Ids offered for deletion.
+    pub attempted: usize,
+    pub pages_before: usize,
+    /// Resident pages over the same ids, after deletion.
+    pub pages_after: usize,
+    /// Owned ids that still resolve after deletion.
+    pub present_after: usize,
+    pub root_pages_before: usize,
+    pub root_pages_after: usize,
+    /// One row per structure walked.
+    pub by_struct: Vec<StructPages>,
+}
+
+impl DestroyReport {
+    /// Pages that went back. Saturating, because a *rise* across a deletion is a
+    /// real possible observation and must not wrap into a huge fake return —
+    /// use [`grew`](Self::grew) to test for it.
+    pub fn returned_pages(&self) -> usize {
+        self.pages_before.saturating_sub(self.pages_after)
+    }
+
+    /// `None` when nothing was measured or nothing was resident, so a caller
+    /// cannot mistake "no denominator" for 0%.
+    pub fn returned_fraction(&self) -> Option<f64> {
+        (self.measured && self.pages_before > 0)
+            .then(|| self.returned_pages() as f64 / self.pages_before as f64)
+    }
+
+    /// Did any structure end up holding *more* pages than it started with?
+    /// Destroying an object should never increase its residency; this is the
+    /// only assertion T3 makes, because it is the only one that does not smuggle
+    /// in a predicted reclaim fraction.
+    pub fn grew(&self) -> bool {
+        self.pages_after > self.pages_before
+    }
+
+    /// One line per structure plus a total, for the harness log.
+    pub fn report_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &self.by_struct {
+            out.push(format!(
+                "  {:<13} ids {:>5} present {:>5}->{:>5} pages {:>8}->{:>8} accepted {:>5}",
+                s.label, s.ids, s.present_before, s.present_after, s.pages_before, s.pages_after,
+                s.accepted
+            ));
+        }
+        out.push(format!(
+            "  {:<13} ids {:>5} present {:>5}->{:>5} pages {:>8}->{:>8} accepted {:>5}",
+            "TOTAL",
+            self.attempted,
+            self.by_struct.iter().map(|s| s.present_before).sum::<usize>(),
+            self.present_after,
+            self.pages_before,
+            self.pages_after,
+            self.accepted
+        ));
+        out.push(format!(
+            "  {:<13} pages {:>8}->{:>8} (never deleted, by design)",
+            "root", self.root_pages_before, self.root_pages_after
+        ));
+        out
+    }
+}
+
 impl Graph {
 
     pub fn record_count(&self) -> usize {
@@ -525,10 +618,25 @@ impl Graph {
     /// destroyed name instead of a whole graph. Re-using the name needs an
     /// explicit `reset`/`reset_arena`, which rebuilds in place.
     pub fn destroy(name: &str) -> Result<usize> {
+        Self::destroy_inner(name, false).map(|r| r.accepted)
+    }
+
+    /// Same code path as `destroy`, parameterised rather than duplicated. The
+    /// id-collection walk is the part of this function most likely to drift out
+    /// of step with the engine (it has already been wrong once — see
+    /// `owned_object_ids`, which omitted the arena store entirely), so a second
+    /// copy of it for measurement would be a defect waiting to happen.
+    /// `destroy` pays no syscalls for this; `destroy_measured` pays two per
+    /// object, which is microseconds against a cycle measured in seconds.
+    pub fn destroy_measured(name: &str) -> Result<DestroyReport> {
+        Self::destroy_inner(name, true)
+    }
+
+    fn destroy_inner(name: &str, measure: bool) -> Result<DestroyReport> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
         let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
-            return Ok(0); // nothing registered
+            return Ok(DestroyReport::default()); // nothing registered
         };
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
         let (is_graph, version, cap, l, x, ad, al, il, ir, bd) = {
@@ -550,7 +658,7 @@ impl Graph {
             // Already destroyed (magic is `MAGIC_DESTROYED`), or never ours.
             // Idempotent either way, and safe: a destroyed root's registry ids
             // are zeroed, so there is nothing left to chase.
-            return Ok(0);
+            return Ok(DestroyReport::default());
         }
         // `version_reclaimable`, not `version_supported`: destroy's job is to
         // free what the graph owns, and that only needs the object graph to be
@@ -569,8 +677,8 @@ impl Graph {
 
         // `version_supported` above admits only `VERSION_ARENA`, so there is one
         // layout to walk.
-        let mut ids = {
-            let mut ids = Vec::new();
+        let mut groups: Vec<(&'static str, Vec<u128>)> = Vec::new();
+        {
             if let Ok(store) = ArenaStore::open(
                 ad,
                 al,
@@ -579,29 +687,55 @@ impl Graph {
                 }),
                 cap,
             ) {
-                ids.extend(store.owned_object_ids());
+                groups.push(("arenas+locs", store.owned_object_ids()));
             }
             if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
-                ids.extend(sv.object_ids());
+                groups.push(("labels", sv.object_ids()));
             }
             if let Ok(sv) = SegVec::<IndexedLabel>::open(il, cap) {
-                ids.extend(sv.object_ids());
+                groups.push(("index_labels", sv.object_ids()));
             }
             if let Ok(sv) = SegVec::<RootEntry>::open(ir, cap) {
-                ids.extend(sv.object_ids());
+                groups.push(("index_roots", sv.object_ids()));
             }
             if let Ok(bs) = BlobStore::open(bd, cap) {
-                ids.extend(bs.object_ids());
+                groups.push(("blobs", bs.object_ids()));
             }
             if x != 0 {
-                ids.push(x);
+                groups.push(("vindex", vec![x]));
             }
-            ids
-        };
+        }
         // Guard against a double-free: an id reachable two ways (a shared
-        // property object, say) would otherwise be deleted twice.
-        ids.sort_unstable();
-        ids.dedup();
+        // property object, say) would otherwise be deleted twice. Deduping
+        // across groups rather than over a flat list keeps each id charged to
+        // exactly one structure, so the per-group pages sum to the total.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for (_, v) in groups.iter_mut() {
+                v.retain(|r| *r != 0 && seen.insert(*r));
+            }
+            groups.retain(|(_, v)| !v.is_empty());
+        }
+
+        let root_raw = root.id().raw();
+        let mut rep = DestroyReport::default();
+        if measure {
+            rep.by_struct = groups
+                .iter()
+                .map(|(label, v)| {
+                    let (present, pages) = reclaim::pages_of(v.iter().copied());
+                    StructPages {
+                        label: *label,
+                        ids: v.len(),
+                        present_before: present,
+                        pages_before: pages,
+                        ..StructPages::default()
+                    }
+                })
+                .collect();
+            rep.pages_before = rep.by_struct.iter().map(|s| s.pages_before).sum();
+            rep.root_pages_before = reclaim::object_pages(root_raw).unwrap_or(0);
+        }
 
         // Mark the root dead *before* freeing, so an interruption leaves a root
         // that refuses to open rather than one naming freed objects.
@@ -619,7 +753,25 @@ impl Graph {
             Ok(())
         })?;
 
-        Ok(reclaim::delete_all(ids))
+        for (i, (_, v)) in groups.iter().enumerate() {
+            rep.attempted += v.len();
+            let accepted = reclaim::delete_all(v.iter().copied());
+            rep.accepted += accepted;
+            if measure {
+                let (present, pages) = reclaim::pages_of(v.iter().copied());
+                let s = &mut rep.by_struct[i];
+                s.accepted = accepted;
+                s.present_after = present;
+                s.pages_after = pages;
+            }
+        }
+        if measure {
+            rep.pages_after = rep.by_struct.iter().map(|s| s.pages_after).sum();
+            rep.present_after = rep.by_struct.iter().map(|s| s.present_after).sum();
+            rep.root_pages_after = reclaim::object_pages(root_raw).unwrap_or(0);
+            rep.measured = true;
+        }
+        Ok(rep)
     }
 
     /// Rebuild empty on VERSION 4, packing `arena_cap` vertices per arena.
@@ -1269,8 +1421,7 @@ impl Graph {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn owned_object_ids(&self) -> Vec<u128> {
+    pub fn owned_object_ids(&self) -> Vec<u128> {
         let mut ids = Vec::new();
         ids.extend(self.store.owned_object_ids());
         // Edges: no object to map, and the property id lives in the mirror.
@@ -1281,6 +1432,15 @@ impl Graph {
         ids.extend(self.blobs.object_ids());
         ids.extend(self.index_object_ids());
         ids
+    }
+
+    pub fn resident_pages(&self) -> (usize, usize) {
+        let (mut objects, mut pages) = reclaim::pages_of(self.owned_object_ids());
+        if let Some(p) = reclaim::object_pages(self.root_id.raw()) {
+            objects += 1;
+            pages += p;
+        }
+        (objects, pages)
     }
 
     #[cfg(test)]

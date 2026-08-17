@@ -27,7 +27,9 @@ mod tests;
 
 pub use edge::{EdgeHandle, EdgeId, EdgeInfo};
 pub use error::GraphError;
-pub use graph::{BulkInsert, Graph, DEFAULT_ARENA_CAP, DEFAULT_SEG_CAP};
+pub use graph::{
+    BulkInsert, DestroyReport, Graph, StructPages, DEFAULT_ARENA_CAP, DEFAULT_SEG_CAP,
+};
 pub use index::{IndexSchema, IndexStrategy, Lookup, RebuildSource, UnindexedLookup};
 pub use props::PropValue;
 pub use arena_store::{
@@ -35,6 +37,18 @@ pub use arena_store::{
     RECORD_SIZE_NO_PROPS,
 };
 pub use name::NameKey;
+
+pub fn sweep_deleted_objects() -> bool {
+    reclaim::sweep_deleted()
+}
+
+/// Resident pages over a set of raw object ids: `(ids_still_resolving, pages)`.
+/// Ids the kernel no longer knows contribute to neither figure. Same lower-bound
+/// caveat as [`Graph::resident_pages`].
+pub fn pages_of_ids(ids: &[u128]) -> (usize, usize) {
+    reclaim::pages_of(ids.iter().copied())
+}
+
 pub use record::RecordId;
 pub use traversal::{
     EdgeTraversal, Path, PathElem, Paths, Repeat, StrictRepeat, TraversalSource, VertexTraversal,
