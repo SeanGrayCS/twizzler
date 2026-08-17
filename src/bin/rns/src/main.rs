@@ -31,14 +31,6 @@
 //!
 //! # Usage
 //!
-//!   rns make           create four real objects that reference each other
-//!   rns index          walk `data/`, read every FOT, build the graph
-//!   rns refs <name>    what does this object reference?      (forward)
-//!   rns rrefs <name>   what references this object?          (reverse)
-//!   rns names <name>   every name this object has            (reverse)
-//!   rns safe           objects nothing references            (reclaim's question)
-//!   rns reset          clear the graph
-//!
 //! The graph is registered at `data/rns`, so it re-opens by name after reboot.
 
 use core::sync::atomic::Ordering;
@@ -210,6 +202,60 @@ fn make() -> Result<()> {
     Ok(())
 }
 
+#[repr(C)]
+struct Node {
+    kind: u32,
+    size: u64,
+    source: InvPtr<Node>,
+}
+unsafe impl Invariant for Node {}
+impl BaseType for Node {}
+
+fn corpus(n: usize) -> Result<()> {
+    let mut namer = static_naming_factory().expect("naming service available");
+    let mut objs: Vec<Object<Node>> = Vec::with_capacity(n);
+    let t = std::time::Instant::now();
+    for i in 0..n {
+        let isolated = i == 0 || i % 10 == 0;
+        let parent = i / 2;
+        let obj = ObjectBuilder::<Node>::default()
+            .persist(true)
+            .build_inplace(|tx| {
+                let source = if isolated {
+                    InvPtr::null()
+                } else {
+                    InvPtr::new(&tx, objs[parent].base_ref())?
+                };
+                tx.write(Node {
+                    kind: if isolated { 0 } else { 1 },
+                    size: 64,
+                    source,
+                })
+            })?;
+        let path = format!("{ROOT}/f{i}");
+        if let Err(e) = namer.put(&path, obj.id()) {
+            println!("rns: could not name f{i} ({e:?}) — fresh image needed?");
+        }
+        objs.push(obj);
+        if (i + 1) % 100 == 0 {
+            println!(
+                "rns: corpus {}/{} ({:.0}/s)",
+                i + 1,
+                n,
+                (i + 1) as f64 / t.elapsed().as_secs_f64()
+            );
+        }
+    }
+    println!(
+        "rns: corpus of {n} objects in {:.1}s — ~{} referencing, {} isolated. \
+         Now run `rns index`, then `rns bench`.",
+        t.elapsed().as_secs_f64(),
+        n - (n + 9) / 10,
+        (n + 9) / 10
+    );
+    Ok(())
+}
+
 /// Every object an object's FOT points at.
 ///
 /// `MetaInfo.fotcount` bounds the table and `RawObject::fote_ptr` reads an
@@ -217,6 +263,16 @@ fn make() -> Result<()> {
 /// `from_parts` inverts it. Resolver entries are skipped: they name a resolver
 /// function rather than an object, so they are not an edge.
 fn fot_targets(id: ObjID) -> Vec<ObjID> {
+    fot_targets_inner(id, true)
+}
+
+/// The same scan without the per-object report — for `bench`, whose platform
+/// arm calls this in a loop over every object.
+fn fot_targets_quiet(id: ObjID) -> Vec<ObjID> {
+    fot_targets_inner(id, false)
+}
+
+fn fot_targets_inner(id: ObjID, verbose: bool) -> Vec<ObjID> {
     let Ok(obj) = Object::<()>::map(id, MapFlags::READ) else {
         // Unmappable is a finding, not an error — see the module docs on
         // protections. Report it rather than treating it as zero references.
@@ -267,12 +323,15 @@ fn fot_targets(id: ObjID) -> Vec<ObjID> {
     // between "this object references nothing" and "the read is wrong", and
     // that distinction is the whole point of the index. `declared` is printed
     // beside the scan precisely because it should stay 0 while `scanned` does
-    // not — that gap is the platform finding.
-    println!(
-        "rns:   {id:x} scanned={scanned} refs={} resolver={resolvers} \
-         deleted={deleted} null/self={nulls} (meta.fotcount={declared})",
-        out.len()
-    );
+    // not — that gap is the reserved-field note in `rns-filesystem.md`.
+    if verbose {
+        println!(
+            "rns:   {id:x} scanned={scanned} refs={} resolver={resolvers} \
+             deleted={deleted} null/self={nulls} (meta.fotcount={declared})",
+            out.len()
+        );
+    }
+    let _ = (scanned, declared, resolvers, deleted, nulls);
     out
 }
 
@@ -330,12 +389,19 @@ fn index() -> Result<()> {
             continue;
         }
         let v = vertex_for(&mut g, node.id)?;
-        // The human name is an edge, not a field — an object can have several.
-        g.add_edge(ns, CONTAINS, v)?;
-        // `PropValue::Str` is a `NameKey` — 31 bytes, truncated at a char
-        // boundary. Namer entries are short, and the hex id on the vertex is
-        // the authoritative identity anyway.
-        g.set_vertex_prop(v, "name", PropValue::Str(NameKey::new(name)))?;
+        // The human name is a property of the *binding*, not the object — an
+        // object under three names has three `contains` edges, each carrying
+        // its own name. (An earlier version stored the name on the vertex,
+        // where a second name silently overwrote the first: the one-way
+        // namer's defect, reproduced in our own index.) `PropValue::Str` is a
+        // `NameKey` — 31 bytes, char-boundary truncated; namer entries are
+        // short, and the hex id on the vertex is the authoritative identity.
+        let e = g.add_edge(ns, CONTAINS, v)?;
+        g.set_edge_prop(e, "name", PropValue::Str(NameKey::new(name)))?;
+        // Display-convenience copy of the first name only.
+        if g.get_vertex_prop(v, "name").is_none() {
+            g.set_vertex_prop(v, "name", PropValue::Str(NameKey::new(name)))?;
+        }
         objects += 1;
 
         for target in fot_targets(node.id) {
@@ -426,11 +492,141 @@ fn names(name: &str) -> Result<()> {
         println!("rns: no object named {name}; run `rns index` first");
         return Ok(());
     };
-    let holders = g.in_neighbors(v, Labels::these(&[CONTAINS]));
-    println!("{name} has {} name(s):", holders.len());
-    if let Some(PropValue::Str(s)) = g.get_vertex_prop(v, "name") {
-        println!("  {}", s.as_str());
+    // One edge per binding, each carrying its own name — so this lists *all*
+    // names, which the platform can only do by enumerating every namespace.
+    let edges = g.traversal().v(v).in_e(Labels::these(&[CONTAINS])).to_ids();
+    println!("{name} has {} name(s):", edges.len());
+    for e in edges {
+        if let Some(PropValue::Str(s)) = g.get_edge_prop(e, "name") {
+            println!("  {}", s.as_str());
+        }
     }
+    Ok(())
+}
+
+/// Microseconds for `reps` runs of `f`, with the per-op figure.
+fn time<T>(reps: usize, mut f: impl FnMut() -> T) -> (f64, f64, T) {
+    let t = std::time::Instant::now();
+    let mut last = f();
+    for _ in 1..reps {
+        last = f();
+    }
+    let us = t.elapsed().as_secs_f64() * 1e6;
+    (us, us / reps as f64, last)
+}
+
+fn bench() -> Result<()> {
+    let g = Graph::open_or_create_arena(GRAPH, twizzler_graph::DEFAULT_ARENA_CAP)?;
+    let mut namer = static_naming_factory().expect("naming service available");
+    let root = match namer.get(ROOT, GetFlags::empty()) {
+        Ok(n) => n,
+        Err(e) => {
+            println!("rns: cannot open {ROOT}: {e:?}");
+            return Ok(());
+        }
+    };
+    let listing = namer
+        .enumerate_names_nsid(root.id, 0, usize::MAX)
+        .unwrap_or_default();
+    let named: Vec<(String, ObjID)> = listing
+        .iter()
+        .filter(|n| n.kind == NsNodeKind::Object)
+        .filter_map(|n| n.name().ok().map(|s| (s.to_string(), n.id)))
+        .filter(|(s, _)| s != GRAPH)
+        .collect();
+    let n = named.len();
+    if n < 4 {
+        println!("rns: only {n} named objects — run `rns corpus <n>` and `rns index` first");
+        return Ok(());
+    }
+    println!("RNS BENCH n={n} (both arms warm; index built this boot)");
+
+    // Probe: f1 — a tree parent, so it has referrers; also present by name.
+    let probe_name = "f1".to_string();
+    let Some((_, probe_id)) = named.iter().find(|(s, _)| *s == probe_name) else {
+        println!("rns: no f1 in {ROOT} — bench expects a `corpus` layout");
+        return Ok(());
+    };
+    let probe_id = *probe_id;
+    let probe_v = resolve(&g, &format!("{:x}", probe_id.raw())).expect("indexed");
+    // The ns vertex has label "ns" (unindexed); find it by scan, once.
+    let ns_v = g
+        .vertices()
+        .into_iter()
+        .find(|v| g.vertex_info(*v).map(|i| i.label == "ns").unwrap_or(false))
+        .expect("ns vertex — run `rns index` first");
+
+    // 1. Name lookup. The graph arm is an honest O(N) property scan — `rns`
+    //    has no human-name index — so the platform should win decisively.
+    let (_, plat, want) = time(200, || {
+        namer.get(&format!("{ROOT}/{probe_name}"), GetFlags::empty()).ok().map(|x| x.id)
+    });
+    let (_, graph, got) = time(20, || resolve(&g, &probe_name));
+    let ok = want == Some(probe_id) && got == Some(probe_v);
+    println!("RNS BENCH lookup      platform={plat:.1}us graph={graph:.1}us agree={ok} (graph unindexed by design — see docs)");
+
+    // 2. Namespace listing.
+    let (_, plat, pl) = time(50, || {
+        namer.enumerate_names_nsid(root.id, 0, usize::MAX).map(|v| v.len()).unwrap_or(0)
+    });
+    let (_, graph, gl) = time(50, || g.out_neighbors(ns_v, Labels::these(&[CONTAINS])).len());
+    // Platform listing includes the graph's own entry; the index skips it.
+    println!("RNS BENCH list        platform={plat:.1}us graph={graph:.1}us sizes={pl}/{gl}");
+
+    // 3. Forward references of f1. The platform CAN do this — one map + scan.
+    let (_, plat, pf) = time(200, || fot_targets_quiet(probe_id));
+    let (_, graph, gf) = time(200, || g.out_neighbors(probe_v, Labels::these(&[REFERENCES])));
+    let gf_ids: Vec<u128> = gf.iter().filter_map(|v| g.vertex_info(*v).map(|i| i.target.raw())).collect();
+    let ok = pf.iter().map(|i| i.raw()).collect::<std::collections::BTreeSet<_>>()
+        == gf_ids.iter().copied().collect();
+    println!("RNS BENCH fwd-refs    platform={plat:.1}us graph={graph:.1}us agree={ok}");
+
+    // 4. REVERSE references of f1 — the headline. The platform has no index:
+    //    map every named object and scan its FOT for the probe id.
+    let (tot, plat, pr) = time(3, || {
+        let mut hits = Vec::new();
+        for (_, id) in &named {
+            if fot_targets_quiet(*id).contains(&probe_id) {
+                hits.push(id.raw());
+            }
+        }
+        hits
+    });
+    let (_, graph, gr) = time(200, || g.in_neighbors(probe_v, Labels::these(&[REFERENCES])));
+    let gr_ids: std::collections::BTreeSet<u128> =
+        gr.iter().filter_map(|v| g.vertex_info(*v).map(|i| i.target.raw())).collect();
+    let ok = pr.iter().copied().collect::<std::collections::BTreeSet<_>>() == gr_ids;
+    println!(
+        "RNS BENCH rev-refs    platform={plat:.0}us graph={graph:.1}us agree={ok} \
+         (platform scanned {n} objects; total {:.0}ms over 3 reps)",
+        tot / 1e3
+    );
+
+    // 5. Safe-to-delete: nothing references it. Reclaim's discovery question.
+    let (_, plat, ps) = time(3, || {
+        let mut referenced = std::collections::BTreeSet::new();
+        for (_, id) in &named {
+            for t in fot_targets_quiet(*id) {
+                referenced.insert(t.raw());
+            }
+        }
+        named.iter().filter(|(_, id)| !referenced.contains(&id.raw())).count()
+    });
+    let (_, graph, gs) = time(20, || {
+        g.vertices()
+            .into_iter()
+            .filter(|v| {
+                g.vertex_info(*v).map(|i| i.label == "object").unwrap_or(false)
+                    && g.in_neighbors(*v, Labels::these(&[REFERENCES])).is_empty()
+            })
+            .count()
+    });
+    println!("RNS BENCH safe        platform={plat:.0}us graph={graph:.0}us counts={ps}/{gs} (must agree)");
+    println!(
+        "RNS BENCH NOTE: reverse and safe are the claim — O(answer) against \
+         O(everything). lookup and fwd-refs are the platform's home ground and \
+         it should win them; report all five."
+    );
     Ok(())
 }
 
@@ -480,6 +676,8 @@ fn main() {
 
     let r = match (cmd, arg) {
         ("make", _) => make(),
+        ("corpus", Some(n)) => corpus(n.parse().unwrap_or(200)),
+        ("bench", _) => bench(),
         ("unname", Some(n)) => unname(n),
         ("index", _) => index(),
         ("refs", Some(n)) => show(n, true),
@@ -491,8 +689,8 @@ fn main() {
         }
         (c, _) => {
             println!(
-                "usage: rns [make | index | refs <name> | rrefs <name> | \
-                 names <name> | safe | unname <name> | reset]  (got {c})"
+                "usage: rns [make | corpus <n> | index | bench | refs <name> | \
+                 rrefs <name> | names <name> | safe | unname <name> | reset]  (got {c})"
             );
             Ok(())
         }
