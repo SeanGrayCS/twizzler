@@ -1,8 +1,8 @@
-//! These tests pin that arena-backing spends 1 object per vertex, or 1/N with
-//! packing, while producing *identical* traversal results. Packing is the
-//! lever — cost per vertex is `1454/cap` — not the choice of ids over
-//! pointers, which the corrected model shows buys essentially nothing on
-//! memory.
+//! Arena-backed storage with a pluggable placement policy.
+//!
+//! These tests pin that arena-backing spends one object per vertex, or 1/N
+//! with packing, while producing identical traversal results. Counts stay
+//! small: the assertions are about ratios, not magnitudes.
 
 use crate::arena_store::{ArenaStore, FillTo, OnePerArena, PropSlot, ADJ_CHUNK};
 use crate::props::PropValue;
@@ -11,6 +11,7 @@ fn store(policy: Box<dyn crate::arena_store::Placement>) -> ArenaStore {
     ArenaStore::create(policy, 64).expect("create arena store")
 }
 
+/// `OnePerArena` places each vertex in its own arena.
 #[test]
 fn one_per_arena_uses_one_object_per_vertex() {
     let mut s = store(Box::new(OnePerArena));
@@ -21,6 +22,8 @@ fn one_per_arena_uses_one_object_per_vertex() {
     assert_eq!(s.arena_count(), 8, "one arena per vertex under OnePerArena");
 }
 
+/// `FillTo` packs `cap` vertices per arena, and edges allocate inside
+/// existing arenas without adding objects.
 #[test]
 fn packing_collapses_object_count() {
     let mut s = store(Box::new(FillTo { cap: 4 }));
@@ -30,7 +33,7 @@ fn packing_collapses_object_count() {
     assert_eq!(s.arena_count(), 3, "12 vertices / cap 4 = 3 arenas");
 
     // Edges must not add objects: chunks are allocated inside the endpoint's
-    // own arena, which is the whole reason the ceiling moves.
+    // own arena.
     for i in 0..11u64 {
         s.add_edge(i, i + 1, i, 0).unwrap();
     }
@@ -41,6 +44,8 @@ fn packing_collapses_object_count() {
     );
 }
 
+/// Adjacency survives chunk rollover in insertion order. Chunks are prepended
+/// internally, so readers must recover the original order.
 #[test]
 fn adjacency_spans_chunks_in_order() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -63,6 +68,7 @@ fn adjacency_spans_chunks_in_order() {
     assert!(s.neighbors(targets[0], true).is_empty());
 }
 
+/// Placement policy changes object count, never traversal results.
 #[test]
 fn policy_does_not_change_results() {
     fn build(policy: Box<dyn crate::arena_store::Placement>) -> (Vec<u64>, Vec<u64>, usize) {
@@ -94,6 +100,7 @@ fn policy_does_not_change_results() {
     );
 }
 
+/// Durability: sync, reopen from the recorded ids, read back.
 #[test]
 fn reopen_preserves_graph() {
     let (dir, locs) = {
@@ -118,6 +125,7 @@ fn reopen_preserves_graph() {
     assert_eq!(s.neighbors(5, false), vec![4]);
 }
 
+/// Tombstones hide a vertex and its adjacency.
 #[test]
 fn delete_tombstones_vertex() {
     let mut s = store(Box::new(FillTo { cap: 16 }));
@@ -131,6 +139,7 @@ fn delete_tombstones_vertex() {
     assert_eq!(s.vertex_name(1), None);
     assert!(s.neighbors(1, true).is_empty());
     assert!(s.neighbors(1, false).is_empty());
+    // A tombstoned vertex must also vanish from its neighbours' lists.
     assert!(
         s.neighbors(0, true).is_empty(),
         "deleted neighbour hidden from the surviving vertex's out-list"
@@ -144,6 +153,8 @@ fn delete_tombstones_vertex() {
     assert_eq!(s.vertex_name(2).as_deref(), Some("v2"));
 }
 
+/// Allocation is batched: a batch costs one sync and one transaction per
+/// arena, not one per allocation.
 #[test]
 fn allocation_syncs_once_per_arena_not_per_allocation() {
     let mut s = store(Box::new(FillTo { cap: 4 }));
@@ -153,8 +164,7 @@ fn allocation_syncs_once_per_arena_not_per_allocation() {
     for i in 0..11u64 {
         s.add_edge(i, i + 1, i, 0).unwrap();
     }
-    // 12 vertex records plus a chunk per endpoint per edge: >30 allocations,
-    // every one of which was a sync before this change.
+    // 12 vertex records plus a chunk per endpoint per edge: >30 allocations.
     assert_eq!(s.sync_count(), 0, "nothing is synced before sync_all");
 
     s.sync_all().unwrap();
@@ -166,6 +176,16 @@ fn allocation_syncs_once_per_arena_not_per_allocation() {
         "one sync per arena — if this equals the allocation count, the \
          batching transaction is being dropped instead of reused"
     );
+    // `syncs` increments only inside `sync_all`, so a revert to per-allocation
+    // drop-syncs would leave the sync assertions above green. Transaction opens
+    // are counted at the open site, so that regression reads as one open per
+    // record allocation (12 here) instead of one per arena per batch (3).
+    assert_eq!(
+        s.tx_opens(),
+        3,
+        "one batching transaction per arena — more means batching has \
+         regressed toward transaction-per-allocation"
+    );
 
     // Batching must not cost durability: the whole batch is readable after the
     // single flush. (`reopen_preserves_graph` covers survival across a reopen.)
@@ -174,6 +194,49 @@ fn allocation_syncs_once_per_arena_not_per_allocation() {
     assert_eq!(s.neighbors(5, true), vec![6]);
 }
 
+/// A vertices-only batch must mark its arena dirty: `add_record` writes
+/// through the arena's own handle, not `record_ptr`, and `sync_all` skips an
+/// unmarked arena. The free-list reuse branch must mark too.
+#[test]
+fn a_vertex_only_batch_syncs_its_arena() {
+    let mut s = store(Box::new(FillTo { cap: 64 }));
+    s.add_vertex(0, "v0", 0).unwrap();
+    s.sync_all().unwrap(); // spends the fresh arena's own mark
+    let base = s.sync_count();
+
+    s.add_vertex(0, "v1", 0).unwrap(); // pure add_record into a clean arena
+    s.sync_all().unwrap();
+    assert_eq!(
+        s.sync_count() - base,
+        1,
+        "a vertices-only batch left its arena unmarked: sync_all skipped the \
+         arena while locs.flush() recorded the new record as live"
+    );
+
+    // The free-list reuse branch writes through its own `lea_mut` and must
+    // mark too. Spend the delete's mark (`record_ptr`) first, so the only
+    // thing between the two counts is the reusing insert.
+    let v = s.add_vertex(0, "victim", 0).unwrap();
+    s.delete_vertex(v).unwrap();
+    s.sync_all().unwrap();
+    let base = s.sync_count();
+    s.add_vertex(0, "reuser", 0).unwrap(); // exact-stride match: takes v's slot
+    s.sync_all().unwrap();
+    assert_eq!(
+        s.sync_count() - base,
+        1,
+        "the reuse branch of alloc_record_bytes left its arena unmarked"
+    );
+
+    // And a no-op batch still costs nothing — sync_all must not sync
+    // unconditionally.
+    let base = s.sync_count();
+    s.sync_all().unwrap();
+    assert_eq!(s.sync_count(), base, "an empty batch synced something");
+}
+
+/// The arena record carries label, name, target, and data properties, and
+/// liveness gates every accessor.
 #[test]
 fn arena_record_carries_target_and_props() {
     let mut s = store(Box::new(FillTo { cap: 8 }));
@@ -210,9 +273,8 @@ fn arena_record_carries_target_and_props() {
     assert!(s.vertices_by_label(3).is_empty(), "a was label 3 and is dead");
 }
 
-/// Label filtering happens inside the adjacency walk, so a selective query
-/// never materialises the whole neighbourhood. Same filter semantics as
-/// `Graph`'s `Labels::these`.
+/// Label filtering happens inside the adjacency walk, with the same filter
+/// semantics as `Graph`'s `Labels::these`.
 #[test]
 fn labeled_neighbor_and_edge_queries() {
     let mut s = store(Box::new(FillTo { cap: 8 }));
@@ -249,6 +311,9 @@ fn labeled_neighbor_and_edge_queries() {
     assert_eq!(s.edge_ids(spokes[1], false, None), vec![101]);
 }
 
+/// Liveness is mirrored into `VertexLoc` so a scan need not resolve each
+/// record. The mirror and the records must agree after every mutation, and
+/// across a reopen.
 #[test]
 fn arena_liveness_mirrors_the_record() {
     let mut s = store(Box::new(FillTo { cap: 4 }));
@@ -273,13 +338,14 @@ fn arena_liveness_mirrors_the_record() {
     // Registry view.
     assert_eq!(s.vertices(), vec![0, 1, 2, 4, 5, 6, 8, 9]);
     assert!(!s.is_alive(3) && !s.is_alive(7));
+    // Record-resolving read paths consult the mirror for liveness too.
     assert_eq!(s.vertex_name(3), None);
     assert_eq!(s.vertex_name(7), None);
     assert_eq!(s.vertex_info(3), None);
     assert!(s.neighbors(2, true).is_empty(), "neighbour 3 is hidden");
     assert!(s.neighbors(4, false).is_empty(), "neighbour 3 is hidden");
 
-    // And across a reopen, since `flags` is now persisted state.
+    // And across a reopen: `flags` is persisted state.
     s.sync_all().expect("sync");
     let (dir, locs) = s.ids();
     let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 64).expect("reopen");
@@ -288,19 +354,9 @@ fn arena_liveness_mirrors_the_record() {
     assert!(s.is_alive(9));
 }
 
-/// That disagreement is not hypothetical. `GlobalPtr::resolve` maps `READ` and
-/// `resolve_mut` maps `READ | WRITE | PERSIST`, so they are separate mappings
-/// and a record write is invisible to a record read. At `scale:20000` this left
-/// 2 858 deleted vertices live on every record-reading path while the mirror
-/// had them right. A small in-boot test cannot provoke the incoherence — the
-/// suite was green throughout — so this stages it directly instead.
-///
-/// Record access no longer uses `GlobalPtr`, so the two agree again in the
-/// ordinary case. The mirror stays authoritative for the cross-arena
-/// `InvPtr::resolve` path, and this test is what stops that quietly eroding.
-///
-/// If someone reinstates a record-side liveness check, every assertion below
-/// fails at once.
+/// Liveness comes from the `locs` mirror, never from the record. The test
+/// forces the two out of agreement — mirror dead, record live — and checks
+/// that every read path follows the mirror.
 #[test]
 fn liveness_reads_come_from_the_mirror_not_the_record() {
     let mut s = store(Box::new(FillTo { cap: 4 }));
@@ -337,7 +393,10 @@ fn liveness_reads_come_from_the_mirror_not_the_record() {
     assert!(s.vertex_info(3).is_some());
 }
 
-/// CANARY — the load-bearing assumption of every `nosync` path in the crate.
+/// Canary for every `nosync` path in the crate: `TxObject::abort` suppresses
+/// only the sync-on-drop — upstream has no rollback, so aborted writes remain
+/// in memory. If this fails, upstream semantics changed and every batched
+/// write path is unsound until it moves to a proper upstream nosync API.
 #[test]
 fn tx_abort_does_not_roll_back() {
     use twizzler::object::{ObjectBuilder, TypedObject};
@@ -357,14 +416,9 @@ fn tx_abort_does_not_roll_back() {
     );
 }
 
-/// Multi-segment store. Every other test here fits the location registry
-/// and the arena directory in one segment each, which is why two bugs reached
-/// `gstress scale:20000` before anything caught them: deletes had no effect,
-/// and a reopened store found 0 arenas against 5 532 registered vertices.
-///
-/// A tiny `seg_cap` reproduces the same geometry in a second: 20 vertices at
-/// `seg_cap` 4 gives 5 `locs` segments and 5 arena-directory entries, where
-/// `scale:20000` needed 55 101 vertices to reach 14.
+/// Multi-segment store: deletes and reopen still work when the location
+/// registry and the arena directory each span several segments. A tiny
+/// `seg_cap` forces both to roll over.
 #[test]
 fn multi_segment_store_deletes_and_reopens() {
     // seg_cap 4 (not 64) so both registries roll over; cap 4 so each vertex
@@ -390,8 +444,7 @@ fn multi_segment_store_deletes_and_reopens() {
     }
     assert_eq!(s.vertices().len(), 17);
 
-    // Survives a reopen with every segment populated — the case where the
-    // arena directory came back empty.
+    // Survives a reopen with every segment populated.
     s.sync_all().expect("sync");
     let (dir, locs) = s.ids();
     let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 4).expect("reopen");
@@ -409,6 +462,7 @@ fn multi_segment_store_deletes_and_reopens() {
     assert_eq!(s.neighbors(5, false), vec![4]);
 }
 
+/// Each policy reports an identifying name.
 #[test]
 fn policy_is_identifiable() {
     let a = store(Box::new(OnePerArena));
@@ -417,7 +471,9 @@ fn policy_is_identifiable() {
     assert_eq!(b.policy_name(), "fill-to");
 }
 
-
+/// A record's extent is derived from its own `nprops`, so records of different
+/// widths sit back-to-back. A stride slip reads a neighbour's bytes instead of
+/// failing, which is why zero-slot and many-slot records are interleaved here.
 #[test]
 fn records_of_differing_widths_read_back_correctly() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -457,10 +513,8 @@ fn records_of_differing_widths_read_back_correctly() {
     }
 }
 
-/// Edge records share `locs` with vertices, so `vertices()` must exclude them —
-/// and must do so without resolving anything, or the scan's cost becomes a
-/// function of how wide records are. The counter is what makes the second half
-/// checkable rather than asserted.
+/// Edge records share `locs` with vertices, so `vertices()` must exclude them
+/// from the mirror alone, without resolving any record.
 #[test]
 fn edge_records_are_excluded_from_scans_without_resolving() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -488,10 +542,8 @@ fn edge_records_are_excluded_from_scans_without_resolving() {
     assert_eq!(s.record_touches(), 0);
 }
 
-/// Topology is `from → edge → to`, so a 1-hop query is two resolutions. That
-/// cost is the point of the design, not an accident: it buys edge properties
-/// through the same path as vertex properties, and hyperedges with no new
-/// machinery.
+/// An edge is a record: topology is `from → edge → to`, and the two-hop walk
+/// returns the far vertex.
 #[test]
 fn edges_are_records_and_traversal_reaches_the_far_vertex() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -515,10 +567,8 @@ fn edges_are_records_and_traversal_reaches_the_far_vertex() {
     );
 }
 
-/// A hyperedge needs no new machinery — an edge record with several
-/// out-links simply has several targets, and the same walk returns them all.
-/// This is the payoff that justified edges-as-records; if it needed a special
-/// case, the design would not have earned its cost.
+/// A hyperedge is an edge record with several out-links; the same walk
+/// returns every far endpoint.
 #[test]
 fn a_hyperedge_is_just_an_edge_record_with_more_links() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -526,7 +576,7 @@ fn a_hyperedge_is_just_an_edge_record_with_more_links() {
     let b = s.add_record(1, "b", 0, &[], false).unwrap();
     let c = s.add_record(1, "c", 0, &[], false).unwrap();
     let e = s.add_edge_record(9, a, b).unwrap();
-    // A third participant, joined to the *existing* edge record.
+    // A third participant, joined to the existing edge record.
     s.add_edge_endpoint(e, c, true).expect("add participant");
 
     let mut got = s.neighbors_via_edges(a, true, false);
@@ -536,8 +586,8 @@ fn a_hyperedge_is_just_an_edge_record_with_more_links() {
     assert_eq!(s.vertices(), vec![a, b, c]);
 }
 
-/// A self-loop's far endpoint legitimately *is* its source, so the walk must
-/// return it rather than filtering it as a duplicate.
+/// A self-loop's far endpoint is its source, so the walk returns it rather
+/// than filtering it as a duplicate.
 #[test]
 fn a_self_loop_returns_its_own_source() {
     let mut s = store(Box::new(FillTo { cap: 64 }));
@@ -564,20 +614,9 @@ fn tombstoning_an_edge_record_hides_the_hop() {
     assert_eq!(s.edge_endpoints(e), None, "a dead edge has no endpoints");
 }
 
-/// A deleted record's slot is reclaimed and reused.
-///
-/// `FillTo` counts records placed, so before slot reuse existed a tombstone
-/// never made room: one live vertex pinned its whole arena and churn grew
-/// arenas without bound. That was the counter-pressure against raising
-/// `DEFAULT_ARENA_CAP` ("4× worse space amplification under churn").
-///
-/// Reuse is only safe because of the generation counter. Inbound
-/// `AdjRef.neighbor` `InvPtr`s still hold a dead record's offset, and
-/// `walk_adj` resolves the pointer *before* checking liveness — so handing the
-/// bytes to a new record would make every stale entry resolve to a live record
-/// with a valid id, pass the liveness check, and yield a neighbour that was
-/// never connected. `stale_adjacency_does_not_resurrect_through_a_reused_slot`
-/// is the test for that half; this one is about space.
+/// A deleted record's slot is reclaimed and reused, so churn does not grow
+/// the arena count. The generation counter is what makes reuse safe;
+/// `stale_adjacency_does_not_resurrect_through_a_reused_slot` covers that half.
 #[test]
 fn a_deleted_records_slot_is_reused() {
     let mut s = store(Box::new(FillTo { cap: 2 }));
@@ -599,7 +638,7 @@ fn a_deleted_records_slot_is_reused() {
     assert_eq!(s.vertex_name(c).as_deref(), Some("c"));
     assert_eq!(s.vertex_name(b).as_deref(), Some("b"), "b is undisturbed");
 
-    // Churn is now flat rather than linear: the steady state holds.
+    // Steady-state churn: the arena count stays flat.
     for _ in 0..8 {
         let last = *s.vertices().last().unwrap();
         s.delete_vertex(last).unwrap();
@@ -623,14 +662,65 @@ fn a_deleted_records_slot_is_reused() {
     assert_eq!(s.vertex_name(q).as_deref(), Some("q"), "p and q must not share a slot");
 }
 
-/// The guard that makes reuse safe. A neighbour entry pointing at a slot
-/// that has since been reclaimed must be skipped, not followed.
-///
-/// Without the generation check this is a silent wrong answer: the stale
-/// `InvPtr` resolves to a perfectly valid, live record, `is_alive` passes, and
-/// traversal reports a neighbour that was never connected. Nothing faults and
-/// nothing logs — the same shape as the `resolve`/`resolve_mut` incoherence,
-/// which stayed hidden for five days behind a green suite.
+/// A twice-tombstoned offset (delete, in-session reuse, delete again — legal,
+/// since `delete_vertex` preserves `off` and `locs` is append-only) enters the
+/// rebuilt free list once on reopen, so later allocations do not share a slot.
+#[test]
+fn a_twice_tombstoned_offset_is_freed_once_across_reopen() {
+    let (dir, locs) = {
+        let mut s = store(Box::new(FillTo { cap: 4 }));
+        let a = s.add_record(1, "a", 0, &[], false).unwrap();
+        s.add_record(1, "keep", 0, &[], false).unwrap();
+        s.delete_vertex(a).unwrap(); // tombstone №1 at offset X
+        let c = s.add_record(1, "c", 0, &[], false).unwrap(); // in-session reuse of X
+        s.delete_vertex(c).unwrap(); // tombstone №2 at X
+        s.sync_all().unwrap();
+        s.ids()
+    };
+
+    let mut s =
+        ArenaStore::open(dir, locs, Box::new(FillTo { cap: 4 }), 64).expect("reopen");
+    // The post-reopen inserts. With X pushed twice, p and q both land on X.
+    let p = s.add_record(1, "p", 0, &[], false).unwrap();
+    let q = s.add_record(1, "q", 0, &[], false).unwrap();
+    assert_eq!(
+        s.vertex_name(p).as_deref(),
+        Some("p"),
+        "q was handed p's bytes: the reopen rebuild pushed one offset twice"
+    );
+    assert_eq!(s.vertex_name(q).as_deref(), Some("q"));
+    let live = s.vertices();
+    assert_eq!(live.len(), 3, "keep, p and q live; a and c stay dead: {live:?}");
+}
+
+/// Vertex labels, edge labels, and property keys intern through one table, so
+/// one label id can name both kinds. A by-label vertex scan must still exclude
+/// edge records.
+#[test]
+fn a_label_shared_by_vertices_and_edges_yields_no_edge_records() {
+    let mut s = store(Box::new(FillTo { cap: 8 }));
+    let a = s.add_record(1, "a", 0, &[], false).unwrap();
+    let b = s.add_record(1, "b", 0, &[], false).unwrap();
+    // Same label id as the vertices — legal, and what a user gets by using
+    // one string for both kinds.
+    let e = s.add_edge_record(1, a, b).unwrap();
+
+    assert_eq!(
+        s.vertices_by_label(1),
+        vec![a, b],
+        "edge record {e} leaked into a by-label vertex scan"
+    );
+    // The mask must not damage the edge itself: it still resolves as an edge.
+    assert_eq!(s.edge_endpoints(e), Some((a, b)));
+    // Tombstones are masked by the same mirror test.
+    s.delete_vertex(b).unwrap();
+    assert_eq!(s.vertices_by_label(1), vec![a]);
+    assert_eq!(s.edge_endpoints(e), None, "b is gone, so the edge hides too");
+}
+
+/// A neighbour entry pointing at a reclaimed slot is skipped, not followed:
+/// without the generation check the stale `InvPtr` resolves to the slot's new
+/// live record and traversal reports a neighbour that was never connected.
 #[test]
 fn stale_adjacency_does_not_resurrect_through_a_reused_slot() {
     let mut s = store(Box::new(FillTo { cap: 8 }));
@@ -664,24 +754,26 @@ fn stale_adjacency_does_not_resurrect_through_a_reused_slot() {
     assert!(s.neighbors_via_edges(squatter, true, true).is_empty());
 }
 
-/// An `AdjChunk` holds `ADJ_CHUNK` entries and costs 208 bytes. An edge record
-/// has out-degree 1 and in-degree 1, so before the inline slots it spent 416
-/// bytes to store 48 — more than three times the record itself, and the
-/// difference between edges-as-records costing 4.6× v4 per edge and 1.7×.
-///
-/// Asserted through arena *count* at a tiny cap, which is the only handle the
-/// store exposes on allocation volume: chunks and records share the arena, so a
-/// workload that stops allocating chunks fits in fewer arenas.
+/// A degree-1 record allocates no adjacency chunk — its entries fit in the
+/// inline slots — asserted through the chunk-allocation counter. Ordering
+/// holds across the inline-to-chunk transition.
 #[test]
 fn a_degree_one_record_allocates_no_chunk() {
-    // Cap 4 with records only: 3 records = 1 arena. If each edge still took two
-    // chunks, the same workload would spill well past it.
     let mut s = store(Box::new(FillTo { cap: 4 }));
     let a = s.add_record(1, "a", 0, &[], false).unwrap();
     let b = s.add_record(1, "b", 0, &[], false).unwrap();
     let e = s.add_edge_record(9, a, b).unwrap();
 
-    // Correctness first — inline entries must read back like chunked ones.
+    // Zero chunks so far: both endpoints and both of the edge record's own
+    // directions fit in inline slots.
+    assert_eq!(
+        s.chunk_allocs(),
+        0,
+        "a degree-1 edge must live entirely in inline slots — 416 bytes of \
+         chunk for 48 bytes of entries is the cost A7-AC5 removes"
+    );
+
+    // Correctness — inline entries must read back like chunked ones.
     assert_eq!(s.neighbors_via_edges(a, true, false), vec![(e, 9, b)]);
     assert_eq!(s.neighbors_via_edges(b, false, true), vec![(e, 9, a)]);
     assert_eq!(s.edge_endpoints(e), Some((a, b)));
@@ -705,20 +797,122 @@ fn a_degree_one_record_allocates_no_chunk() {
         "insertion order must hold across the inline→chunk transition — the \
          inline entry is the oldest and the chunks are prepended"
     );
+    // And past degree 1 the counter must move: the hub spilled to chunks
+    // (its inline out slot holds entry 0; the rest chunk), while each edge
+    // record itself stayed inline. If this reads 0, the counter is not wired
+    // to the allocation site and the assertion above is vacuous.
+    assert!(
+        s.chunk_allocs() > 0,
+        "a degree-{} hub must have spilled past its inline slot",
+        ADJ_CHUNK + 2
+    );
+}
+
+/// `add_edge_endpoint` appends entries without creating records or deduping,
+/// so a legal chain can far exceed the record count. `walk_adj`'s corruption
+/// bound is a revisited-offset check, which no chain length trips.
+#[test]
+fn a_wide_hyperedge_walks_without_tripping_the_corruption_bound() {
+    let mut s = store(Box::new(FillTo { cap: 64 }));
+    let a = s.add_record(1, "a", 0, &[], false).unwrap();
+    let b = s.add_record(1, "b", 0, &[], false).unwrap();
+    let e = s.add_edge_record(9, a, b).unwrap();
+    // 60 repeated joins of the same participant: entries grow, `locs` does
+    // not, so the out-chain runs many chunks against three records.
+    for _ in 0..60 {
+        s.add_edge_endpoint(e, b, true).expect("repeated participant");
+    }
+
+    let got = s.neighbors_via_edges(a, true, false);
+    assert_eq!(got.len(), 61, "the original endpoint plus 60 repeats, none lost");
+    assert!(
+        got.iter().all(|&(ee, l, nb)| ee == e && l == 9 && nb == b),
+        "every entry names the same edge and participant"
+    );
+    // The reverse chain grew identically and must walk too.
+    let back = s.neighbors_via_edges(b, false, true);
+    assert_eq!(back.len(), 61);
+    assert!(back.iter().all(|&(ee, _, nb)| ee == e && nb == a));
+}
+
+/// Data-property growth allocates a fresh block and repoints `data_props`;
+/// the record itself never moves, so its `locs` entry stays put and inbound
+/// edges keep resolving.
+#[test]
+fn data_prop_growth_moves_neither_record_nor_inbound_edges() {
+    let mut s = store(Box::new(FillTo { cap: 8 }));
+    let fan = s.add_record(1, "fan", 0, &[], false).unwrap();
+    let hub = s.add_record(1, "hub", 0, &[], false).unwrap();
+    let e = s.add_edge_record(9, fan, hub).unwrap();
+    let before = s.record_loc(hub).expect("hub is live");
+
+    // 12 keys: first block (cap 4), then a doubled one, then another — three
+    // allocations, two copies, two repoints. The record itself must not move
+    // by a byte.
+    for k in 0..12u32 {
+        s.set_data_prop(hub, 1000 + k, PropValue::I64(k as i64))
+            .expect("set data prop");
+    }
+    assert_eq!(
+        s.record_loc(hub),
+        Some(before),
+        "data-property growth moved the record's locs entry — every inbound \
+         AdjRef offset into it is now stale"
+    );
+    let props = s.data_props(hub).expect("hub is live");
+    for k in 0..12u32 {
+        assert_eq!(
+            props.iter().find(|p| p.key_id == 1000 + k).map(|p| p.val),
+            Some(PropValue::I64(k as i64)),
+            "key {k} lost across block growth"
+        );
+    }
+    // The inbound edge resolves through the unmoved offset.
+    assert_eq!(s.neighbors_via_edges(fan, true, false), vec![(e, 9, hub)]);
+    assert_eq!(s.edge_endpoints(e), Some((fan, hub)));
+}
+
+/// A hyperedge with two sources and two sinks survives a within-boot reopen.
+#[test]
+fn a_two_in_two_out_hyperedge_survives_a_reopen() {
+    let (dir, locs, a, b, c, d, e) = {
+        let mut s = store(Box::new(FillTo { cap: 8 }));
+        let a = s.add_record(1, "a", 0, &[], false).unwrap();
+        let b = s.add_record(1, "b", 0, &[], false).unwrap();
+        let c = s.add_record(1, "c", 0, &[], false).unwrap();
+        let d = s.add_record(1, "d", 0, &[], false).unwrap();
+        let e = s.add_edge_record(9, a, b).unwrap();
+        s.add_edge_endpoint(e, c, true).expect("second sink");
+        s.add_edge_endpoint(e, d, false).expect("second source");
+        s.sync_all().expect("sync");
+        let (dir, locs) = s.ids();
+        (dir, locs, a, b, c, d, e)
+    };
+
+    let s = ArenaStore::open(dir, locs, Box::new(FillTo { cap: 8 }), 64).expect("reopen");
+    let mut from_a = s.neighbors_via_edges(a, true, false);
+    from_a.sort();
+    assert_eq!(from_a, vec![(e, 9, b), (e, 9, c)], "first source reaches both sinks");
+    let mut from_d = s.neighbors_via_edges(d, true, false);
+    from_d.sort();
+    assert_eq!(from_d, vec![(e, 9, b), (e, 9, c)], "second source reaches both sinks");
+    let mut into_b = s.neighbors_via_edges(b, false, true);
+    into_b.sort();
+    assert_eq!(into_b, vec![(e, 9, a), (e, 9, d)], "first sink sees both sources");
+    let mut into_c = s.neighbors_via_edges(c, false, true);
+    into_c.sort();
+    assert_eq!(into_c, vec![(e, 9, a), (e, 9, d)], "second sink sees both sources");
 }
 
 // --- cross-arena adjacency -------------------------------------------------
 //
-// `gstress scale:20000` then lost every cross-arena inline adjacency entry —
-// clique out-degrees of 0 where 99 were due — while chunk entries beside them
-// resolved fine. Seven arenas is where the suite's blind spot started.
-//
-// These use `FillTo { cap: 2 }` so that almost every reference crosses an
-// arena, and they assert they are actually crossing: a test that quietly
-// fell back to one arena would pass while covering nothing, which is the exact
-// failure mode being corrected.
+// Most tests above run in one arena. These use `FillTo { cap: 2 }` so that
+// almost every reference crosses an arena, and they assert they are actually
+// crossing: a test that quietly fell back to one arena would pass while
+// covering nothing.
 
-/// The shape that broke: `a → edge → b` with all three in different arenas.
+/// `a → edge → b` with all three records in different arenas resolves at
+/// every hop.
 #[test]
 fn cross_arena_edge_traversal_is_correct_at_every_hop() {
     let mut s = store(Box::new(FillTo { cap: 2 }));
@@ -749,9 +943,9 @@ fn cross_arena_edge_traversal_is_correct_at_every_hop() {
     assert_eq!(s.vertices(), vec![a, b]);
 }
 
-/// Chunk entries across arenas, past the inline slot. These always worked, so
-/// this is the control: it shows the inline test above is measuring the inline
-/// path rather than cross-arena traversal in general.
+/// Chunk entries across arenas, past the inline slot — the control showing
+/// the inline test above measures the inline path rather than cross-arena
+/// traversal in general.
 #[test]
 fn cross_arena_chunk_entries_resolve_and_keep_order() {
     let mut s = store(Box::new(FillTo { cap: 2 }));
@@ -814,7 +1008,7 @@ fn cross_arena_deletes_hide_exactly_one_neighbour() {
 }
 
 /// Slot reuse across arenas: the generation guard must still reject a stale
-/// *chunk* entry when the reused slot is in a different arena from the walker.
+/// entry when the reused slot is in a different arena from the walker.
 #[test]
 fn cross_arena_slot_reuse_does_not_resurrect_a_neighbour() {
     let mut s = store(Box::new(FillTo { cap: 2 }));

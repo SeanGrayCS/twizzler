@@ -25,6 +25,18 @@ use twizzler_rt_abi::error::ArgumentError;
 
 type Result<T> = core::result::Result<T, TwzError>;
 
+// --- public-API nosync primitives (confined to this crate) ------------------
+//
+// Batching needs writes whose durability is deferred to one explicit sync per
+// object at batch close. The twizzler crate exposes no nosync API, and we
+// deliberately change nothing outside our section of the tree. Instead we use
+// the public `TxObject::abort()`: in the current upstream implementation,
+// transactions have no rollback, so `abort` only suppresses the sync-on-drop
+// and the writes remain. That assumption is load-bearing and pinned by
+// `tx_abort_does_not_roll_back` in `tests/arena.rs` — if upstream ever
+// implements real rollback, that canary fails loudly and these helpers must
+// switch to a proper upstream nosync API.
+
 /// `VecObject::push` with the sync-on-drop suppressed; durability deferred
 /// to a later explicit sync of the object.
 pub(crate) fn vec_push_nosync<T>(v: &mut VecObject<T, VecObjectAlloc>, val: T) -> Result<()>
@@ -73,8 +85,6 @@ pub(crate) struct SegVec<T: Invariant> {
     /// Segment indices with writes whose durability was deferred
     /// (`push_nosync`); drained by [`SegVec::flush`].
     dirty: std::collections::HashSet<usize>,
-    /// Whether the directory itself has deferred writes.
-    dir_dirty: bool,
 }
 
 impl<T: Invariant> SegVec<T> {
@@ -89,7 +99,6 @@ impl<T: Invariant> SegVec<T> {
             segs: Vec::new(),
             cap,
             dirty: std::collections::HashSet::new(),
-            dir_dirty: false,
         })
     }
 
@@ -133,7 +142,6 @@ impl<T: Invariant> SegVec<T> {
             segs,
             cap,
             dirty: std::collections::HashSet::new(),
-            dir_dirty: false,
         })
     }
 
@@ -142,6 +150,9 @@ impl<T: Invariant> SegVec<T> {
         self.dir.object().id().raw()
     }
 
+    /// Every object this vector owns: the directory plus each segment, in that
+    /// order. Used by reclaim to free a whole registry, and by the reclaim
+    /// tests to assert the objects really went away.
     pub(crate) fn object_ids(&self) -> Vec<u128> {
         let mut ids = Vec::with_capacity(self.segs.len() + 1);
         ids.push(self.dir_raw());
@@ -169,7 +180,12 @@ impl<T: Invariant> SegVec<T> {
         self.segs.get(idx / self.cap)?.get_ref(idx % self.cap)
     }
 
-    /// Mutate the entry at `i`, deferring durability to [`SegVec::flush`].
+    /// Mutate the entry at `idx`, deferring durability to [`SegVec::flush`].
+    ///
+    /// This is the only in-place mutation `SegVec` offers, and it does not
+    /// sync. A variant that opened a syncing transaction would cost a sync
+    /// per element on a hot path; defer instead, and let `flush` sync each
+    /// dirty object once.
     pub(crate) fn with_mut_at_nosync<R>(
         &mut self,
         idx: usize,
@@ -209,6 +225,9 @@ impl<T: Invariant> SegVec<T> {
             .push(item)
     }
 
+    /// Like [`SegVec::push`], but defers durability: the touched segment (and
+    /// the directory, on rollover) is only marked dirty. Call
+    /// [`SegVec::flush`] to issue one sync per dirty object.
     pub(crate) fn push_nosync(&mut self, item: T) -> Result<()>
     where
         T: StoreCopy,
@@ -224,29 +243,28 @@ impl<T: Invariant> SegVec<T> {
         Ok(())
     }
 
-    /// Sync every object with deferred writes, once each: dirty segments and,
-    /// if it grew during a batch, the directory.
+    /// Sync every dirty segment, once each, then the directory. The directory
+    /// is always synced: deferred directory writes may predate this instance,
+    /// so no flag can prove it clean.
     pub(crate) fn flush(&mut self) -> Result<()> {
-        for i in self.dirty.drain() {
+        // Iterate without draining, and clear only after every sync
+        // succeeded: an error mid-loop must leave the dirty set intact so a
+        // retried `flush` still syncs every segment with deferred writes.
+        for &i in self.dirty.iter() {
             if let Some(seg) = self.segs.get(i) {
                 // Safety: the engine is single-threaded per graph handle; no
                 // other mapping mutates these objects concurrently.
                 unsafe { seg.object().as_mut()?.sync()? };
             }
         }
-        // Always sync the directory, not just when this instance grew it.
-        //
-        // `dir_dirty` lives on the `SegVec` instance, so dropping one without
-        // flushing discards the flag while the writes stay in mapped memory —
-        // where a later instance still sees them and has no reason to set the
-        // flag again. A subsequent `flush` then syncs segments but not the
-        // directory, and the directory reaches disk empty.
-        //
-        // The flag now only avoids a redundant sync, never a required one, so
-        // it is gone. One extra object sync per `flush` is not worth the
-        // failure mode it was buying.
+        self.dirty.clear();
+        // Always sync the directory, not just when this instance grew it. A
+        // grew-it flag would live on the instance: drop one without flushing
+        // and the flag is lost while the writes stay visible in mapped
+        // memory, so a later instance would sync segments but never the
+        // directory. One extra object sync per `flush` is the cheap side of
+        // that trade.
         unsafe { self.dir.object().as_mut()?.sync()? };
-        self.dir_dirty = false;
         Ok(())
     }
 
@@ -267,7 +285,6 @@ impl<T: Invariant> SegVec<T> {
         };
         if nosync {
             vec_push_nosync(&mut self.dir, entry)?;
-            self.dir_dirty = true;
             self.dirty.insert(self.segs.len());
         } else {
             self.dir.push(entry)?;
@@ -351,6 +368,11 @@ mod tests {
     }
 
     /// In-place mutation, and the durability contract that comes with it.
+    ///
+    /// `with_mut_at_nosync` is the only in-place mutation `SegVec` has, and
+    /// it is not durable until `flush`. That is the property most likely to
+    /// be assumed away by a future caller, so it is asserted here rather
+    /// than only documented.
     #[test]
     fn segvec_with_mut_at_nosync_defers_durability() {
         let mut sv = filled(4, 9);
@@ -363,6 +385,10 @@ mod tests {
         assert_eq!(sv.get_ref(5).unwrap().v, 55, "visible immediately in memory");
         assert_eq!(sv.get_ref(4).unwrap().v, 4, "neighbour untouched");
 
+        // Durability is the caller's job. `flush` is what makes it stick; a
+        // within-boot read cannot tell the difference, so this asserts that
+        // flush succeeds and leaves the value intact rather than claiming to
+        // have proved persistence.
         sv.flush().expect("flush");
         assert_eq!(sv.get_ref(5).unwrap().v, 55);
 
@@ -390,6 +416,8 @@ mod tests {
         assert_eq!(sv.get_ref(12).unwrap().v, 12);
     }
 
+    /// Nosync pushes are immediately visible (mapped memory), rollover
+    /// works, and `flush` makes the batch durable for reopen.
     #[test]
     fn segvec_push_nosync_and_flush() {
         let mut sv = SegVec::create(4).unwrap();

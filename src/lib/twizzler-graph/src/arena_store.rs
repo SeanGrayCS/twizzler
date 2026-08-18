@@ -1,16 +1,37 @@
+// TODO: remove this allow and fix the dead-code warnings it hides.
 #![allow(dead_code)]
 
-//! Mechanism. [`ArenaObject`] is a bump allocator *inside one object*. The
-//! current layout is forced into three objects only because `VecObjectAlloc`
-//! hardcodes a single data region per object; an arena hands out many disjoint
-//! allocations, so a vertex record and both its adjacency chains can live in one
-//! object — or a thousand vertices can.
+//! Arena-backed packed storage for vertex/edge records and adjacency.
 //!
-//! References are arena offsets, not `InvPtr`s. Within an arena a link is a
-//! `u64` offset applied to the arena's own mapping, so intra-arena traversal
-//! needs no FOT entry and touches no second object. Neighbours in *other*
-//! arenas are named by `VertexId` and resolved through the location registry —
-//! the "A4b" reference form.
+//! [`ArenaObject`] is a bump allocator inside one Twizzler object, so a
+//! record and its adjacency chains — or many records — pack into a single
+//! object instead of costing several. Records are addressed as
+//! (arena index, offset), and a [`Placement`] policy chooses which arena a
+//! new record joins: [`OnePerArena`] gives every record its own arena,
+//! [`FillTo`] packs up to `cap` per arena.
+//!
+//! Adjacency entries are [`AdjRef`]s — an `InvPtr` to the neighbour record
+//! plus its id and expected slot generation. The first entry in each
+//! direction lives in an inline, id-only slot in the record itself, so a
+//! degree-≤1 record allocates no chunk. A same-arena neighbour resolves
+//! through the `InvPtr`'s inlined local path — offset arithmetic against the
+//! already-mapped arena, FOT index 0, no second object — while a cross-arena
+//! one takes a real FOT-mediated resolve, through which only immutable
+//! fields may be read (see `walk_adj`).
+//!
+//! Records are reached only through the arena handle — `record_ptr` and
+//! `chunk_ptr`, never `GlobalPtr::resolve`/`resolve_mut`: those map the same
+//! object under different `MapFlags` and hand back different mappings.
+//!
+//! Deletion is a tombstone flag. The bump allocator has no `free`; a
+//! tombstoned record's slot is reused for a new record of the same stride,
+//! and anything beyond that waits for an arena rebuild.
+//!
+//! Allocation is batched: the store keeps one transaction open per arena and
+//! closes them in [`ArenaStore::sync_all`], which `abort()`s each —
+//! suppressing sync-on-drop; upstream transactions have no rollback — and
+//! then issues one sync per touched arena. Field mutations write mapped
+//! memory and become durable at `sync_all`.
 
 use core::mem::size_of;
 
@@ -34,35 +55,40 @@ pub const ADJ_CHUNK: usize = 8;
 /// `flags` bit 0: record is deleted.
 const TOMBSTONE: u32 = 1;
 
-/// Mirrored into `VertexLoc.flags` beside `TOMBSTONE`, and that is the whole
-/// point. With edges as records, `locs` holds both, so `vertices()` has to
-/// exclude edges — and if the only place that fact lived were the record, the
-/// scan would have to resolve every record to answer. That is precisely the
-/// 3.2× cold regression the liveness mirror was built to remove, traded against
-/// its measured 5.2× warm gain. Keeping the bit in the mirror makes scan cost
-/// independent of how wide records get, which matters more once records carry
-/// inline properties.
+/// `flags` bit 1: this record is an edge, not a vertex.
 ///
-/// It follows that is-edge must not also be expressible as a property, or
-/// there are two sources of truth for it.
+/// Mirrored into `VertexLoc.flags` beside `TOMBSTONE`: `locs` holds both
+/// kinds, and reading the bit from the mirror lets `vertices()` exclude edges
+/// without resolving any record, so scan cost stays independent of record
+/// width.
+///
+/// Is-edge must not also be expressible as a property, or there are two
+/// sources of truth for it.
 #[allow(dead_code)] // wired up with the record format
 const IS_EDGE: u32 = 2;
 
 /// `flags` bit 2/3: the record's inline out-/in-adjacency slot is occupied.
 ///
+/// The slots exist for the edge record, which has out-degree 1 and in-degree 1
+/// and would otherwise allocate a whole `ADJ_CHUNK`-entry chunk in each
+/// direction to hold one entry.
+///
 /// One slot each way, not two. Two would cover degree-2 vertices as well, but
 /// the case that matters is the edge record, which is exactly degree-1, and
-/// every extra slot widens *every* record including the vertices that spill to
+/// every extra slot widens every record including the vertices that spill to
 /// chunks anyway.
 const HAS_INLINE_OUT: u32 = 4;
 const HAS_INLINE_IN: u32 = 8;
 
-/// 48 bytes, of which 8 are padding. `PropValue` contains a `u128` variant,
-/// so it aligns to 16 and the `u32` key cannot share its first word. The waste
-/// is recorded rather than optimised: shrinking it means either dropping
-/// `ObjId(u128)` from `PropValue` or splitting keys into a parallel array, and
-/// both are format decisions that should be made against a measurement rather
-/// than against this comment.
+/// One inline traversal property: an interned key and a value, stored
+/// contiguously with the record head so a mid-walk filter never leaves the
+/// record's cache lines.
+///
+/// `PropValue` contains a `u128` variant, so it aligns to 16 and the `u32`
+/// key cannot share its first word. The padding stays: shrinking it means
+/// either dropping `ObjId(u128)` from `PropValue` or splitting keys into a
+/// parallel array, and both are format decisions. `layout_tests` pins the
+/// sizes numerically.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct PropSlot {
@@ -74,12 +100,9 @@ unsafe impl Invariant for PropSlot {}
 
 /// Hand-written rather than derived, to exclude `_pad`.
 ///
-/// Two slots are equal when they *mean* the same thing. A derived `PartialEq`
+/// Two slots are equal when they mean the same thing. A derived `PartialEq`
 /// would compare the padding word, making equality depend on bytes nothing
-/// reads — and the only thing keeping that word zero is the allocation-time
-/// zeroing, which `add_record` deliberately does not rely on for correctness
-/// (see the note there about the transaction's mapping). Deriving would quietly
-/// promote padding from "never read" to "load-bearing in tests".
+/// reads.
 impl PartialEq for PropSlot {
     fn eq(&self, other: &Self) -> bool {
         self.key_id == other.key_id && self.val == other.val
@@ -89,11 +112,11 @@ impl PartialEq for PropSlot {
 /// Header of a record's data-property block, followed by `cap` [`PropSlot`]s
 /// of which `len` are live.
 ///
-/// This block is the thing that may move, and it is the only one. It has
-/// exactly one referent — `ArenaRecordHead::data_props`, a single `u64` — so
-/// growing it is: allocate a bigger block, copy, write one field. No inbound
-/// `InvPtr` names it, which is precisely why data properties can be added after
-/// insert while inline traversal slots cannot.
+/// This block is the only part of a record that may move. It has exactly one
+/// referent — `ArenaRecordHead::data_props`, a single `u64` — so growing it
+/// is: allocate a bigger block, copy, write one field. No inbound `InvPtr`
+/// names it, which is why data properties can be added after insert while
+/// inline traversal slots cannot.
 ///
 /// 16 bytes, which is both `PropSlot`'s alignment and the arena's minimum, so
 /// the slots that follow need no padding.
@@ -111,111 +134,105 @@ pub(crate) const fn data_block_size(cap: u16) -> usize {
     size_of::<DataBlockHead>() + cap as usize * size_of::<PropSlot>()
 }
 
-/// Bytes occupied by a record carrying `nprops` inline traversal properties.
 #[allow(dead_code)] // wired up with the record format
-/// 255 because it is the natural bound for a byte length, and because the
-/// measured LDBC SF0.1 maximum among filtered columns is
-/// `organisation.name` at 124 bytes — a 128-byte limit would have ~3% headroom
-/// and be outgrown by a larger scale factor, silently truncating filtered values
-/// again. Storage is per-value, so an unused limit costs nothing.
+/// The largest queryable text value, in bytes.
+///
+/// 255 is the natural bound for a byte length. Storage is per-value, so an
+/// unused limit costs nothing.
 pub const MAX_TEXT_LEN: usize = 255;
 
-/// Exported so a test can pin it numerically. Arena *count* cannot catch a
-/// regression here — an arena holds a fixed number of records, not a fixed
-/// number of bytes — so a widened record would pass any count-based assertion
-/// while inflating all 1.48 M LDBC edge records.
+/// The stride of a record carrying `nprops` inline slots.
+///
+/// Exported so a test can pin it numerically. An arena holds a fixed number
+/// of records, not a fixed number of bytes, so a widened record would pass
+/// any count-based assertion.
 pub const fn record_size_for(nprops: u16) -> usize {
     record_size(nprops)
 }
 
+/// The zero-property stride.
 pub const RECORD_SIZE_NO_PROPS: usize = size_of::<ArenaRecordHead>();
 
 pub(crate) const fn record_size(nprops: u16) -> usize {
     size_of::<ArenaRecordHead>() + nprops as usize * size_of::<PropSlot>()
 }
 
-
-/// Self-describing on purpose: there is no schema. The record carries
-/// `nprops`, so its extent is derivable from its own bytes and nothing external
-/// has to be consulted to read it. That is what let the earlier schema-typed
-/// draft (declared types, a `SegVec<TypeDef>`, type ids in `flags`) be dropped:
-/// it fixed size per *declared type* where this fixes it per *record*, needing
-/// no declaration step and wasting no slots.
+/// The uniform record head. A vertex and an edge are the same thing —
+/// `flags & IS_EDGE` is the only difference — followed by `nprops` inline
+/// [`PropSlot`]s.
+///
+/// Self-describing: the record carries `nprops`, so its extent is derivable
+/// from its own bytes and nothing external has to be consulted to read it.
+/// There is no schema.
 ///
 /// Size is fixed at insert and the record never moves. This is forced by
-/// pointer topology, not chosen: a record has O(in-degree) inbound
-/// `AdjRef.neighbor` `InvPtr`s, each holding its offset, so relocating it means
-/// rewriting all of them with durability ordering to get right. Data properties
-/// escape this because their block has exactly one referent — `data_props`,
-/// a single `u64` that can be repointed in place. *Many referents ⇒ immovable;
-/// one referent ⇒ freely movable.*
+/// pointer topology: a record has O(in-degree) inbound `AdjRef.neighbor`
+/// `InvPtr`s, each holding its offset, so relocating it would mean rewriting
+/// all of them with durability ordering to get right. Data properties escape
+/// this because their block has exactly one referent — `data_props`, a single
+/// `u64` that can be repointed in place. Many referents means immovable; one
+/// referent moves freely.
 // Not `Copy`, unlike every other record type here: it embeds `AdjRef`s,
 // whose `InvPtr` carries a FOT index that means something only inside its own
 // object. Copying a head between arenas would silently mis-resolve, which is
-// the same reason `AdjRef` and `AdjChunk` are not `Copy`.
+// the same reason `AdjRef` and `AdjChunk` are not `Copy`. Do not work around
+// that by copying the raw `u64`.
 #[repr(C)]
 #[allow(dead_code)] // wired up with the record format
 pub(crate) struct ArenaRecordHead {
     pub(crate) id: u64,
     pub(crate) flags: u32,
     pub(crate) label: u32,
-    /// Inline traversal slots. `u16` bounds a record at 65 535 of them, far
-    /// above the ~11 000-vertex property ceiling this format exists to remove.
+    /// Inline traversal slots. `u16` bounds a record at 65 535 of them.
     pub(crate) nprops: u16,
     pub(crate) _pad: u16,
+    /// Slot generation: bumped every time this slot is handed to a new
+    /// record. This is what makes space reuse safe.
+    ///
     /// A tombstoned record cannot simply be overwritten: inbound
     /// `AdjRef.neighbor` `InvPtr`s still hold its offset, and `walk_adj`
-    /// resolves the pointer *before* checking liveness. Reusing the bytes with
-    /// no invalidation would make a stale pointer resolve to a live record with
-    /// a valid id — the liveness check passes and traversal returns a neighbour
-    /// that was never connected. Silent, and worse than the `resolve`/
-    /// `resolve_mut` incoherence because nothing faults.
+    /// resolves the pointer before checking liveness. Reusing the bytes with
+    /// no invalidation would make a stale pointer resolve to a live record
+    /// with a valid id — the liveness check passes and traversal silently
+    /// returns a neighbour that was never connected.
     ///
     /// Every `AdjRef` records the generation it expects, so a stale entry
     /// mismatches and is skipped. Belongs to the slot, not the record: a
-    /// reused slot's new record has a different id *and* a higher generation.
-    ///
-    /// Free: it lives in padding the head already had, so the record stays 128
-    /// bytes and `AdjRef` stays 24.
+    /// reused slot's new record has a different id and a higher generation.
     pub(crate) generation: u32,
     pub(crate) name: NameKey,
     pub(crate) target_raw: u128,
+    /// Arena offset of the data-property block, 0 = none. Not an `ObjID`:
+    /// properties are arena bytes, not objects.
     pub(crate) data_props: u64,
     /// Chunk-chain heads. 0 means "no chunk", which for a degree-≤1 record is
-    /// now the normal case — see the inline slots below.
+    /// the normal case — see the inline slots below.
     pub(crate) out_head: u64,
     pub(crate) in_head: u64,
-    /// These name the neighbour by *id*, not by `InvPtr` — see [`InlineAdj`].
+    /// The first adjacency entry in each direction, stored in the record.
+    /// Occupied iff the matching `HAS_INLINE_*` flag is set.
+    ///
+    /// These name the neighbour by id, not by `InvPtr` — see [`InlineAdj`].
     pub(crate) inline_out: InlineAdj,
     pub(crate) inline_in: InlineAdj,
 }
 unsafe impl Invariant for ArenaRecordHead {}
 
-/// One adjacency entry (VERSION 4).
+/// The inline adjacency entry: like [`AdjRef`] except that the neighbour is
+/// an id, resolved through `locs`, rather than an `InvPtr`.
 ///
-/// The neighbour is an [`InvPtr`], which handles both cases in one field:
-/// a target in *this* arena gets FOT index 0 — no FOT entry, and
-/// `resolve()` takes an inlined base+offset path — while a target elsewhere
-/// costs one FOT entry, deduped per target arena by the runtime's
-/// `insert_fot`. Traversal therefore never consults the location registry.
+/// It cannot hold an `InvPtr`: a FOT index is meaningful only inside its
+/// containing object, and a chunk entry earns one by being allocated through
+/// the arena's transaction, while the inline slot is written straight into
+/// the record with a raw pointer. An id resolves the same way from anywhere.
 ///
-/// This started as an `AdjRef` and had to change. An `InvPtr`'s FOT index is
-/// meaningful only inside its containing object, and a chunk earns one by being
-/// allocated through the arena's transaction. The inline slot is written
-/// straight into the record with a raw pointer, and cross-arena resolution from
-/// there returned garbage: `gstress scale:20000` lost every cross-arena
-/// inline entry — clique out-degrees of 0 where 99 were due — while the chunk
-/// entries beside them resolved correctly. Same-arena resolution worked, which
-/// is why a single-arena test suite never saw it.
+/// Ids also need no generation check: an id is never reused, so a stale one
+/// finds a tombstone in `locs` and `is_alive` rejects it. Generations exist
+/// to catch a stale pointer into a reused slot; an id cannot go stale that
+/// way.
 ///
-/// Ids sidestep the question rather than answering it. They also cost less here
-/// than pointers did: no FOT entry per degree-1 record, and no generation
-/// check — an id is never reused, so a stale one finds a tombstone in `locs`
-/// and `is_alive` rejects it. Generations exist to catch a stale *pointer* into
-/// a reused slot; an id cannot go stale that way.
-///
-/// The high-degree path keeps `InvPtr`s in chunks, so index-free adjacency —
-/// the mechanism the project is about — is untouched where it matters.
+/// The high-degree path keeps `InvPtr`s in chunks, so index-free adjacency is
+/// untouched where it matters.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub(crate) struct InlineAdj {
@@ -231,6 +248,9 @@ pub(crate) struct AdjRef {
     pub(crate) edge_id: u64,
     pub(crate) neighbor: InvPtr<ArenaRecordHead>,
     pub(crate) label: u32,
+    /// The `generation` this entry expects to find in `neighbor`'s slot. A
+    /// mismatch means the slot was reclaimed and reused, so the entry is stale
+    /// and must be skipped.
     pub(crate) neighbor_gen: u32,
 }
 unsafe impl Invariant for AdjRef {}
@@ -261,6 +281,16 @@ pub(crate) struct AdjChunk {
 unsafe impl Invariant for AdjChunk {}
 
 /// Where a vertex lives: which arena, at what offset, and whether it is alive.
+///
+/// `flags` mirrors `ArenaRecordHead.flags` so a full scan is a linear walk of
+/// `locs` rather than a record resolution per vertex.
+///
+/// The duplication must be maintained: `delete_vertex` is the only writer and
+/// sets both, and this copy is the authoritative one. The mirror decides
+/// because a cross-arena neighbour arrives via `InvPtr::resolve`, which maps
+/// `READ | INDIRECT` and so reads a mapping our writes do not reach. One
+/// structure with one mapping gives one answer. See
+/// [`ArenaStore::delete_vertex`].
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct VertexLoc {
@@ -285,12 +315,16 @@ pub struct ArenaStat {
     pub vertices: usize,
 }
 
+/// Chooses which arena a new vertex joins. Policies differ only here: the
+/// record layout, traversal and persistence are shared.
 pub trait Placement {
     /// `Some(i)` to place in existing arena `i`, `None` to open a new one.
     fn place(&mut self, arenas: &[ArenaStat]) -> Option<usize>;
     fn name(&self) -> &'static str;
 }
 
+/// Every vertex gets its own arena. The simplest policy, and the floor for
+/// what arena-backing alone buys.
 pub struct OnePerArena;
 impl Placement for OnePerArena {
     fn place(&mut self, _arenas: &[ArenaStat]) -> Option<usize> {
@@ -301,6 +335,8 @@ impl Placement for OnePerArena {
     }
 }
 
+/// Pack up to `cap` vertices per arena before opening another. A
+/// locality-aware policy would replace only this type; nothing else changes.
 pub struct FillTo {
     pub cap: usize,
 }
@@ -322,55 +358,74 @@ pub struct ArenaStore {
     dir: SegVec<ArenaEntry>,
     locs: SegVec<VertexLoc>,
     open: Vec<ArenaObject>,
+    /// One long-lived transaction per arena, opened lazily on first allocation
+    /// and closed by [`ArenaStore::sync_all`]. This is what makes allocation
+    /// cost one sync per arena per batch instead of one per allocation.
     txs: Vec<Option<TxObject<ArenaBase>>>,
     stats: Vec<ArenaStat>,
-    /// Which arenas have been touched since the last `sync_all`.
+    /// Which arenas have been touched since the last `sync_all`, so a sync
+    /// costs O(touched arenas) rather than O(all of them).
     ///
-    /// Conservative on purpose: set by `record_ptr`/`chunk_ptr`, which are the
-    /// only ways to obtain a writable pointer into an arena. They serve reads
-    /// too, so a read-heavy workload marks arenas it only read and syncs them
-    /// needlessly — no worse than the old unconditional behaviour, and never
-    /// *unsafe*. Missing a write path would be silent data loss, which is not a
-    /// trade worth making for a sync we can afford. A precise version needs
-    /// separate read/write pointer accessors; noted, not done.
+    /// Set conservatively: by `record_ptr`/`chunk_ptr` — the general ways to
+    /// obtain a pointer into an arena — and by `add_record`/
+    /// `alloc_record_bytes`, whose head writes and allocations go through the
+    /// arena handle and the batching transaction directly. The pointer
+    /// accessors serve reads too, so a read-heavy workload marks arenas it
+    /// only read and syncs them needlessly — never unsafe, while missing a
+    /// write path would be silent data loss. A precise version needs separate
+    /// read/write pointer accessors; noted, not done.
     dirty: Vec<bool>,
     /// Reclaimed record slots per arena, as `(offset, stride)`.
     ///
     /// In-memory, rebuilt on `open`. Persisting it would mean a second
-    /// structure to keep coherent with the records themselves — exactly the
-    /// record/mirror split that produced the `resolve`/`resolve_mut` bug — and
-    /// it is derivable: a slot is free iff some tombstoned `locs` entry names it
-    /// and no live entry does. Deriving costs one pass at open and cannot drift.
+    /// structure to keep coherent with the records themselves, and it is
+    /// derivable: a slot is free iff some tombstoned `locs` entry names it and
+    /// no live entry does. Deriving costs one pass at open and cannot drift.
     ///
-    /// Exact-stride reuse only. A freed 128-byte slot is not offered to a
-    /// record wanting 176, and is not split for one wanting 80. Both would work
-    /// but both need a size-class scheme, and today nearly every record is
-    /// `record_size(0)` — vertices default to no inline slots and edges always
-    /// have none — so exact match covers the common case at no complexity. If a
-    /// profile ever shows churn on mixed widths, that is when to generalise.
+    /// Exact-stride reuse only: a freed slot is neither offered to a larger
+    /// record nor split for a smaller one. Both would need a size-class
+    /// scheme, and nearly every record is `record_size(0)` — vertices default
+    /// to no inline slots and edges always have none — so exact match covers
+    /// the common case.
     free: Vec<Vec<(u64, usize)>>,
     policy: Box<dyn Placement>,
     /// Syncs issued by `sync_all`, so a test can assert the batching property
     /// directly rather than inferring it from wall time.
     syncs: usize,
-    /// Both criteria were written as claims about *mechanism* ("performs no
-    /// second resolution", "assert the scan's cost"), which nothing could
-    /// check: they would have passed by inspection, which is how the
-    /// `resolve`/`resolve_mut` incoherence survived five days of a green suite.
-    /// A counter makes them falsifiable.
+    /// Records reached through [`Self::record_ptr`], so a test can assert
+    /// that a path resolves no records rather than taking it on inspection.
+    ///
+    /// Test-only: it sits in the hottest path in the engine.
     ///
     /// `Cell` because `record_ptr` takes `&self`; the store is single-threaded
     /// per handle, which is the same contract the raw pointers already rely on.
     #[cfg(test)]
     record_touches: core::cell::Cell<usize>,
+    /// Data-property blocks dereferenced. A walk filtering on an inline
+    /// property must leave this at zero while the same walk filtering on a
+    /// data property increments it.
     #[cfg(test)]
     data_block_reads: core::cell::Cell<usize>,
+    /// Chunks allocated by `append_adj`, so a test can assert that a degree-1
+    /// record allocates none. Test-only, like `record_touches`, and for the
+    /// same hot-path reason.
+    #[cfg(test)]
+    chunk_allocs: core::cell::Cell<usize>,
+    /// Batching transactions opened by `tx_for`. `syncs` increments only
+    /// inside `sync_all`, so it cannot see a regression to a fresh
+    /// transaction per allocation; counting opens at the open site can.
+    #[cfg(test)]
+    tx_opens: core::cell::Cell<usize>,
     /// Adjacency counters. Test-only, like `record_touches`: they sit on the
     /// hottest path in the engine.
+    ///
+    /// The `cross_arena_*` tests assert `inline > 0` and `cross_arena > 0`,
+    /// so a test cannot silently stop covering the case it names.
     #[cfg(test)]
     pub(crate) diag: core::cell::Cell<AdjDiag>,
 }
 
+/// Adjacency-walk counters. See `ArenaStore::diag`.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct AdjDiag {
     /// Entries visited by `walk_adj`, before any filtering.
@@ -405,6 +460,10 @@ impl ArenaStore {
             record_touches: core::cell::Cell::new(0),
             #[cfg(test)]
             data_block_reads: core::cell::Cell::new(0),
+            #[cfg(test)]
+            chunk_allocs: core::cell::Cell::new(0),
+            #[cfg(test)]
+            tx_opens: core::cell::Cell::new(0),
             #[cfg(test)]
             diag: core::cell::Cell::new(AdjDiag::default()),
         })
@@ -465,6 +524,14 @@ impl ArenaStore {
         // rather than persisted). A tombstoned entry's offset is free unless a
         // live entry also names it — which happens exactly when the slot was
         // already reused, in which case the live record owns it.
+        //
+        // Each offset is also absorbed into `taken` as it is pushed, because
+        // two tombstoned entries can legally name one offset: delete A@X,
+        // in-session reuse hands X to B, delete B — both entries are now
+        // tombstoned at X (`delete_vertex` preserves `off`; `locs` is
+        // append-only). Without the dedupe, X would enter the rebuilt list
+        // twice and the next two same-stride allocations after a reopen would
+        // share the slot, the second zeroing the first's head.
         let mut free: Vec<Vec<(u64, usize)>> = (0..open.len()).map(|_| Vec::new()).collect();
         {
             let mut taken: Vec<(u32, u64)> = Vec::new();
@@ -495,6 +562,14 @@ impl ArenaStore {
                 let nprops = unsafe { (*(p as *const ArenaRecordHead)).nprops };
                 if let Some(slots) = free.get_mut(l.arena as usize) {
                     slots.push((l.off, record_size(nprops)));
+                    // The dedupe described above: the offset is owned now —
+                    // by the free list — so a second tombstone naming it is
+                    // skipped by the same `taken` check that skips live
+                    // owners. (The stride read is insensitive to which entry
+                    // contributes it: exact-stride reuse means every record
+                    // that ever occupied X had the stride the bytes at X
+                    // describe.)
+                    taken.push((l.arena, l.off));
                 }
             }
         }
@@ -515,17 +590,16 @@ impl ArenaStore {
             #[cfg(test)]
             data_block_reads: core::cell::Cell::new(0),
             #[cfg(test)]
+            chunk_allocs: core::cell::Cell::new(0),
+            #[cfg(test)]
+            tx_opens: core::cell::Cell::new(0),
+            #[cfg(test)]
             diag: core::cell::Cell::new(AdjDiag::default()),
         })
     }
 
     /// Every object this store owns: the arena directory, the location
-    /// registry, each arena, and each vertex's property object.
-    ///
-    /// Walking the vertices to collect `props_raw` pages the arenas in, which
-    /// is wasted work if the caller is not about to free them — so this is for
-    /// teardown only. It is cheap in the way that matters: arena count is
-    /// `vertices/cap`, not `vertices`.
+    /// registry, and each arena. Used at teardown.
     pub fn owned_object_ids(&self) -> Vec<u128> {
         let mut ids = self.dir.object_ids();
         ids.extend(self.locs.object_ids());
@@ -533,10 +607,12 @@ impl ArenaStore {
         ids
     }
 
+    /// Number of arena objects.
     pub fn arena_count(&self) -> usize {
         self.open.len()
     }
 
+    /// Total records — vertices and edges. `locs` holds both.
     pub fn record_count(&self) -> usize {
         self.locs.len()
     }
@@ -551,8 +627,7 @@ impl ArenaStore {
     ///
     /// `place` decides rollover from `stats` alone, so if the two columns
     /// disagree the cap is not doing what it says. `ArenaStore::open` rebuilds
-    /// `stats` from `locs` and counts tombstoned vertices as live, so the
-    /// harness's mid-run `E:reopen` is the first place to look.
+    /// `stats` from `locs` and counts tombstoned vertices as live.
     pub fn arena_vertex_counts(&self) -> (Vec<usize>, Vec<usize>) {
         let policy: Vec<usize> = self.stats.iter().map(|s| s.vertices).collect();
         let mut actual = vec![0usize; self.open.len()];
@@ -569,6 +644,9 @@ impl ArenaStore {
     fn new_arena(&mut self) -> Result<usize> {
         let arena = ArenaObject::new(ObjectBuilder::default().persist(true))?;
         let raw = arena.object().id().raw();
+        // nosync: the directory is drained by `sync_all`'s `dir.flush()`.
+        // A plain `push` here would sync the directory object on every new
+        // arena.
         self.dir.push_nosync(ArenaEntry { raw })?;
         self.open.push(arena);
         self.txs.push(None);
@@ -578,25 +656,40 @@ impl ArenaStore {
         Ok(self.open.len() - 1)
     }
 
+    /// The open transaction for arena `idx`, opening one if needed. Every
+    /// allocation goes through this rather than `ArenaObject::alloc`, which
+    /// would open and sync a fresh transaction per call.
     fn tx_for(&mut self, idx: usize) -> Result<&mut TxObject<ArenaBase>> {
         if self.txs[idx].is_none() {
             let tx = self.open[idx].as_tx()?;
             self.txs[idx] = Some(tx);
+            // A real open, not a reuse: this is the count that catches a
+            // regression to transaction-per-allocation, which `sync_count`
+            // cannot see.
+            #[cfg(test)]
+            self.tx_opens.set(self.tx_opens.get() + 1);
         }
         Ok(self.txs[idx].as_mut().expect("just opened"))
     }
 
+    /// Syncs issued so far. A batch of `n` allocations across `k` arenas must
+    /// cost `k` syncs, not `n`.
     pub fn sync_count(&self) -> usize {
         self.syncs
     }
 
-    /// Bounds-checked arena lookup, for paths reading a *persisted* index.
+    /// Bounds-checked arena lookup, for paths reading a persisted index.
+    ///
+    /// A `VertexLoc` read from disk names an arena by position, so a store
+    /// whose directory and location registry disagree yields an index past the
+    /// end. That is corruption, not a normal condition — but it must not be a
+    /// panic in teardown.
     fn try_arena_id(&self, idx: usize) -> Option<ObjID> {
         self.open.get(idx).map(|a| a.object().id())
     }
 
     /// A `GlobalPtr` naming a vertex record — an `(ObjID, offset)` pair, used
-    /// where one is *required* rather than resolved: `InvPtr::new` needs a
+    /// where one is required rather than resolved: `InvPtr::new` needs a
     /// global address to build an adjacency entry against. Never resolve one
     /// of these to touch a record; go through [`Self::record_ptr`].
     fn vertex_ptr(&self, id: u64) -> Option<GlobalPtr<ArenaRecordHead>> {
@@ -613,11 +706,10 @@ impl ArenaStore {
     // `resolve` maps its object `READ`; `resolve_mut` maps it
     // `READ | WRITE | PERSIST` (`ptr/global.rs`). Different flags, so
     // `twz_rt_map_object` returns different mappings, and a write through one
-    // is not visible through the other. That cost us 2 858 silently-undeleted
-    // vertices on `scale:20000` — see `delete_vertex`.
+    // is not visible through the other — see `delete_vertex`.
     //
     // `ArenaObject::from_objid` already maps `READ | WRITE | PERSIST`, so the
-    // handle in `self.open` *is* the write mapping, and `lea`/`lea_mut` are
+    // handle in `self.open` is the write mapping, and `lea`/`lea_mut` are
     // plain `handle().start() + offset` against it. Reads and writes therefore
     // land in the same pages by construction. It is also cheaper: `resolve()`
     // calls `twz_rt_map_object` on every single access, and these do not.
@@ -638,7 +730,7 @@ impl ArenaStore {
 
     /// Records touched since the last [`Self::reset_record_touches`].
     ///
-    /// Counts *attempts*, incremented before the bounds check, so a lookup that
+    /// Counts attempts, incremented before the bounds check, so a lookup that
     /// fails still registers. A path that "does not touch records" must not be
     /// reaching this function at all — counting only successes would let a
     /// miss-heavy path look clean.
@@ -658,6 +750,26 @@ impl ArenaStore {
         self.data_block_reads.get()
     }
 
+    /// Chunks allocated so far.
+    #[cfg(test)]
+    pub(crate) fn chunk_allocs(&self) -> usize {
+        self.chunk_allocs.get()
+    }
+
+    /// Batching transactions opened so far.
+    #[cfg(test)]
+    pub(crate) fn tx_opens(&self) -> usize {
+        self.tx_opens.get()
+    }
+
+    /// Test seam: the record's `(arena, offset)` exactly as `locs` records
+    /// them. The pair never changes for a record's lifetime — every inbound
+    /// `AdjRef` offset depends on it.
+    #[cfg(test)]
+    pub(crate) fn record_loc(&self, vertex: u64) -> Option<(u32, u64)> {
+        self.locs.get_ref(vertex as usize).map(|l| (l.arena, l.off))
+    }
+
     /// Raw pointer to an adjacency chunk, inside its arena's own mapping.
     fn chunk_ptr(&self, arena: u32, off: u64) -> Option<*mut AdjChunk> {
         self.mark_dirty(arena as usize);
@@ -668,11 +780,11 @@ impl ArenaStore {
 
     /// The location entry for a vertex that is live, in one `locs` read.
     ///
-    /// Liveness is the mirror's call, not the record's. That was forced when
-    /// record writes were invisible; it stays now that they are not, because
-    /// a *cross-arena* neighbour is still reached through `InvPtr::resolve`,
-    /// which maps `READ | INDIRECT` and so has the original problem. Reading
-    /// liveness from the mirror keeps every path on one answer.
+    /// Liveness is the mirror's call, not the record's: a cross-arena
+    /// neighbour is reached through `InvPtr::resolve`, which maps
+    /// `READ | INDIRECT` and need not see writes made through the arena
+    /// handle. Reading liveness from the mirror keeps every path on one
+    /// answer.
     fn live_loc(&self, vertex: u64) -> Option<VertexLoc> {
         let loc = self.locs.get_ref(vertex as usize).map(|l| *l)?;
         if loc.flags & TOMBSTONE != 0 {
@@ -688,17 +800,17 @@ impl ArenaStore {
 
     /// Add a record — vertex or edge — with `props` inline traversal slots.
     ///
-    /// `props.len()` is fixed here and for the record's lifetime. Not a
-    /// policy choice: a record has O(in-degree) inbound `AdjRef.neighbor`
-    /// `InvPtr`s, each holding its arena offset, so growing one would mean
-    /// rewriting every inbound pointer with durability ordering to get right.
-    /// Anything added later becomes a *data* property, whose block has exactly
-    /// one referent and can therefore move freely.
-    /// `pub(crate)`, unlike [`Self::add_vertex`]: it takes [`PropSlot`], which is
-    /// a *persisted layout* type. Exposing it would publish the record format as
-    /// API and commit us to its field order. The public route to inline
-    /// properties is `Graph::add_vertex_with_props`, which speaks `&str` and
-    /// `PropValue`.
+    /// `props.len()` is fixed here and for the record's lifetime: a record has
+    /// O(in-degree) inbound `AdjRef.neighbor` `InvPtr`s, each holding its
+    /// arena offset, so growing one would mean rewriting every inbound pointer
+    /// with durability ordering to get right. Anything added later becomes a
+    /// data property, whose block has exactly one referent and can therefore
+    /// move freely.
+    ///
+    /// `pub(crate)`, unlike [`Self::add_vertex`]: it takes [`PropSlot`], which
+    /// is a persisted-layout type, and exposing it would publish the record
+    /// format as API. The public route to inline properties is
+    /// `Graph::add_vertex_with_props`, which speaks `&str` and `PropValue`.
     pub(crate) fn add_record(
         &mut self,
         label: u32,
@@ -709,18 +821,15 @@ impl ArenaStore {
     ) -> Result<u64> {
         let nprops = u16::try_from(props.len())
             .map_err(|_| twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
-        // Reuse before placement. The policy counts records *ever* allocated,
+        // Reuse before placement. The policy counts records ever allocated,
         // so it considers an arena full even when a delete has freed a slot in
-        // it — ask it first and it opens a new arena while reclaimed space sits
-        // unused. This overrides the policy only where the alternative is
+        // it — ask it first and it opens a new arena while reclaimed space
+        // sits unused. This overrides the policy only where the alternative is
         // growth, and only for an exact stride match.
         //
-        // Deliberate tension worth naming: placement stops being purely
-        // policy-driven, so a future locality-aware policy will sometimes be
-        // overruled by "wherever a slot happened to free up". That is the right
-        // default while the alternative is unbounded arena growth, but a policy
-        // that cares about locality should be able to decline a reclaimed slot.
-        // `Placement` has no way to express that yet.
+        // The tension is real: a locality-aware policy would sometimes be
+        // overruled by wherever a slot happened to free up, and `Placement`
+        // has no way to decline a reclaimed slot yet.
         let want = record_size(nprops);
         let reusable = self
             .free
@@ -734,19 +843,35 @@ impl ArenaStore {
             },
         };
         let id = self.locs.len() as u64;
+        // Reserve by stride, then write the head into the reserved bytes.
+        //
         // Not `tx.alloc(head)`, which reserves `Layout::new::<T>()` and so can
-        // only ever place a record with zero inline slots. Routing the ordinary
-        // vertex path through the variable-stride allocator now — at `nprops =
-        // 0`, where it is equivalent — means the whole test suite and `gstress`
-        // exercise it, rather than it sitting untested beside a working path
-        // until the day it is switched on.
+        // only ever place a record with zero inline slots. The zero-slot path
+        // goes through the same variable-stride allocator so that it stays
+        // exercised.
         let (off, generation) = self.alloc_record_bytes(idx, nprops)?;
+        // The head and inline slots below are written through the arena's own
+        // handle, not `record_ptr` — so this path must mark the arena dirty
+        // itself, or a batch that touches an arena only through here (a pure
+        // `add_vertex` load into a pre-existing arena; an edge record placed
+        // by `FillTo` into an arena neither endpoint lives in) is invisible to
+        // `sync_all` while `locs.flush()` durably names its records as live.
+        // `alloc_record_bytes` marks too; both are kept so neither write path
+        // survives a refactor of the other unprotected — the mark is an
+        // idempotent bool store.
+        self.mark_dirty(idx);
         {
             let obj = self.open[idx].object();
             let base = obj
                 .lea_mut(off as usize, record_size(nprops))
                 .ok_or(twizzler_rt_abi::error::ArgumentError::InvalidArgument)?;
             let p = base as *mut ArenaRecordHead;
+            // Every field is written explicitly. `alloc_with_slice` zeroes
+            // through the transaction's mapping (`gp.resolve_mut()`), while
+            // these writes and every later read go through the arena's own
+            // handle. The two coincide today, but relying on the zeroing for
+            // field values would rest correctness on that coincidence; only
+            // padding trusts it, and padding is never read.
             unsafe {
                 (*p).id = id;
                 (*p).flags = 0;
@@ -769,6 +894,10 @@ impl ArenaStore {
                 }
             }
         }
+        // nosync: drained by `sync_all`'s `locs.flush()`. A plain `push` would
+        // sync the location registry once per vertex.
+        // `IS_EDGE` is mirrored here beside `TOMBSTONE` so `vertices()` can
+        // exclude edge records without resolving any of them — see the constant.
         self.locs.push_nosync(VertexLoc {
             arena: idx as u32,
             flags: if is_edge { IS_EDGE } else { 0 },
@@ -779,6 +908,12 @@ impl ArenaStore {
     }
 
     /// A live record's inline traversal slots.
+    ///
+    /// Deliberately does not increment `record_touches`: reading an inline
+    /// property is not a second access — the slots are in the same allocation
+    /// as the head, a few bytes further into cache lines the caller has
+    /// already paid for. The tests that contrast inline with data properties
+    /// depend on this staying uncounted.
     pub(crate) fn traversal_props(&self, vertex: u64) -> Option<Vec<PropSlot>> {
         let loc = self.live_loc(vertex)?;
         let p = self.record_ptr(&loc)?;
@@ -803,15 +938,15 @@ impl ArenaStore {
     /// Update an existing inline slot in place. Returns whether the key was
     /// found; `false` means the caller should store it as a data property.
     ///
-    /// Updating is safe where adding is not. A slot is fixed-size, so
+    /// Updating is safe where adding is not: a slot is fixed-size, so
     /// overwriting its value moves nothing and no inbound `AdjRef.neighbor`
-    /// offset changes. It is *adding* a key that would grow the record, which is
-    /// the thing the format forbids.
+    /// offset changes. Adding a key would grow the record, which the format
+    /// forbids.
     ///
-    /// This exists to keep one source of truth. Without it, `set_vertex_prop` on
-    /// a key that happens to be inline would write the side object while readers
-    /// still saw the inline slot — a silent divergence, and indistinguishable
-    /// from an unset property from the outside.
+    /// This exists to keep one source of truth. Without it, setting a key that
+    /// happens to be inline would write a data property while readers still
+    /// saw the inline slot — a silent divergence, indistinguishable from an
+    /// unset property from the outside.
     pub(crate) fn set_traversal_prop(
         &mut self,
         vertex: u64,
@@ -838,6 +973,9 @@ impl ArenaStore {
         Some(false)
     }
 
+    /// A record's data properties. Counts a `data_block_reads`, unlike
+    /// `traversal_props`, which counts nothing — the contrast the property
+    /// tests measure.
     pub(crate) fn data_props(&self, vertex: u64) -> Option<Vec<PropSlot>> {
         let loc = self.live_loc(vertex)?;
         let p = self.record_ptr(&loc)?;
@@ -856,6 +994,10 @@ impl ArenaStore {
     }
 
     /// Set a data property, allocating or growing the block as needed.
+    ///
+    /// Growth doubles rather than adding one, so N properties cost O(log N)
+    /// allocations instead of N. The old block is orphaned — the arena is a
+    /// bump allocator with no `free`.
     pub(crate) fn set_data_prop(&mut self, vertex: u64, key_id: u32, val: PropValue) -> Result<()> {
         let loc = self
             .live_loc(vertex)
@@ -943,6 +1085,7 @@ impl ArenaStore {
         Ok(())
     }
 
+    /// `Some(())` iff `vertex` names a live record.
     pub(crate) fn live_record(&self, vertex: u64) -> Option<()> {
         self.live_loc(vertex).map(|_| ())
     }
@@ -985,33 +1128,48 @@ impl ArenaStore {
             .map_or(false, |l| l.flags & IS_EDGE != 0)
     }
 
+    /// Reserve `record_size(nprops)` zeroed, contiguous bytes in arena `idx`
+    /// and return the offset.
+    ///
     /// # Why a byte slice and not `alloc_inplace`
     ///
     /// A record's size depends on `nprops`, which is a runtime value, and the
     /// arena's typed path cannot express that:
     ///
-    /// Alignment is safe but incidental, and worth knowing: `Layout::array
-    /// ::<u8>` has align 1, yet `ArenaBase::reserve` raises every allocation to
-    /// `MIN_ALIGN = 16`, which is what `ArenaRecordHead` and `PropSlot` need.
-    /// We depend on that floor. If upstream ever lowers `MIN_ALIGN`, records
-    /// become misaligned — hence `record_head_alignment_holds` in the layout
-    /// tests, which fails loudly rather than letting reads go sideways.
+    /// - `TxObject::alloc_inplace` reserves `Layout::new::<T>()` — compile-time.
+    /// - `ArenaBase::reserve` takes a runtime `Layout` but is private.
+    /// - `ArenaAllocator::alloc` is the public runtime-sized path, but it opens
+    ///   its own transaction (`self.ptr.resolve().into_tx()`) — one sync per
+    ///   allocation, which the per-arena batching transaction exists to avoid.
+    ///
+    /// `alloc_with_slice` is the one public API that is runtime-sized and goes
+    /// through the open transaction, so it keeps the batching.
+    ///
+    /// Alignment is safe but incidental: `Layout::array::<u8>` has align 1,
+    /// yet `ArenaBase::reserve` raises every allocation to `MIN_ALIGN = 16`,
+    /// which is what `ArenaRecordHead` and `PropSlot` need. We depend on that
+    /// floor — `record_head_alignment_holds` in the layout tests fails loudly
+    /// if it ever drops.
     ///
     /// The bytes are zeroed, so a record is fully initialised before any field
     /// is written and padding never carries stale arena contents to disk.
     fn alloc_record_bytes(&mut self, idx: usize, nprops: u16) -> Result<(u64, u32)> {
+        // Every branch below writes arena bytes — the reuse branch through the
+        // arena handle's own `lea_mut`, the fresh branch through the batching
+        // transaction's `alloc_with_slice` — and neither goes near
+        // `record_ptr`/`chunk_ptr`, so the dirty mark has to happen here.
+        self.mark_dirty(idx);
         let want = record_size(nprops);
         // Reclaimed slot first — this is what stops churn growing arenas
-        // without bound. The caller bumps `generation` on the reused slot, which
-        // is what invalidates any `AdjRef` still pointing here.
+        // without bound. Reuse hands back a bumped `generation`, which is what
+        // invalidates any `AdjRef` still pointing here.
         if let Some(slots) = self.free.get_mut(idx) {
             if let Some(pos) = slots.iter().position(|(_, sz)| *sz == want) {
                 let (off, _) = slots.swap_remove(pos);
                 // Read the old generation before zeroing, and hand back its
-                // successor. Zeroing would otherwise reset it to 0 and every
-                // stale `AdjRef` pointing here — which expects 0 for a slot that
-                // has never been reused — would match again. That single
-                // ordering mistake would silently undo the whole mechanism.
+                // successor. Zeroing first would reset it to 0, and a stale
+                // `AdjRef` pointing here — which expects 0 for a slot that
+                // has never been reused — would match again.
                 let mut next_gen = 1;
                 if let Some(p) = self.open[idx].object().lea_mut(off as usize, want) {
                     unsafe {
@@ -1063,8 +1221,14 @@ impl ArenaStore {
             }
         };
 
-        // Note this runs before the `AdjRef` is built, so a degree-1 record
-        // also costs no FOT entry — `InvPtr::new` is never called for it.
+        // The record's own inline slot first. A degree-1 record — every edge,
+        // and many vertices — then costs no chunk at all. Written before any
+        // chunk exists, so the inline entry is always the oldest in the chain;
+        // that is what lets `walk_adj` recover insertion order by emitting it
+        // first.
+        //
+        // This runs before the `AdjRef` is built, so a degree-1 record also
+        // costs no FOT entry — `InvPtr::new` is never called for it.
         {
             let bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
             let occupied = unsafe { (*vp).flags & bit != 0 };
@@ -1113,9 +1277,9 @@ impl ArenaStore {
         }
 
         // Otherwise allocate a fresh chunk in the same arena and link it in.
-        // `from_fn` rather than an array-repeat literal because `AdjRef` is not
-        // `Copy` (see its docs); indices are visited in order, so `take` at 0 is
-        // the single move of `entry`.
+        // `from_fn` rather than an array-repeat literal because `AdjRef` is
+        // not `Copy`; indices are visited in order, so `take` at 0 is the
+        // single move of `entry`.
         let mut slot = Some(entry);
         let entries: [AdjRef; ADJ_CHUNK] = core::array::from_fn(|i| {
             if i == 0 {
@@ -1124,6 +1288,8 @@ impl ArenaStore {
                 AdjRef::null()
             }
         });
+        #[cfg(test)]
+        self.chunk_allocs.set(self.chunk_allocs.get() + 1);
         let new_off = {
             let tx = self.tx_for(arena_idx)?;
             tx.alloc(AdjChunk {
@@ -1162,11 +1328,13 @@ impl ArenaStore {
         self.append_adj(to, false, edge_id, label, from_gp, from, fg)
     }
 
-    /// The topology becomes `from → edge → to`, with the edge record carrying
-    /// its own adjacency, rather than `from → to` with the edge id riding along
-    /// in the entry. That is what makes edge properties identical to vertex
+    /// Create an edge as a record and link it into both endpoints.
+    ///
+    /// The topology is `from → edge → to`, with the edge record carrying its
+    /// own adjacency, rather than `from → to` with the edge id riding along in
+    /// the entry. That is what makes edge properties identical to vertex
     /// properties and hyperedges need no new machinery — an edge record with
-    /// several out-links simply *is* a hyperedge.
+    /// several out-links simply is a hyperedge.
     ///
     /// Four links, not two, and each is one direction of one hop:
     ///
@@ -1176,6 +1344,13 @@ impl ArenaStore {
     /// | edge out | `to` |
     /// | `to` in | the edge record |
     /// | edge in | `from` |
+    ///
+    /// The cost: a 1-hop query is two resolutions and a 2-hop is four.
+    ///
+    /// Placement: the edge record is placed by the same policy as any record,
+    /// which for `FillTo` means "beside whatever was allocated last". Since an
+    /// edge is normally created right after its endpoints, bump allocation
+    /// puts it near them for free.
     pub(crate) fn add_edge_record(&mut self, label: u32, from: u64, to: u64) -> Result<u64> {
         if self.live_loc(from).is_none() || self.live_loc(to).is_none() {
             return Err(twizzler_rt_abi::error::ArgumentError::InvalidArgument.into());
@@ -1207,6 +1382,10 @@ impl ArenaStore {
 
     /// Attach a further participant to an existing edge record, making it a
     /// hyperedge.
+    ///
+    /// `out = true` adds `vertex` as another target, `false` as another
+    /// source. Nothing about the edge record changes shape — a hyperedge is an
+    /// ordinary edge with more links.
     ///
     /// The label is taken from the edge record so participants cannot disagree
     /// about what edge they are on.
@@ -1280,6 +1459,11 @@ impl ArenaStore {
 
     /// Walk `vertex`'s out (or in) chain in insertion order, calling
     /// `f(edge_id, label, neighbour_id)` for each live entry.
+    ///
+    /// The single adjacency traversal every read path is built on. Chunks are
+    /// prepended, so the chunk list is walked then reversed; entries within a
+    /// chunk are already ordered. A dead vertex yields nothing, and tombstoned
+    /// neighbours are skipped, matching `Graph`.
     fn walk_adj(&self, vertex: u64, out: bool, mut f: impl FnMut(u64, u32, u64)) {
         let Some(loc) = self.live_loc(vertex) else {
             return;
@@ -1287,6 +1471,9 @@ impl ArenaStore {
         let Some(vp) = self.record_ptr(&loc) else {
             return;
         };
+        // The inline slot is the oldest entry, so it is emitted first and the
+        // chunk walk continues from there — that is what keeps the whole chain
+        // in insertion order.
         let inline_bit = if out { HAS_INLINE_OUT } else { HAS_INLINE_IN };
         let mut inline: Option<(u64, u32, u64)> = None;
         unsafe {
@@ -1302,8 +1489,7 @@ impl ArenaStore {
                 // No resolve and no generation check: the neighbour is named by
                 // id, and `is_alive` reads the flat `locs` array through its own
                 // coherent mapping. Nothing here depends on a cross-arena view
-                // of another record, which is what the `InvPtr` version got
-                // wrong.
+                // of another record.
                 if !self.is_alive(e.neighbor_id) {
                     #[cfg(test)]
                     {
@@ -1328,29 +1514,31 @@ impl ArenaStore {
             }
         };
 
-        // Bounded walk. A malformed `next` — a cycle, or an offset misread from
-        // a stale on-disk layout — would otherwise spin here forever with no
-        // output, which is the worst failure mode we have: no panic, no log,
-        // nothing to attribute it to. The bound converts that into a loud,
-        // located failure. `vertex_count` is a true upper bound because a chunk
-        // is only ever allocated by `append_adj`, at most one per entry.
-        let max_chunks = self.locs.len() + 2;
-        let mut chunks = Vec::new();
+        // The walk is bounded by structure, not by a count: a hyperedge can
+        // legally chain past any per-record estimate (`add_edge_endpoint`
+        // appends entries to one record without creating any). A cycle must
+        // revisit an offset, checked against the offsets already walked —
+        // chains are a handful of chunks, so the linear scan is free — and a
+        // non-repeating garbage `next` either reaches 0, fails `chunk_ptr`'s
+        // bounds check, or, having only finitely many in-bounds offsets to
+        // visit, eventually repeats and lands in the cycle check.
+        let mut chunks: Vec<(u64, usize)> = Vec::new();
         while off != 0 {
+            if chunks.iter().any(|&(seen, _)| seen == off) {
+                panic!(
+                    "arena_store: adjacency chain for vertex {vertex} in arena \
+                     {} revisited chunk offset {off:#x} after {} chunks — \
+                     cycle in `next`",
+                    loc.arena,
+                    chunks.len()
+                );
+            }
             let Some(cp) = self.chunk_ptr(loc.arena, off) else {
                 break;
             };
             let c = unsafe { &*cp };
             chunks.push((off, c.len as usize));
             off = c.next;
-            if chunks.len() > max_chunks {
-                panic!(
-                    "arena_store: adjacency chain for vertex {vertex} in arena \
-                     {} exceeded {max_chunks} chunks — cycle or corrupt `next` \
-                     (last offset {off:#x})",
-                    loc.arena
-                );
-            }
         }
         chunks.reverse();
 
@@ -1361,7 +1549,7 @@ impl ArenaStore {
             let c = unsafe { &*cp };
             for e in c.entries.iter().take(len) {
                 // Same-arena neighbours take `InvPtr`'s inlined local path
-                // (FOT index 0): `local_resolve` masks the entry's *own*
+                // (FOT index 0): `local_resolve` masks the entry's own
                 // address to its object base, so because the chunk was reached
                 // through the arena's mapping, so is the neighbour. No registry
                 // read, no FOT lookup, and no second mapping.
@@ -1370,8 +1558,8 @@ impl ArenaStore {
                 // `slow_resolve(READ | INDIRECT)` — a different mapping of the
                 // target arena, with the incoherence described on
                 // `delete_vertex`. Only `nb.id` is read from it, which is fixed
-                // at allocation and never written again. Do not read a
-                // mutable field of a neighbour record here.
+                // at allocation and never written again. Do not read a mutable
+                // field of a neighbour record here.
                 #[cfg(test)]
                 let mut d = self.diag.get();
                 #[cfg(test)]
@@ -1413,6 +1601,7 @@ impl ArenaStore {
                     }
                     self.diag.set(d);
                 }
+                // Hide tombstoned neighbours, matching `Graph`.
                 if self.is_alive(nb.id) {
                     f(e.edge_id, e.label, nb.id);
                 }
@@ -1451,19 +1640,15 @@ impl ArenaStore {
         ids
     }
 
-    // --- record accessors (VERSION 4) ---------------------------------------
+    // --- record accessors ----------------------------------------------------
     //
-    // These exist so `Graph` can retire the `verts` SegVec: everything the old
-    // `VertexRef` mirror carried now lives in the arena record, and the store
-    // is the single place that knows how to reach it. Each returns `None` for a
-    // missing or tombstoned vertex, so callers get `Graph`'s liveness semantics
-    // without repeating the check.
+    // The store is the single place that knows how to reach a record's fields.
+    // Each accessor returns `None` for a missing or tombstoned vertex, so
+    // callers get `Graph`'s liveness semantics without repeating the check.
 
     /// Run `f` on a live vertex's record, or `None` if missing/tombstoned.
     ///
     /// One `locs` read serves both the liveness check and the record address.
-    /// Splitting them cost a second lookup on every call — measurably, on the
-    /// `scale:20000` churn scan.
     fn with_vertex<R>(&self, vertex: u64, f: impl FnOnce(&ArenaRecordHead) -> R) -> Option<R> {
         let loc = self.live_loc(vertex)?;
         let p = self.record_ptr(&loc)?;
@@ -1471,6 +1656,10 @@ impl ArenaStore {
     }
 
     /// Whether the vertex exists and is not tombstoned.
+    ///
+    /// Reads the location registry, not the arena record: `locs` is a flat
+    /// mapped array, so this is a bounds check and a load, where resolving the
+    /// record is a pointer chase into another region.
     pub fn is_alive(&self, vertex: u64) -> bool {
         self.locs
             .get_ref(vertex as usize)
@@ -1479,6 +1668,10 @@ impl ArenaStore {
 
     /// Diagnostic: the mirror's view of a vertex against the record's, and
     /// where the record sits.
+    ///
+    /// Both are read through the arena's own mapping, so `mirror_flags` and
+    /// `record_flags` should agree on every live store; a run where they
+    /// disagree means some path is writing through a different mapping.
     pub fn debug_liveness(&self, vertex: u64) -> String {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return format!("v{vertex}: no loc entry (locs.len={})", self.locs.len());
@@ -1540,9 +1733,10 @@ impl ArenaStore {
         res
     }
 
-    /// The vertex's property-object id (0 = none).
-
-    /// All live vertex ids — a linear walk of `locs`, touching no arena.
+    /// All live vertex ids, excluding edges — a linear walk of `locs`,
+    /// touching no arena. A full scan is the one workload where a flat
+    /// registry beats index-free adjacency, which is why the liveness bit is
+    /// mirrored into `VertexLoc`.
     ///
     /// Two bit tests on one already-loaded `u32` — no record is resolved, which
     /// is why this stays cheap as records get wider. See [`IS_EDGE`].
@@ -1561,9 +1755,22 @@ impl ArenaStore {
     }
 
     /// Live vertices carrying `label`. Linear scan, matching `Graph`.
+    ///
+    /// The `IS_EDGE` mask is load-bearing. Vertex labels, edge labels and
+    /// property keys share one intern table, so a string used as both a
+    /// vertex label and an edge label makes the ids collide; without the mask
+    /// this would return edge-record ids as `VertexId`s. With one id space,
+    /// every accessor must reject the wrong kind at runtime. The mirror is
+    /// checked first, like [`Self::vertices`]: two bit tests on a loaded
+    /// `u32`, and edge/tombstoned records are never resolved at all.
     pub fn vertices_by_label(&self, label: u32) -> Vec<u64> {
         (0..self.locs.len() as u64)
-            .filter(|id| self.vertex_label(*id) == Some(label))
+            .filter(|id| {
+                self.locs
+                    .get_ref(*id as usize)
+                    .map_or(false, |l| l.flags & (TOMBSTONE | IS_EDGE) == 0)
+                    && self.vertex_label(*id) == Some(label)
+            })
             .collect()
     }
 
@@ -1572,33 +1779,44 @@ impl ArenaStore {
     }
 
     /// The stored key itself, not a `String` round-trip.
+    ///
+    /// An index rebuild must key exactly as the insert did. `NameKey`
+    /// truncates to 31 bytes, which can split a multibyte character and leave
+    /// bytes that are not valid UTF-8 — `as_str()` then yields `""`, so
+    /// `NameKey::new(vertex_name(id))` is not the key the insert used and the
+    /// rebuilt index misses the record.
     pub fn vertex_name_key(&self, vertex: u64) -> Option<NameKey> {
         self.with_vertex(vertex, |v| v.name)
     }
 
     /// Tombstone a vertex, in the record and in the `locs` mirror.
     ///
-    /// `GlobalPtr::resolve` maps its object `READ`, while `GlobalPtr::resolve_mut`
-    /// maps it `READ | WRITE | PERSIST` (`ptr/global.rs`). Different flags mean
-    /// `twz_rt_map_object` hands back *different mappings*, and a write through
-    /// one is not visible through the other. Measured on `scale:20000`: after
-    /// `v.flags |= TOMBSTONE`, a fresh `resolve_mut` read the bit set and a
-    /// fresh `resolve` read it clear, identically in a stale arena and the
-    /// current one. Every reader here uses `resolve`, so the record bit was
-    /// invisible and 2 858 deleted vertices stayed live.
+    /// The mirror is authoritative for liveness. `GlobalPtr::resolve` maps its
+    /// object `READ`, while `GlobalPtr::resolve_mut` maps it
+    /// `READ | WRITE | PERSIST` (`ptr/global.rs`); different flags mean
+    /// `twz_rt_map_object` hands back different mappings, and a write through
+    /// one is not visible through the other.
     ///
-    /// So the record's bit is written and kept consistent, but `is_alive` and
+    /// So record access does not go through `GlobalPtr` at all —
+    /// [`Self::record_ptr`] and [`Self::chunk_ptr`] use the arena's own
+    /// `READ | WRITE | PERSIST` handle for reads and writes, so the write
+    /// below is visible to every reader by construction. Liveness still comes
+    /// from the mirror, because a cross-arena neighbour is reached through
+    /// `InvPtr::resolve`, which maps `READ | INDIRECT` and reintroduces the
+    /// split; keeping one answer in a structure with one mapping avoids the
+    /// question entirely.
+    ///
+    /// The record's bit is written and kept consistent, but `is_alive` and
     /// [`Self::live_loc`] are what decide. Do not gate a read on the record's
-    /// `flags` — it is right today only for arenas you reached locally.
+    /// `flags` — it is right only for arenas reached through their own handle.
     pub fn delete_vertex(&mut self, vertex: u64) -> Result<()> {
         let Some(loc) = self.locs.get_ref(vertex as usize).map(|l| *l) else {
             return Ok(());
         };
         // Guard on the mirror, before touching anything. A second delete
-        // must not return the slot twice — two records would then be handed the
-        // same bytes, which is not a stale-reference problem that generations
-        // can catch but straightforward corruption. `deletes_stay_idempotent`
-        // covers the double-delete path.
+        // must not return the slot twice — two records would then be handed
+        // the same bytes, which is not a stale-reference problem that
+        // generations can catch but straightforward corruption.
         if loc.flags & TOMBSTONE != 0 {
             return Ok(());
         }
@@ -1614,9 +1832,9 @@ impl ArenaStore {
         if let (Some(sz), Some(slots)) = (stride, self.free.get_mut(loc.arena as usize)) {
             slots.push((loc.off, sz));
         }
-        // nosync: `with_mut_at` would sync the registry on every delete, which
-        // measured 2.5× on the churn phase. Drained by `sync_all`'s
-        // `locs.flush()`, like every other write here.
+        // nosync: a plain `with_mut_at` would sync the registry on every
+        // delete. Drained by `sync_all`'s `locs.flush()`, like every other
+        // write here.
         self.locs.with_mut_at_nosync(vertex as usize, |l| {
             l.flags |= TOMBSTONE;
             Ok(())
@@ -1624,9 +1842,9 @@ impl ArenaStore {
         Ok(())
     }
 
-    /// Test-only: tombstone the mirror and leave the record alive, forcing
-    /// the disagreement that `resolve`/`resolve_mut` incoherence produced at
-    /// scale but that a small in-boot test cannot provoke on its own.
+    /// Test-only: tombstone the mirror and leave the record alive, forcing a
+    /// mirror/record disagreement that a small in-boot test cannot provoke on
+    /// its own.
     #[cfg(test)]
     pub(crate) fn tombstone_mirror_only(&mut self, vertex: u64) -> Result<()> {
         self.locs.with_mut_at_nosync(vertex as usize, |l| {
@@ -1635,19 +1853,24 @@ impl ArenaStore {
         })
     }
 
+    /// Make every touched arena durable — one sync per arena. Mutations above
+    /// write mapped memory; nothing is durable until this runs.
+    ///
     /// Closes each arena's batching transaction first. `abort()` is what makes
-    /// the batching worth anything: it suppresses the transaction's sync-on-drop
-    /// so the arena is synced exactly once here, rather than once per open
-    /// transaction plus once again below. Upstream transactions have no
-    /// rollback, so the writes stand — the assumption is pinned by
-    /// `tx_abort_does_not_roll_back` in `tests/bulk.rs`, which fails loudly if
-    /// upstream ever implements one.
+    /// the batching worth anything: it suppresses the transaction's
+    /// sync-on-drop so the arena is synced exactly once here, rather than once
+    /// per open transaction plus once again below. Upstream transactions have
+    /// no rollback, so the writes stand — `tx_abort_does_not_roll_back` in
+    /// `tests/arena.rs` fails loudly if upstream ever implements one.
     pub fn sync_all(&mut self) -> Result<()> {
         for slot in self.txs.iter_mut() {
             if let Some(mut tx) = slot.take() {
                 tx.abort();
             }
         }
+        // Touched arenas only — see `dirty`. `syncs` counts real syncs, so a
+        // second `sync_all` with no writes in between costs nothing and
+        // counts nothing.
         for (i, a) in self.open.iter().enumerate() {
             if !self.dirty.get(i).copied().unwrap_or(true) {
                 continue;
@@ -1666,6 +1889,13 @@ impl ArenaStore {
 
 #[cfg(test)]
 mod layout_tests {
+    //! Record-layout guards. Pure `size_of`/`align_of` arithmetic — no
+    //! objects, so these cost the shared boot nothing.
+    //!
+    //! Layout bugs here do not present as errors. Records sit back-to-back at
+    //! a stride computed from each record's own `nprops`, so a stride mistake
+    //! does not fail — it reads a neighbouring record's bytes as this one's
+    //! fields.
 
     // Imported explicitly, as the module already does for `size_of`: these are
     // prelude items only on newer toolchains.
@@ -1693,6 +1923,7 @@ mod layout_tests {
         );
     }
 
+    /// `record_size` agrees with the type system for every width.
     #[test]
     fn record_size_matches_the_types() {
         assert_eq!(record_size(0), size_of::<ArenaRecordHead>());
@@ -1708,11 +1939,33 @@ mod layout_tests {
         assert!(record_size(1) < record_size(2));
     }
 
-    /// The mirror must not grow. `VertexLoc` is what makes a scan cheap:
-    /// 16 B means 256 entries per 4 KB page against ~42 records, and that 6.1×
-    /// density ratio is the model behind the measured 5.2× warm-scan gain.
-    /// `IS_EDGE` is a *bit*, so it costs nothing here — a test because the
-    /// tempting fix when the scan needs more information is to widen this.
+    /// The head and slot sizes, pinned numerically — these numbers are what a
+    /// layout regression would actually move: head 160, slot 64 (`PropValue`
+    /// 48 at `u128` alignment).
+    #[test]
+    fn record_head_and_slot_sizes_are_pinned_numerically() {
+        assert_eq!(
+            size_of::<ArenaRecordHead>(),
+            160,
+            "the record head widened — every record in every graph pays this, \
+             and the on-disk format is no longer what format 15 wrote"
+        );
+        assert_eq!(
+            size_of::<PropSlot>(),
+            64,
+            "the inline slot widened — record stride changes with it"
+        );
+        assert_eq!(size_of::<PropValue>(), 48, "PropValue grew a wider variant");
+        assert_eq!(
+            RECORD_SIZE_NO_PROPS, 160,
+            "the zero-property stride moved; 1.48 M LDBC edge records pay this"
+        );
+    }
+
+    /// The mirror must not grow. `VertexLoc` at 16 bytes is what makes a scan
+    /// cheap: 256 entries per 4 KB page. `IS_EDGE` is a bit, so it costs
+    /// nothing here — a test because the tempting fix when the scan needs
+    /// more information is to widen this.
     #[test]
     fn the_liveness_mirror_stays_sixteen_bytes() {
         assert_eq!(
