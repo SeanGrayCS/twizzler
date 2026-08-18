@@ -1,21 +1,11 @@
-//! The obvious fix — `sys_object_ctrl(id, Delete)` — turned out to be unsafe
-//! in this build: deleting a pager-backed object livelocks the pager, which
-//! answers the next `ObjectInfoReq` for that id with "uncategorized error: 0"
-//! and retries forever. So the deletes are withheld and only the parts that
-//! are safe and useful remain:
+//! Reclaim tests: the owned-object inventory, unreachability after delete,
+//! answer preservation, idempotent deletes, reset, and direct frame accounting
+//! via `sys_object_stat`.
 //!
-//! - the inventory (what a graph owns), which is what any reclaim or
-//!   eviction scheme needs and which nothing else in the engine could report;
-//! - the unreachability work in `delete_vertex` — tombstone plus clearing
-//!   the adjacency and property ids — which is what makes those objects
-//!   eligible for reclaim in the first place;
-//! - the semantics guarantee, that none of this changes an answer.
-//!
-//! ---
-//!
-//! Everything above this line is stale and is kept only for the trail.
-//!
-//! The load-bearing error was the frame-accounting paragraph, which read:
+//! `Delete` marks an object; the kernel reaps it only once nothing maps it and
+//! a sweep re-examines pending deletions. So the frame-accounting tests assert
+//! accepted-delete counts and print reap outcomes as data instead of asserting
+//! a predicted reap result.
 
 use crate::Lookup;
 use twizzler::object::ObjID;
@@ -23,6 +13,8 @@ use twizzler::object::ObjID;
 use super::{fresh, TEST_ARENA_CAP};
 use crate::{reclaim, Graph, Labels, PropValue};
 
+/// The inventory lists every object the graph owns — no nulls, no duplicates,
+/// never the root — and allocating a second arena adds exactly one id.
 #[test]
 fn inventory_covers_everything_the_graph_owns() {
     let mut g = fresh("t-reclaim-inv");
@@ -39,6 +31,9 @@ fn inventory_covers_everything_the_graph_owns() {
     assert!(ids.iter().all(|r| *r != 0), "no null ids in the inventory");
     assert!(!ids.contains(&g.root_id().raw()), "root is not owned");
 
+    // Properties are arena bytes — a data block inside the record's own
+    // arena — so setting one allocates no object at all and there is nothing
+    // per-record for a reclaim pass to find.
     assert_eq!(
         g.vertex_props_raw(a),
         Some(0),
@@ -46,15 +41,15 @@ fn inventory_covers_everything_the_graph_owns() {
     );
     assert_eq!(g.edge_props_raw(e), Some(0), "nor an edge property");
 
+    // Ids are unique — a duplicate would invite a double free.
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len(), "inventory contains no duplicates");
 
     // Fill the first arena and spill into a second. Exactly one new id should
-    // appear: the new arena. Anything else means the inventory is tracking
-    // something it should not, and a miss means arenas are invisible to
-    // reclaim — the bug this rewrite exists to close.
+    // appear: the new arena. Anything else means the inventory tracks
+    // something it should not; a miss means arenas are invisible to reclaim.
     let before = ids.len();
     assert_eq!(g.arena_count(), 1, "two vertices fit in one arena");
     for i in 0..TEST_ARENA_CAP {
@@ -68,6 +63,8 @@ fn inventory_covers_everything_the_graph_owns() {
     );
 }
 
+/// Deleting a vertex leaves no object to reclaim: a record owns no objects, so
+/// the delete tombstones the record and the inventory is unchanged.
 #[test]
 fn delete_vertex_leaves_no_object_to_reclaim() {
     let mut g = fresh("t-reclaim-delv");
@@ -87,7 +84,7 @@ fn delete_vertex_leaves_no_object_to_reclaim() {
 
     // The record survives as a tombstone — neighbours' adjacency entries still
     // point into it, and traversal resolves those before checking liveness —
-    // but it no longer names the property object.
+    // but nothing reads through it any more.
     assert!(
         g.vertex_info(a).is_none(),
         "tombstoned vertex reads as absent"
@@ -99,6 +96,9 @@ fn delete_vertex_leaves_no_object_to_reclaim() {
     );
     assert_eq!(g.get_vertex_prop(a, "age"), None, "properties unreadable");
 
+    // Nothing was allocated for the property, so nothing is orphaned by the
+    // delete. The record's bytes stay pinned in their arena until the arena is
+    // rebuilt.
     assert_eq!(
         g.owned_object_ids().len(),
         before,
@@ -106,6 +106,8 @@ fn delete_vertex_leaves_no_object_to_reclaim() {
     );
 }
 
+/// Releasing objects changes memory, never answers: the deleted vertex is
+/// invisible everywhere and every other read is exactly as before.
 #[test]
 fn reclaim_does_not_change_answers() {
     let mut g = fresh("t-reclaim-answers");
@@ -139,6 +141,8 @@ fn reclaim_does_not_change_answers() {
     }
 }
 
+/// Releasing is idempotent and never fatal — a second delete frees nothing and
+/// is still a success, and unknown ids stay no-ops.
 #[test]
 fn deletes_stay_idempotent() {
     let mut g = fresh("t-reclaim-idem");
@@ -159,8 +163,7 @@ fn deletes_stay_idempotent() {
     assert_eq!(g.vertices(), vec![b]);
 }
 
-/// `reset` still produces a working, empty graph that keeps its identity —
-/// the property the withheld reclaim must not have broken.
+/// `reset` produces a working, empty graph that keeps its identity.
 #[test]
 fn reset_leaves_a_working_empty_graph() {
     let name = "t-reclaim-reset";
@@ -189,12 +192,73 @@ fn reset_leaves_a_working_empty_graph() {
     assert_eq!(v.0, 0);
 }
 
-/// Deliberately the least interesting test in the file, and deliberately first.
-/// Every conclusion downstream divides by `pages_before`, so a silent zero
-/// there would turn "no frames came back" and "the counter returns nothing"
-/// into the same observation — which is the shape of mistake that produced the
-/// 38%. Asserting the denominator before anyone reads the ratio is the whole
-/// point.
+/// `reset` marks every owned object for deletion, the index and blob-store
+/// directories included; reaping is deferred, so it is printed, not asserted.
+#[test]
+fn reset_reclaims_the_index_and_blob_families() {
+    let name = "t-reclaim-reset-fams";
+    let (all_ids, fam_ids) = {
+        let mut g = fresh(name);
+        // One vertex under an indexed label, so the families are the ones a
+        // real graph carries (declare_test_labels already populated
+        // `index_labels`).
+        g.add_vertex("n", "a", ObjID::new(0)).unwrap();
+        g.sync().unwrap();
+        (g.owned_object_ids(), g.index_family_object_ids())
+    }; // handle dropped before the reset
+    assert!(
+        !fam_ids.is_empty(),
+        "the families own at least their three directory objects"
+    );
+    // The seam must stay a subset of the real inventory, or the arithmetic
+    // below stops meaning anything.
+    assert!(
+        fam_ids.iter().all(|id| all_ids.contains(id)),
+        "index_family_object_ids drifted outside owned_object_ids"
+    );
+
+    let accepted =
+        Graph::reset_arena_measured(name, TEST_ARENA_CAP).expect("reset");
+    assert_eq!(
+        accepted,
+        all_ids.len(),
+        "reset marked {accepted} of {} owned objects for deletion — a \
+         shortfall of {} is the families ({}) going uninventoried again",
+        all_ids.len(),
+        all_ids.len().saturating_sub(accepted),
+        fam_ids.len()
+    );
+
+    // The reap half, reported rather than asserted: pending-delete objects
+    // wait for their mappings to drop and for a sweep. Zero here means
+    // reclaimed already; nonzero means deferred — either is data.
+    let swept = reclaim::sweep_deleted();
+    let (present, pages) = reclaim::pages_of(fam_ids.iter().copied());
+    println!(
+        "reset-reclaim: {present} of {} family objects still resolving after \
+         reset + sweep (sweep ran: {swept}; {pages} pages) — marked but \
+         unreaped is a deferral, not a leak; see AC13b",
+        fam_ids.len()
+    );
+
+    // Guard the other direction too: the reset graph is intact and usable,
+    // so the wider inventory did not over-collect into the new families.
+    let mut g =
+        Graph::open_or_create_arena(name, TEST_ARENA_CAP).expect("reopen after reset");
+    g.set_label_indexed("n", true).expect("declare label on the reset graph");
+    let v = g.add_vertex("n", "fresh", ObjID::new(0)).unwrap();
+    assert_eq!(g.find_vertex("n", "fresh"), Lookup::Found(v));
+}
+
+// ---------------------------------------------------------------------------
+// Direct frame accounting via `sys_object_stat`.
+//
+// The order matters: first check the instrument reads a non-zero number, then
+// what deletion does to the object table, and only then report a fraction.
+// ---------------------------------------------------------------------------
+
+/// The instrument reads a non-zero number: every owned id resolves via
+/// `sys_object_stat`, and a populated graph's resident-page total is positive.
 #[test]
 fn object_stat_reports_pages_for_a_live_arena() {
     let mut g = fresh("t-reclaim-stat");
@@ -209,6 +273,8 @@ fn object_stat_reports_pages_for_a_live_arena() {
     let ids = g.owned_object_ids();
     assert!(!ids.is_empty(), "a populated graph owns objects");
 
+    // Every owned id resolves: an id the kernel does not know is
+    // indistinguishable from one holding zero pages once the two are summed.
     let unknown: Vec<u128> = ids
         .iter()
         .copied()
@@ -230,15 +296,8 @@ fn object_stat_reports_pages_for_a_live_arena() {
     );
 }
 
-/// What this test can and cannot see. `sys_object_stat` returns `Ok` for an
-/// object that is in the manager's map, and a marked-but-unreaped object is
-/// still in the map. So `Ok`/`Err` cannot distinguish "never deleted" from
-/// "deleted, not yet reaped" — which is why this test now *reports* rather than
-/// asserts, and why the sweep below exists to separate them.
-///
-/// The root is checked in the opposite direction on purpose: it is the one
-/// object `destroy` deliberately retains, because the naming service cannot
-/// unbind on this build.
+/// `destroy` marks every owned object and deliberately retains the root; how
+/// many ids still resolve, before and after a sweep, is printed as data.
 #[test]
 fn destroy_defers_reaping_until_the_mapping_drops() {
     let name = "t-reclaim-gone";
@@ -263,6 +322,10 @@ fn destroy_defers_reaping_until_the_mapping_drops() {
     };
     let immediately = resolving(&ids);
 
+    // `scan_deleted` walks the entire map, not just the id being deleted, so a
+    // sweep re-examines every pending object. Ids that disappear after it were
+    // merely deferred — their mappings had not dropped when `destroy` ran. Ids
+    // that survive it are still mapped somewhere.
     let swept = reclaim::sweep_deleted();
     let after_sweep = resolving(&ids);
 
@@ -289,9 +352,7 @@ fn destroy_defers_reaping_until_the_mapping_drops() {
         }
     );
 
-    // Deliberately no assertion on `after_sweep`. Every value of it is a result,
-    // and the one thing this file must not do again is assert a predicted
-    // outcome and read the failure as a defect rather than as data.
+    // Deliberately no assertion on `after_sweep`: every value of it is a result.
     assert!(
         after_sweep <= immediately,
         "a sweep made *more* ids resolve ({immediately} -> {after_sweep}), which \
@@ -307,8 +368,8 @@ fn destroy_defers_reaping_until_the_mapping_drops() {
     );
 }
 
-/// The only assertion is that destroying an object never *increases* its
-/// resident pages. That is deliberate and it is the point of the test.
+/// Destroying a graph never increases its resident pages — the only assertion.
+/// The returned fraction, instantaneous and after a sweep, is printed as data.
 #[test]
 fn destroy_returns_pages() {
     let name = "t-reclaim-pages";
@@ -349,11 +410,9 @@ fn destroy_returns_pages() {
         None => println!("  returned fraction: undefined (nothing resident)"),
     }
 
-    // The same figure after a sweep, because the first run of this file
-    // established that `destroy` marks and `scan_deleted` reaps, and the two do
-    // not happen at the same moment. `rep` is therefore the *instantaneous*
-    // fraction, which may be structurally near zero without telling us anything
-    // about whether the frames ever come back. This is the eventual one.
+    // The same figure after a sweep: `destroy` marks and `scan_deleted` reaps,
+    // and the two do not happen at the same moment, so `rep` holds only the
+    // instantaneous fraction. This is the eventual one.
     let swept = reclaim::sweep_deleted();
     let (present, pages) = reclaim::pages_of(ids.iter().copied());
     println!(

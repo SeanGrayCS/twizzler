@@ -386,8 +386,6 @@ impl Graph {
         Self::open_inner(name, cap, arena_cap)
     }
 
-    /// Every graph created here is VERSION 4; `arena_cap` sets placement at
-    /// creation and is ignored (see above) when opening an existing graph.
     fn open_inner(name: &str, cap: usize, arena_cap: usize) -> Result<Graph> {
         Self::open_inner_schema(name, cap, arena_cap, IndexSchema::default())
     }
@@ -551,13 +549,6 @@ impl Graph {
 
     /// Reset a graph to empty, reusing its registration. No-op if no such graph
     /// is registered.
-    ///
-    /// This does not remove the `data/<name>` entry: removing a name under the
-    /// persistent `data/` namespace is unsupported on the current Twizzler build
-    /// (the pager's external unlink is unimplemented). Instead it rewrites the
-    /// existing root object in place to point at fresh, empty registries. Old
-    /// registry objects are orphaned; reclamation and true unregistration are
-    /// future work.
     pub fn reset(name: &str) -> Result<()> {
         Self::reset_inner(name, None)
     }
@@ -786,23 +777,34 @@ impl Graph {
         arena_cap: usize,
         schema: IndexSchema,
     ) -> Result<()> {
-        Self::reset_inner_fmt_schema(name, cap, arena_cap, schema)
+        Self::reset_inner_fmt_schema(name, cap, arena_cap, schema).map(|_| ())
     }
 
     fn reset_inner_fmt(name: &str, cap: Option<usize>, arena_cap: usize) -> Result<()> {
-        Self::reset_inner_fmt_schema(name, cap, arena_cap, IndexSchema::default())
+        Self::reset_inner_fmt_schema(name, cap, arena_cap, IndexSchema::default()).map(|_| ())
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_arena_measured(name: &str, arena_cap: usize) -> Result<usize> {
+        if arena_cap == 0 || arena_cap > u32::MAX as usize {
+            return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
+        }
+        Self::reset_inner_fmt_schema(name, None, arena_cap, IndexSchema::default())
+    }
+
+    /// Returns how many outgoing-graph objects the kernel accepted deletes
+    /// for (0 when no graph was registered, or when the outgoing format is
+    /// not reclaimable). Public wrappers discard the count.
     fn reset_inner_fmt_schema(
         name: &str,
         cap: Option<usize>,
         arena_cap: usize,
         schema: IndexSchema,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut namer = static_naming_factory().expect("naming service available");
         let path = format!("data/{name}");
         let Ok(node) = namer.get(&path, GetFlags::FOLLOW_SYMLINK) else {
-            return Ok(()); // nothing registered
+            return Ok(0); // nothing registered
         };
 
         let mut root = Object::<GraphRoot>::map(node.id.into(), rw())?;
@@ -827,13 +829,16 @@ impl Graph {
         let cap = cap.unwrap_or(DEFAULT_SEG_CAP);
 
         let old_ids = {
-            let (l, x, ad, al) = {
+            let (l, x, ad, al, il, ir, bd) = {
                 let r = root.base();
                 (
                     r.labels_raw,
                     r.vindex_raw,
                     r.arena_dir_raw,
                     r.arena_locs_raw,
+                    r.index_labels_raw,
+                    r.index_roots_raw,
+                    r.blob_dir_raw,
                 )
             };
             match old_version {
@@ -858,6 +863,15 @@ impl Graph {
                     }
                     if let Ok(sv) = SegVec::<LabelEntry>::open(l, cap) {
                         ids.extend(sv.object_ids());
+                    }
+                    if let Ok(sv) = SegVec::<IndexedLabel>::open(il, cap) {
+                        ids.extend(sv.object_ids());
+                    }
+                    if let Ok(sv) = SegVec::<RootEntry>::open(ir, cap) {
+                        ids.extend(sv.object_ids());
+                    }
+                    if let Ok(bs) = BlobStore::open(bd, cap) {
+                        ids.extend(bs.object_ids());
                     }
                     ids.push(x);
                     ids
@@ -905,8 +919,7 @@ impl Graph {
             Ok(())
         })?;
 
-        reclaim::delete_all(old_ids);
-        Ok(())
+        Ok(reclaim::delete_all(old_ids))
     }
 
     /// The set supplied here is fixed for the record's lifetime, because the
@@ -1073,6 +1086,21 @@ impl Graph {
         // reopens — a slow leak in the structure introduced to avoid a leak.
         if self.indexed_set.borrow().contains(&lbl) == indexed {
             return Ok(());
+        }
+        if indexed
+            && self.schema.strategy == IndexStrategy::LazyLabel
+            && self.schema.rebuild == RebuildSource::Roots
+            && self.store.record_count() > 0
+        {
+            self.scans.set(self.scans.get() + 1);
+            for id in self.store.vertices_by_label(lbl) {
+                self.index_roots.push_nosync(RootEntry {
+                    id,
+                    label: lbl,
+                    _pad: 0,
+                })?;
+            }
+            self.index_roots.flush()?;
         }
         self.index_labels.push(IndexedLabel {
             label: lbl,
@@ -1395,11 +1423,10 @@ impl Graph {
         // in `find_vertex` would catch it anyway; this keeps the map honest
         // rather than relying on that second line of defence.
         if self.schema.strategy == IndexStrategy::LazyLabel {
-            if let (Some(lbl), Some(nm)) = (self.vertex_label_id(id), self.store.vertex_name(id.0))
+            if let (Some(lbl), Some(key)) =
+                (self.vertex_label_id(id), self.store.vertex_name_key(id.0))
             {
-                self.volatile
-                    .borrow_mut()
-                    .remove_if_built(lbl, NameKey::new(&nm));
+                self.volatile.borrow_mut().remove_if_built(lbl, key, id.0);
             }
         }
         // `?` rather than a bare tail: the store speaks `TwzError`, the graph
@@ -1424,13 +1451,20 @@ impl Graph {
     pub fn owned_object_ids(&self) -> Vec<u128> {
         let mut ids = Vec::new();
         ids.extend(self.store.owned_object_ids());
-        // Edges: no object to map, and the property id lives in the mirror.
-        // `verts` is vestigial on v4 but still allocated, and still freed.
         ids.extend(self.labels.object_ids());
         ids.extend(self.index_labels.object_ids());
         ids.extend(self.index_roots.object_ids());
         ids.extend(self.blobs.object_ids());
         ids.extend(self.index_object_ids());
+        ids
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_family_object_ids(&self) -> Vec<u128> {
+        let mut ids = self.index_labels.object_ids();
+        ids.extend(self.index_roots.object_ids());
+        ids.extend(self.blobs.object_ids());
+        ids.retain(|r| *r != 0);
         ids
     }
 
@@ -1468,9 +1502,6 @@ impl Graph {
         self.store.live_record(e.0).map(|_| 0)
     }
 
-    /// Set a property on a vertex; errors if it is missing or tombstoned.
-    /// Creates the vertex's property object on first use and records its id in
-    /// the vertex's arena record.
     pub fn set_vertex_prop(&mut self, v: VertexId, key: &str, val: PropValue) -> Result<()> {
         if !self.is_vertex_alive(v) {
             return Err(GraphError::Twz(ArgumentError::InvalidArgument.into()));
@@ -1578,7 +1609,11 @@ impl Graph {
     }
 
     pub(crate) fn text_eq(&self, v: VertexId, key: &str, want: &str) -> bool {
-        self.get_vertex_text(v, key).as_deref() == Some(want)
+        if self.get_vertex_text(v, key).as_deref() == Some(want) {
+            return true;
+        }
+        let k = NameKey::new(want);
+        k.as_str() == want && self.get_vertex_prop(v, key) == Some(PropValue::Str(k))
     }
 
     /// All of a vertex's properties (empty if dead/unset).
@@ -1593,6 +1628,12 @@ impl Graph {
         slots.extend(self.store.data_props(v.0).unwrap_or_default());
         slots
             .into_iter()
+            .filter(|s| {
+                !matches!(
+                    s.val,
+                    PropValue::TextRef { .. } | PropValue::BlobRef { .. }
+                )
+            })
             .filter_map(|s| self.label_name(s.key_id).map(|k| (k, s.val)))
             .collect()
     }

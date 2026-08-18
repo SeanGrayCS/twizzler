@@ -1,10 +1,11 @@
-//! Indexing every record is the KV-store assumption. IndraDB must index
-//! everything because it has no pointers: every traversal step is a keyed
-//! lookup. Index-free adjacency follows ids inside arenas and never consults an
-//! index — only *query entry* does, and an LDBC query resolves a handful of
-//! roots and then walks. So the index should cover roots, not records, and
-//! which roots is a property of the workload. That makes it a schema decision
-//! rather than a constant, which is what this module encodes.
+//! The index as a schema decision.
+//!
+//! Indexing every record is the KV-store assumption, where every traversal
+//! step is a keyed lookup. Index-free adjacency follows ids inside arenas and
+//! never consults an index — only query entry does: a query resolves a
+//! handful of roots by name and then walks. So the index covers roots, not
+//! records, and which roots is a property of the workload. That makes it a
+//! schema decision rather than a constant, which is what this module encodes.
 //!
 //! The seam mirrors [`crate::Placement`], which already does this for arena
 //! layout: the engine asks the schema rather than hardcoding a policy, so a new
@@ -26,6 +27,9 @@ pub enum IndexStrategy {
     /// memory and built on first lookup. Nothing is persisted or synced, so the
     /// index leaves the write path entirely.
     LazyLabel,
+    /// Every record, in a persistent `hachage` map. Retained as the
+    /// comparison arm so its size and sync cost can be compared against the
+    /// default rather than assumed.
     Persistent,
 }
 
@@ -36,9 +40,9 @@ pub enum UnindexedLookup {
     ///
     /// Not because scanning is wrong — some workloads genuinely need name
     /// lookup on labels they chose not to index — but because a scan's cost is
-    /// invisible at the call site. A benchmark resolving one root per query
-    /// would silently become a full scan per query. Opting in is one builder
-    /// call, and [`crate::Graph::scans_performed`] makes it auditable.
+    /// invisible at the call site: a lookup meant to resolve one root would
+    /// silently become a full scan. Opting in is one builder call, and
+    /// [`crate::Graph::scans_performed`] makes it auditable.
     Refuse,
     /// Walk records and answer authoritatively. Never returns `NotIndexed`.
     Scan,
@@ -47,7 +51,13 @@ pub enum UnindexedLookup {
 /// Where a lazy index gets its entries when it is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RebuildSource {
+    /// Walk every record. Persists nothing, but pages in every arena.
+    /// Default, because it is the version with no extra persistent structure
+    /// to justify.
     Scan,
+    /// Keep one `u64` id per indexed record and build from that: rebuild
+    /// reads only the recorded roots for declared labels instead of every
+    /// record, at the cost of a small persistent id list.
     Roots,
 }
 
@@ -110,6 +120,12 @@ impl IndexSchema {
     /// would index the wrong labels and answer lookups wrongly rather than
     /// refusing to open.
     pub(crate) fn from_bits(b: u32) -> Option<Self> {
+        // The top byte is the room the u32 packing reserved for a fourth
+        // policy. A nonzero value there comes from a newer build, so it must
+        // refuse like any other unknown bit pattern.
+        if b >> 24 != 0 {
+            return None;
+        }
         Some(Self {
             strategy: match b & 0xff {
                 0 => IndexStrategy::None,
@@ -135,8 +151,8 @@ impl IndexSchema {
 ///
 /// `NotFound` and `NotIndexed` are different answers and must never be
 /// collapsed. `Option` cannot carry the distinction, and returning `None` for
-/// an unindexed label is a lie: it reads as "no such vertex" when the truth is
-/// "I did not look". A benchmark would believe it for every root it resolves.
+/// an unindexed label would read as "no such vertex" when the truth is "I did
+/// not look".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lookup {
     Found(VertexId),
@@ -148,8 +164,8 @@ pub enum Lookup {
 }
 
 impl Lookup {
-    /// For call sites that only want the happy path. Note this *does* discard
-    /// the `NotFound`/`NotIndexed` distinction — only use it where the label is
+    /// For call sites that only want the happy path. This discards the
+    /// `NotFound`/`NotIndexed` distinction — only use it where the label is
     /// known to be indexed.
     pub fn found(self) -> Option<VertexId> {
         match self {
@@ -164,6 +180,9 @@ impl Lookup {
 }
 
 /// The in-memory index for [`IndexStrategy::LazyLabel`].
+///
+/// `map` is `None` until the first lookup builds it, so a pure bulk load
+/// never pays for it. `builds` is a test seam for that.
 #[derive(Default)]
 pub(crate) struct VolatileIndex {
     map: Option<HashMap<(u32, NameKey), u64>>,
@@ -194,6 +213,9 @@ impl VolatileIndex {
         self.map.as_ref()?.get(&(label, name)).copied()
     }
 
+    /// Keep an already-built map current. Insertions must not build it — a
+    /// bulk load into an unbuilt index has to stay free, or the lazy saving
+    /// is lost.
     pub(crate) fn insert_if_built(&mut self, label: u32, name: NameKey, id: u64) {
         if let Some(m) = self.map.as_mut() {
             m.insert((label, name), id);
@@ -201,10 +223,17 @@ impl VolatileIndex {
     }
 
     /// Drop a key from an already-built map, so a delete cannot leave a name
-    /// resolving to a tombstoned record.
-    pub(crate) fn remove_if_built(&mut self, label: u32, name: NameKey) {
+    /// resolving to a tombstoned record — but only when the entry is the
+    /// record being deleted. Duplicate `(label, name)` pairs are permitted,
+    /// so a key-only removal could un-index a live twin, and `find_vertex`
+    /// would then answer an authoritative `NotFound` for it until the next
+    /// rebuild. The id match also keeps this arm answer-identical to
+    /// `Persistent` under duplicates.
+    pub(crate) fn remove_if_built(&mut self, label: u32, name: NameKey, id: u64) {
         if let Some(m) = self.map.as_mut() {
-            m.remove(&(label, name));
+            if m.get(&(label, name)) == Some(&id) {
+                m.remove(&(label, name));
+            }
         }
     }
 

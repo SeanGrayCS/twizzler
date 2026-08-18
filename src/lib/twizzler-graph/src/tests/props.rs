@@ -1,8 +1,12 @@
+//! Typed properties on vertices and edges: round-trips, overwrite,
+//! enumeration order, persistence, and error cases.
+
 use twizzler::object::ObjID;
 
 use super::fresh;
 use crate::{EdgeId, Graph, PropValue, VertexId};
 
+/// A fresh vertex has no props; a set round-trips.
 #[test]
 fn vertex_prop_roundtrip_and_missing() {
     let mut g = fresh("t-prop1");
@@ -14,6 +18,8 @@ fn vertex_prop_roundtrip_and_missing() {
     assert_eq!(g.get_vertex_prop(v, "kind"), None);
 }
 
+/// Overwrite replaces in place (position preserved); distinct keys coexist;
+/// enumeration returns insertion order.
 #[test]
 fn prop_overwrite_multiple_keys_and_enumeration() {
     let mut g = fresh("t-prop2");
@@ -38,6 +44,7 @@ fn prop_overwrite_multiple_keys_and_enumeration() {
     assert_eq!(all[0].1, PropValue::U64(100));
 }
 
+/// Edge properties round-trip like vertex properties.
 #[test]
 fn edge_prop_roundtrip() {
     let mut g = fresh("t-prop3");
@@ -53,6 +60,7 @@ fn edge_prop_roundtrip() {
     assert_eq!(g.get_vertex_prop(a, "weight"), None);
 }
 
+/// Properties persist across reopen-by-name.
 #[test]
 fn props_persist_on_reopen() {
     let name = "t-prop4";
@@ -72,6 +80,7 @@ fn props_persist_on_reopen() {
     let _ = Graph::reset(name);
 }
 
+/// Tombstoned elements hide their properties.
 #[test]
 fn deleted_element_props_hidden() {
     let mut g = fresh("t-prop5");
@@ -90,6 +99,8 @@ fn deleted_element_props_hidden() {
     assert!(g.vertex_props(a).is_empty());
 }
 
+/// A graph written without any props reopens normally — no `StaleVersion`,
+/// and reads return `None`.
 #[test]
 fn propless_graph_compat() {
     let name = "t-prop6";
@@ -105,6 +116,7 @@ fn propless_graph_compat() {
     let _ = Graph::reset(name);
 }
 
+/// Str values truncate byte-wise at 31, exactly like `NameKey`.
 #[test]
 fn str_props_truncate_like_namekey() {
     let mut g = fresh("t-prop7");
@@ -124,6 +136,8 @@ fn str_props_truncate_like_namekey() {
     );
 }
 
+/// Every variant round-trips: missing → set → overwritten per variant,
+/// including cross-variant overwrite.
 #[test]
 fn all_variants_roundtrip() {
     let mut g = fresh("t-prop8");
@@ -153,6 +167,8 @@ fn all_variants_roundtrip() {
     assert_eq!(g.vertex_props(v).len(), cases.len());
 }
 
+/// Setting on missing or tombstoned elements errors; the graph stays usable
+/// afterward.
 #[test]
 fn set_on_missing_or_deleted_errors() {
     let mut g = fresh("t-prop9");
