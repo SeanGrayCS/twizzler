@@ -3,21 +3,33 @@ name = "twizzler-graph"
 version = "0.1.0"
 edition = "2021"
 
+# twizzler-graph — a general-purpose property-graph database engine for Twizzler.
+# Reusable across applications (relational namespace, social graph, provenance,
+# dependency graphs, …). Records — vertices and edges — are packed into shared
+# arena objects with adjacency as in-arena chunk chains.
+
 [lib]
 crate-type = ["rlib"]
 
+# Test-suite slicing, so the whole suite need not fit in one boot's frame
+# budget.
+#
 # `xtask` writes `target.<triple>.rustflags` itself and calls
 # `clear_rustflags()`, so a `RUSTFLAGS --cfg` would clobber the `machine` cfg
 # and break the build — features are the only usable switch.
+#
+# To run one slice: set `default` to that feature and rebuild; the three
+# slices together cover everything. `test-all` runs the whole suite in one
+# boot.
 [features]
 default = ["test-all"]
 test-all = ["test-core", "test-storage", "test-query"]
-## crud, names, adjacency, persistence — plain semantics, cheapest slice.
+## adjacency, crud, names, persistence — plain semantics, cheapest slice.
 test-core = []
-## arena, arena_graph, sharding, bulk, reclaim — the layout tests, and the
-## v3 holdouts that still spend three referencing objects per vertex.
+## arena, arena_graph, index_strategy, text_blob, reclaim — the storage
+## layout, index strategy, and reclaim tests.
 test-storage = []
-## dsl, props — traversal and property semantics.
+## dsl, ordering, props, repeat — traversal and property semantics.
 test-query = []
 
 [dependencies]
