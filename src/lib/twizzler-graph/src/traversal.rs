@@ -22,10 +22,16 @@
 //! `limit`), and terminals (`to_ids`, `to_infos`, `values(key)`, `path`,
 //! `count`, `first`).
 //!
-//! Paths. Every traversal records, for each current element, the route it
-//! came by: the vertices reached *and the edges crossed*, alternating.
+//! Every traversal records, for each current element, the route it came by:
+//! the vertices reached and the edges crossed, alternating.
 //! [`VertexTraversal::path`] returns that; [`VertexTraversal::vertex_path`]
-//! projects it down to the vertices alone.
+//! projects it down to the vertices alone. Carrying the edges costs no extra
+//! reads (the adjacency entry holds the edge id beside the neighbour) and
+//! keeps parallel edges distinguishable, direction recoverable after
+//! `both(..)`, and edge properties along a path reachable.
+//!
+//! Tracking is always on rather than opt-in, so `path()` works at the end of
+//! any chain; the cost is one `Vec` per element.
 
 use std::collections::HashSet;
 
@@ -46,6 +52,11 @@ pub struct TraversalSource<'a> {
 
 /// One element of a path: a vertex reached, or an edge crossed to reach the
 /// next one.
+///
+/// An explicit tag, not an even-index convention: `VertexId` and `EdgeId` are
+/// both re-exports of `RecordId` — the same type — so a bare `Vec<RecordId>`
+/// relying on position could not say which is which. Here the variant carries
+/// it, so a path element cannot be misread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathElem {
     /// A vertex the traversal reached.
@@ -93,6 +104,7 @@ fn seed_paths(current: &[VertexId]) -> Paths {
     current.iter().map(|v| vec![PathElem::Vertex(*v)]).collect()
 }
 
+/// Drop the edges from a path: the vertices alone, in order.
 fn project_vertices(p: Path) -> Vec<VertexId> {
     p.into_iter().filter_map(PathElem::as_vertex).collect()
 }
@@ -157,11 +169,12 @@ pub struct VertexTraversal<'a> {
     graph: &'a Graph,
     current: Vec<VertexId>,
     paths: Paths,
-    /// Sticky. Every step carries it forward, because a truncated walk taints
-    /// everything computed from it — clearing it on the next `.out()` would
-    /// recreate the silent-short-answer problem one step removed. The cost is
-    /// that it names the chain rather than the step: you learn *that* something
-    /// truncated, not which repeat did.
+    /// Set when a `repeat` in this chain stopped at its depth cap.
+    ///
+    /// Sticky: every step carries it forward, because a truncated walk taints
+    /// everything computed from it. The cost is that it names the chain
+    /// rather than the step: you learn that something truncated, not which
+    /// repeat did.
     truncated: bool,
 }
 
@@ -218,6 +231,11 @@ impl<'a> VertexTraversal<'a> {
         self
     }
 
+    /// Filter on a long text property, comparing the whole value.
+    ///
+    /// There is deliberately no `has_blob`: filtering a blob has to fail
+    /// loudly, and an absent method is a compile error, which is louder
+    /// than any runtime check and cannot be skipped at a call site.
     pub fn has_text(mut self, key: &str, value: &str) -> Self {
         let g = self.graph;
         self.retain(|v| g.text_eq(v, key, value));
@@ -235,13 +253,19 @@ impl<'a> VertexTraversal<'a> {
 
     /// Sort by vertex name, ascending; ties (and unreadable vertices) break
     /// by id, so the order is total and reproducible.
+    ///
+    /// The id tiebreak is always ascending, in every `order_by_*` step and in
+    /// both directions — `_desc` reverses the sort key, not the tiebreak, so
+    /// the tiebreak's meaning stays independent of direction. A consequence
+    /// worth knowing: `order_by_x_desc()` is not the exact reverse of
+    /// `order_by_x()` when keys tie.
     pub fn order_by_name(mut self) -> Self {
         let g = self.graph;
         self.sort_by_key_opt(|v| g.vertex_info(v).map(|i| i.name), false);
         self
     }
     /// Sort by vertex name, descending. Vertices without readable info sort
-    /// last in *both* directions, so `limit(n)` never surfaces them first.
+    /// last in both directions, so `limit(n)` never surfaces them first.
     pub fn order_by_name_desc(mut self) -> Self {
         let g = self.graph;
         self.sort_by_key_opt(|v| g.vertex_info(v).map(|i| i.name), true);
@@ -255,8 +279,8 @@ impl<'a> VertexTraversal<'a> {
         self
     }
     /// Sort by the value of property `key`, descending; vertices lacking the
-    /// key still sort last (the "newest first, missing dates last" shape the
-    /// LDBC short reads want), ties break by id.
+    /// key still sort last ("newest first, missing values last"), ties break
+    /// by id.
     pub fn order_by_prop_desc(mut self, key: &str) -> Self {
         let g = self.graph;
         self.sort_by_key_opt(|v| g.get_vertex_prop(v, key), true);
@@ -298,6 +322,7 @@ impl<'a> VertexTraversal<'a> {
         self.paths
     }
     /// [`Self::path`] with the edges dropped: just the vertices traversed.
+    /// The right terminal whenever the edges are not part of the question.
     pub fn vertex_path(self) -> Vec<Vec<VertexId>> {
         self.paths.into_iter().map(project_vertices).collect()
     }
@@ -329,8 +354,14 @@ impl<'a> VertexTraversal<'a> {
     /// Sort elements and paths together by an optional key: `None` sorts last
     /// regardless of direction, ties break by vertex id.
     ///
+    /// The key is read once per element, not once per comparison. `key` is
+    /// typically `get_vertex_prop` — a liveness check, a label lookup, a
+    /// record-head read, a data-block read and a `Vec` allocation per call —
+    /// and a comparison sort makes ~`n·log₂n` comparisons, so evaluating the
+    /// key inside the comparator would multiply those reads where `n` suffice.
+    ///
     /// Decorate–sort–undecorate rather than `slice::sort_by_cached_key`,
-    /// because the order is not `K`'s natural one: `None` sorts last in *both*
+    /// because the order is not `K`'s natural one: `None` sorts last in both
     /// directions and the id tiebreak is always ascending. Expressing that
     /// through a cached-key sort needs a wrapper type whose `Ord` depends on
     /// `desc` — more machinery for the same `n` reads.
@@ -406,6 +437,7 @@ impl<'a> VertexTraversal<'a> {
             graph: g,
             current: edges,
             paths,
+            truncated: self.truncated,
         }
     }
 }
@@ -421,6 +453,10 @@ pub struct EdgeTraversal<'a> {
     graph: &'a Graph,
     current: Vec<EdgeId>,
     paths: Paths,
+    /// Set when a `repeat` earlier in this chain stopped at its depth cap.
+    /// Sticky through edge steps too, so `out_e(..).in_v()` after a truncated
+    /// repeat still reports it — same contract as the vertex form.
+    truncated: bool,
 }
 
 impl<'a> EdgeTraversal<'a> {
@@ -495,6 +531,11 @@ impl<'a> EdgeTraversal<'a> {
     pub fn first(self) -> Option<EdgeId> {
         self.current.into_iter().next()
     }
+    /// Whether a `repeat` earlier in this chain stopped at its depth cap.
+    /// Same stickiness contract as [`VertexTraversal::hit_depth_cap`].
+    pub fn hit_depth_cap(&self) -> bool {
+        self.truncated
+    }
 
     // --- internals ---------------------------------------------------------
 
@@ -537,7 +578,7 @@ impl<'a> EdgeTraversal<'a> {
             graph: g,
             current: vs,
             paths,
-            truncated: false,
+            truncated: self.truncated,
         }
     }
 }
@@ -548,12 +589,23 @@ enum End {
     Both,
 }
 
-// Not Gremlin's higher-order `repeat(step)`. An anonymous step fights an
-// ownership model where every step consumes `self`; `repeat_out(labels)` plus a
-// builder expresses every criterion, including IS6's
-// `repeat(out(replyOf)).until(no outgoing replyOf)`. The closure form stays open
-// if a query ever needs a compound per-hop step.
+// ---------------------------------------------------------------------------
+// Recursive / variable-length traversal
+// ---------------------------------------------------------------------------
+//
+// Each `.out()` is one hop, so a k-hop query is k chained steps and an
+// unbounded one cannot be written that way. `repeat_out` and its siblings
+// walk breadth-first until a stopping condition, reusing this module's eager
+// model and its `paths` bookkeeping — so `path()` composes unchanged rather
+// than needing a parallel path API.
+//
+// This is not Gremlin's higher-order `repeat(step)`. An anonymous step fights
+// an ownership model where every step consumes `self`; `repeat_out(labels)`
+// plus a builder expresses the stopping criteria in use, and the closure form
+// stays open if a query ever needs a compound per-hop step.
 
+/// A per-hop predicate. Applied to a newly reached vertex before it is allowed
+/// to expand, so a vertex that fails also blocks everything behind it.
 enum HopFilter<'a> {
     Label(String),
     Prop(String, PropValue),
@@ -564,16 +616,20 @@ enum HopFilter<'a> {
 enum Stop<'a> {
     /// Exactly k hops.
     Times(usize),
+    /// The first frontier containing a match; only the matching vertices are
+    /// returned, not the whole frontier — except under `emit`, where the
+    /// emitted set through the matching frontier is the result (see
+    /// [`Repeat::emit`]).
     Until(Box<dyn Fn(&VertexInfo) -> bool + 'a>),
     /// Until nothing new is reachable. Returns the last non-empty frontier —
-    /// the end of the chain, which is what IS6 wants.
+    /// the end of the chain.
     Exhausted,
 }
 
-/// Default depth cap. Deep enough for any realistic `replyOf` chain (LDBC's are
-/// single digits), shallow enough that a cyclic or adversarial graph stops
-/// promptly. The visited set already guarantees termination on a finite graph;
-/// this is the second line, against depth rather than repetition.
+/// Default depth cap. Deep enough for realistic chains, shallow enough that a
+/// cyclic or adversarial graph stops promptly. The visited set already
+/// guarantees termination on a finite graph; this is the second line, against
+/// depth rather than repetition.
 pub const DEFAULT_MAX_DEPTH: usize = 64;
 
 struct RepeatCfg<'a> {
@@ -602,6 +658,14 @@ impl<'a> RepeatCfg<'a> {
 
 /// Builder for a recursive walk. Configure, then terminate with `times`,
 /// `until`, or `until_exhausted`.
+///
+/// A walk does not enumerate edge-distinct paths. Its visited set is keyed by
+/// vertex and is always on, so a vertex reachable by two parallel edges is
+/// reached once, and its path names whichever edge came first in adjacency
+/// order — deterministic, but arbitrary among the parallel ones. A single
+/// `out(..)` hop does yield one path per edge; the difference is the dedup,
+/// and it is deliberate. Enumerating every edge-distinct route is a different
+/// operation and would need its own step.
 pub struct Repeat<'a> {
     base: VertexTraversal<'a>,
     cfg: RepeatCfg<'a>,
@@ -632,6 +696,8 @@ impl<'a> VertexTraversal<'a> {
         Repeat::new(self, Dir::Both, labels)
     }
 
+    /// Whether a `repeat` in this chain stopped at its depth cap, i.e.
+    /// whether this result may be short rather than complete.
     pub fn hit_depth_cap(&self) -> bool {
         self.truncated
     }
@@ -653,6 +719,14 @@ impl<'a> Repeat<'a> {
 
     /// Collect every vertex visited, in first-visit order, rather than only the
     /// final frontier. The start vertices are not re-emitted.
+    ///
+    /// With `until`, the two compose as in Gremlin's `repeat().emit().until()`:
+    /// the walk still stops at the first frontier containing a match, and the
+    /// result is everything emitted through that frontier — the matching
+    /// vertices included. If nothing ever matches, the result is everything
+    /// emitted before the walk gave up, with
+    /// [`VertexTraversal::hit_depth_cap`] distinguishing exhaustion from the
+    /// cap.
     pub fn emit(mut self) -> Self {
         self.cfg.emit = true;
         self
@@ -698,8 +772,11 @@ impl<'a> Repeat<'a> {
     }
 
     /// Walk until a frontier contains a vertex satisfying `pred`, returning
-    /// only the matching vertices. If nothing ever matches the result is
-    /// empty; if that was because the cap was reached, `hit_depth_cap` says so.
+    /// only the matching vertices — unless [`Repeat::emit`] is set, in which
+    /// case the result is everything visited through the matching frontier.
+    /// If nothing ever matches the result is empty (or, with `emit`,
+    /// everything visited); if that was because the cap was reached,
+    /// `hit_depth_cap` says so.
     pub fn until(self, pred: impl Fn(&VertexInfo) -> bool + 'a) -> VertexTraversal<'a> {
         walk(self.base, self.cfg, Stop::Until(Box::new(pred)))
     }
@@ -759,9 +836,14 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
     let mut emitted: Vec<VertexId> = Vec::new();
     let mut epaths: Paths = Vec::new();
 
-    let limit = match stop {
-        Stop::Times(k) => k.min(cfg.max_depth),
-        _ => cfg.max_depth,
+    // A `times` request is only capped when it asks for more hops than the
+    // cap allows — performing all k requested hops is completion, even when
+    // k equals the cap. `until`/`until_exhausted` always want "as far as
+    // needed", so for them stopping at the cap with frontier left is always
+    // truncation.
+    let (limit, capped_request) = match stop {
+        Stop::Times(k) => (k.min(cfg.max_depth), k > cfg.max_depth),
+        _ => (cfg.max_depth, true),
     };
 
     let mut depth = 0usize;
@@ -775,6 +857,8 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
                 Dir::Both => g.both_neighbors_with_edges(*v, cfg.labels),
             };
             for (e, n) in neighbors {
+                // `insert` returns false if already present: dedup and cycle
+                // safety in one, and it is always on.
                 if !visited.insert(n.0) {
                     continue;
                 }
@@ -807,18 +891,37 @@ fn walk<'a>(mut base: VertexTraversal<'a>, cfg: RepeatCfg<'a>, stop: Stop<'a>) -
                 .map(|(i, _)| i)
                 .collect();
             if !hits.is_empty() {
-                base.current = hits.iter().map(|&i| frontier[i]).collect();
-                base.paths = hits.iter().map(|&i| fpaths[i].clone()).collect();
+                // `emit` and `until` compose: the walk still stops at the
+                // first matching frontier, and with `emit` the result is
+                // everything emitted through that frontier — the matchers
+                // are part of it, since `emit` extends before this check
+                // runs. Without `emit`, only the matchers are returned.
+                if cfg.emit {
+                    base.current = emitted;
+                    base.paths = epaths;
+                } else {
+                    base.current = hits.iter().map(|&i| frontier[i]).collect();
+                    base.paths = hits.iter().map(|&i| fpaths[i].clone()).collect();
+                }
                 return base;
             }
         }
     }
 
-    if depth == cfg.max_depth && !frontier.is_empty() {
+    // Truncated iff we stopped at the cap with somewhere left to go and the
+    // request wanted to go further (`capped_request`). Running out of
+    // frontier is completion, not truncation, and a `times(k)` that
+    // performed all k hops is complete even when k equals the cap.
+    if depth == limit && !frontier.is_empty() && capped_request {
         base.truncated = true;
     }
 
     let (cur, ps) = if cfg.emit {
+        // With `emit`, every terminator's result is the emitted set: for
+        // `until` this is the composed "nothing ever matched" half (the
+        // walk's visits are still the answer; `hit_depth_cap` distinguishes
+        // "no match" from "gave up"), and for `times`/`until_exhausted` it is
+        // the documented every-vertex-visited collection.
         (emitted, epaths)
     } else {
         match stop {
@@ -864,6 +967,10 @@ mod tests {
         assert_eq!(e.id(), EdgeId(2));
     }
 
+    /// The two variants stay distinct even wrapping the same id — which they
+    /// can, since vertices and edges draw from one id space. This is the
+    /// property an even-index-is-vertex convention would not have had, and
+    /// the reason `PathElem` is an enum.
     #[test]
     fn same_id_different_kind_is_not_equal() {
         let v = PathElem::Vertex(VertexId(7));

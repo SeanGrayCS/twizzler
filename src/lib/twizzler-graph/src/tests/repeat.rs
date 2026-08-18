@@ -1,8 +1,10 @@
-//! The DSL is fixed-depth today: each `.out()` is exactly one hop, so a k-hop
-//! query is k chained steps and an unbounded one cannot be written at all. The
-//! engine API can already express recursion by hand — see
-//! `adjacency::recursive_traversal_with_visited_set` — but a caller has to bring
-//! their own `visited` set and loop.
+//! Recursive / variable-length traversal: `repeat_out` with `times`, `until`,
+//! `until_exhausted`, `emit`, per-hop filters, and depth caps.
+//!
+//! `repeat_out(labels)` returns a `Repeat` builder rather than Gremlin's
+//! higher-order `repeat(step)`: an anonymous step fights this DSL's ownership
+//! model, where every step consumes `self`. The visited set is always on, so
+//! cycles terminate.
 
 use twizzler::object::ObjID;
 
@@ -22,6 +24,8 @@ fn chain(tag: &str) -> (Graph, Vec<VertexId>) {
     (g, ids)
 }
 
+/// `times(k)` is exactly k chained hops. Checked against the hand-chained form
+/// rather than a written-down expectation, so the two cannot drift.
 #[test]
 fn times_matches_hand_chained_hops() {
     let (g, ids) = chain("t-b3-times");
@@ -33,6 +37,7 @@ fn times_matches_hand_chained_hops() {
     assert_eq!(repeated, vec![ids[2]]);
 }
 
+/// `until` walks to the first frontier satisfying the predicate.
 #[test]
 fn until_returns_the_matching_frontier() {
     let (g, ids) = chain("t-b3-until");
@@ -45,6 +50,8 @@ fn until_returns_the_matching_frontier() {
     assert_eq!(found, vec![ids[3]]);
 }
 
+/// `until_exhausted` walks to the end of a chain: the terminating condition is
+/// "no outgoing edge of this label", not a property.
 #[test]
 fn until_exhausted_reaches_the_chain_root() {
     let (g, ids) = chain("t-b3-exhaust");
@@ -57,6 +64,8 @@ fn until_exhausted_reaches_the_chain_root() {
     assert_eq!(root, vec![ids[3]], "the last vertex with no outgoing `e`");
 }
 
+/// A cycle terminates: the visited set stops the walk once every reachable
+/// vertex has been seen, and no vertex is visited twice.
 #[test]
 fn cycle_terminates_and_never_revisits() {
     let mut g = fresh("t-b3-cycle");
@@ -80,10 +89,9 @@ fn cycle_terminates_and_never_revisits() {
     sorted.dedup();
     assert_eq!(sorted.len(), seen.len(), "no vertex is visited twice");
 
-    // `a` is absent, and that is the point. `emit` does not re-emit the
-    // start, so reaching `a` again on hop 3 must produce nothing — which is
-    // precisely the evidence the visited set stopped the cycle. Without it the
-    // walk would step back onto `a` and run to the depth cap.
+    // `a` is absent on purpose: `emit` does not re-emit the start, so reaching
+    // `a` again on hop 3 produces nothing — the visited set stopped the cycle.
+    // Without it the walk would step back onto `a` and run to the depth cap.
     assert_eq!(sorted, vec![b, c], "every reachable vertex once; not the start");
     assert!(
         !seen.contains(&a),
@@ -91,6 +99,8 @@ fn cycle_terminates_and_never_revisits() {
     );
 }
 
+/// `emit` collects everything visited, in first-visit order; without it only
+/// the final frontier comes back.
 #[test]
 fn emit_collects_the_path_not_just_the_frontier() {
     let (g, ids) = chain("t-b3-emit");
@@ -113,6 +123,8 @@ fn emit_collects_the_path_not_just_the_frontier() {
     assert_eq!(frontier, vec![ids[3]], "without emit, only the frontier");
 }
 
+/// A per-hop filter prunes the frontier, so failing vertices do not expand:
+/// blocking `b` also makes `c` and `d` unreachable.
 #[test]
 fn per_hop_filter_prunes_expansion() {
     let (mut g, ids) = chain("t-b3-prune");
@@ -134,6 +146,8 @@ fn per_hop_filter_prunes_expansion() {
     );
 }
 
+/// The depth cap bounds the walk and reports that it did; a walk that ends
+/// because the frontier emptied does not report truncation.
 #[test]
 fn depth_cap_bounds_the_walk_and_is_observable() {
     let (g, ids) = chain("t-b3-cap");
@@ -152,7 +166,7 @@ fn depth_cap_bounds_the_walk_and_is_observable() {
     );
     assert_eq!(capped.to_ids(), vec![ids[1]]);
 
-    // A walk that ends because the frontier emptied is *not* truncated.
+    // A walk that ends because the frontier emptied is not truncated.
     let complete = g
         .traversal()
         .v(ids[0])
@@ -166,6 +180,140 @@ fn depth_cap_bounds_the_walk_and_is_observable() {
     );
 }
 
+/// `emit` and `until` compose as in Gremlin's `repeat().emit().until()`: stop
+/// at the first matching frontier, return everything emitted through it.
+#[test]
+fn emit_and_until_compose() {
+    let (g, ids) = chain("t-b3-emituntil");
+    let e = Labels::these(&["e"]);
+
+    // Match at c: the result is everything visited through c's frontier —
+    // b then c, first-visit order — and the walk stopped there (no d).
+    let composed = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(e)
+        .emit()
+        .until(|i| i.name == "c")
+        .to_ids();
+    assert_eq!(
+        composed,
+        vec![ids[1], ids[2]],
+        "emitted set through the matching frontier, matchers included, d unreached"
+    );
+
+    // Without emit, the matchers-only behaviour is unchanged.
+    let matchers = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(e)
+        .until(|i| i.name == "c")
+        .to_ids();
+    assert_eq!(matchers, vec![ids[2]]);
+
+    // `until` that never matches, with emit: the visits are still the result,
+    // and the flag still distinguishes exhaustion from the cap.
+    let unmatched = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(e)
+        .emit()
+        .until(|i| i.name == "never");
+    assert!(!unmatched.hit_depth_cap(), "exhausted, not capped");
+    assert_eq!(unmatched.to_ids(), vec![ids[1], ids[2], ids[3]]);
+}
+
+/// `times(k)` at `k == max_depth` is completion, not truncation. Only a
+/// `times` that asks for more hops than the cap allows is truncated.
+#[test]
+fn times_at_the_cap_is_complete_not_truncated() {
+    let (g, ids) = chain("t-b3-capk");
+    let e = Labels::these(&["e"]);
+
+    // k == cap, frontier still non-empty afterwards: complete.
+    let at_cap = g.traversal().v(ids[0]).repeat_out(e).max_depth(2).times(2);
+    assert!(
+        !at_cap.hit_depth_cap(),
+        "all k requested hops were performed — nothing was cut short"
+    );
+    assert_eq!(at_cap.to_ids(), vec![ids[2]]);
+    // And strict mode agrees: a complete answer is not an error.
+    let strict = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(e)
+        .strict_depth(2)
+        .times(2)
+        .expect("k == cap with all hops performed must not be WalkTruncated");
+    assert_eq!(strict.to_ids(), vec![ids[2]]);
+
+    // k > cap: the request was cut short, and that IS truncation.
+    let over = g.traversal().v(ids[0]).repeat_out(e).max_depth(2).times(3);
+    assert!(over.hit_depth_cap(), "3 hops requested, 2 allowed, more to walk");
+    assert_eq!(over.to_ids(), vec![ids[2]], "the frontier where the cap stopped it");
+}
+
+/// The truncation flag is sticky: an edge step after a truncated repeat
+/// carries it forward, and so does the step back to vertices.
+#[test]
+fn truncation_survives_an_edge_step() {
+    let (g, ids) = chain("t-b3-launder");
+    let e = Labels::these(&["e"]);
+
+    let truncated = g.traversal().v(ids[0]).repeat_out(e).max_depth(1).times(3);
+    assert!(truncated.hit_depth_cap(), "1 of 3 requested hops performed");
+    assert_eq!(truncated.to_ids(), vec![ids[1]]);
+
+    let through_edges = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(e)
+        .max_depth(1)
+        .times(3)
+        .out_e(e);
+    assert!(
+        through_edges.hit_depth_cap(),
+        "the edge form must carry the flag, not launder it"
+    );
+    let back_on_vertices = through_edges.in_v();
+    assert!(
+        back_on_vertices.hit_depth_cap(),
+        "and hand it back to the vertex form"
+    );
+    assert_eq!(back_on_vertices.to_ids(), vec![ids[2]]);
+}
+
+/// The default cap bounds depth on a long acyclic chain: a walk asked for more
+/// hops than `DEFAULT_MAX_DEPTH` stops at the cap and reports truncation.
+#[test]
+fn a_request_past_the_default_cap_stops_at_it_and_reports() {
+    use crate::DEFAULT_MAX_DEPTH;
+    let mut g = fresh("t-b3-defcap");
+    let n = DEFAULT_MAX_DEPTH + 2;
+    let ids: Vec<VertexId> = (0..n)
+        .map(|i| g.add_vertex("n", &format!("c{i}"), ObjID::new(0)).unwrap())
+        .collect();
+    for w in ids.windows(2) {
+        g.add_edge(w[0], "e", w[1]).unwrap();
+    }
+
+    let walked = g
+        .traversal()
+        .v(ids[0])
+        .repeat_out(Labels::these(&["e"]))
+        .times(DEFAULT_MAX_DEPTH + 1); // no max_depth() call: the default governs
+    assert!(
+        walked.hit_depth_cap(),
+        "one more hop was requested than DEFAULT_MAX_DEPTH allows"
+    );
+    assert_eq!(
+        walked.to_ids(),
+        vec![ids[DEFAULT_MAX_DEPTH]],
+        "stopped exactly at the default cap"
+    );
+}
+
+/// `repeat` composes with downstream steps, and survives a reopen.
 #[test]
 fn composes_with_downstream_steps_and_reopen() {
     let name = "t-b3-compose";
@@ -188,10 +336,8 @@ fn composes_with_downstream_steps_and_reopen() {
     assert_eq!(n, 3);
 }
 
-/// This is the criterion worth the most. Every other test here compares the
-/// implementation against expectations written at the same time as the code; this
-/// one compares it against an *independent* implementation that predates it and
-/// is retained precisely so it can serve as an oracle.
+/// The DSL agrees with a hand-rolled visited-set walk over a graph with a
+/// cycle and a branch — an independent implementation serving as an oracle.
 #[test]
 fn agrees_with_the_hand_rolled_visited_set_walk() {
     use std::collections::HashSet;
