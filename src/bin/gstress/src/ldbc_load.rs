@@ -1,4 +1,6 @@
-//! Files are baked into the initrd by `scripts/flatten_ldbc.py` (host side) and
+//! Load LDBC-SNB from `/initrd/` and report what it cost.
+//!
+//! Files are baked into the initrd by the host-side `flatten_ldbc.py` and
 //! appear flat as `<entity>.csv`, pipe-separated with a header line.
 //!
 //! # What is a node, an edge, and neither
@@ -6,21 +8,31 @@
 //! Classification is by filename, and the rule is exact rather than a list:
 //! `X_rel_Y` is an edge iff both `X` and `Y` are node entities. That makes
 //! `person_email_emailaddress` and `person_speaks_language` multi-valued
-//! *properties* — there is no entity on the far side to point at — and it keeps
-//! `params` and the three `updateStream*` files out entirely. Those last are the
-//! benchmark's query parameters and update workload; `updateStream_0_0_forum`
-//! alone is 287 k rows, so ingesting it as graph data would inflate every count
-//! by 16% and look entirely plausible.
+//! properties — there is no entity on the far side to point at — and it keeps
+//! `params` and the `updateStream*` files out entirely. Those last are the
+//! benchmark's query parameters and update workload; ingesting them as graph
+//! data would inflate every count.
 //!
-//! # How a value is stored, and why it is three tiers rather than two
+//! # How a value is stored
+//!
+//! | value | stored as | orderable | filterable |
+//! |---|---|---|---|
+//! | ≤31 B | `PropValue::Str` | yes | yes |
+//! | 32–255 B | `set_vertex_text` | no | yes |
+//! | >255 B | `set_vertex_blob` | no | no |
+//!
+//! The ≤31 tier is load-bearing. `order_by_prop` reads `get_vertex_prop`,
+//! which returns `None` for the reference variants, so a value promoted out of
+//! `PropValue` stops being orderable. `creationDate` is 28 bytes and every
+//! LDBC sort is on it (or on `id`), so keeping short values inline is what
+//! makes the ordered queries work at all.
 //!
 //! # Ids
 //!
-//! An LDBC id becomes the vertex *name*, so `find_vertex(label, id)` resolves an
-//! edge endpoint. All eight node labels are therefore declared indexed —
-//! 327,588 of 1,805,553 records, ~1:5.5. That ratio is why `RebuildSource::Scan`
-//! is used rather than `Roots`: at 1:1 `Roots` measured a net loss and at 1:1000
-//! a 1.75 s win, and 1:5.5 is far nearer the losing end.
+//! An LDBC id becomes the vertex name, so `find_vertex(label, id)` resolves an
+//! edge endpoint. All eight node labels are therefore declared indexed.
+//! Indexed records are a small fraction of the total, which is why the lazy
+//! rebuild uses `RebuildSource::Scan` rather than `Roots`.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -71,6 +83,11 @@ struct Counts {
     text: usize,
     blobs: usize,
     skipped_missing: usize,
+    /// Edge-property values dropped because they exceed `PropValue::Str`'s
+    /// 31 bytes — the edge path has no text/blob tier, unlike the vertex path.
+    /// Zero at SF0.1 (every LDBC edge property is a date or a year); nonzero
+    /// at another scale factor is a restriction to report with the run.
+    dropped_edge_props: usize,
 }
 
 pub(crate) fn run() {
@@ -80,7 +97,7 @@ pub(crate) fn run() {
         DEFAULT_ARENA_CAP
     );
 
-    // `Scan`, not `Roots`: see the module note on the 1:5.5 indexed ratio.
+    // `Scan`, not `Roots`: see the module note on ids.
     let schema = IndexSchema::new(IndexStrategy::LazyLabel);
     Graph::reset_arena_with_index(NAME, DEFAULT_ARENA_CAP, schema).expect("reset");
     let mut g =
@@ -96,10 +113,11 @@ pub(crate) fn run() {
         text: 0,
         blobs: 0,
         skipped_missing: 0,
+        dropped_edge_props: 0,
     };
 
-    // Nodes before edges, necessarily: an edge row names both endpoints by
-    // id, and an id cannot resolve before the vertex exists.
+    // Nodes before edges, necessarily: an edge row names both endpoints by id,
+    // and an id cannot resolve before the vertex exists.
     let t_nodes = Instant::now();
     for n in NODES {
         load_nodes(&mut g, n, &mut c);
@@ -161,6 +179,14 @@ pub(crate) fn run() {
         c.blobs,
         nodes_s + edges_s + sync_s
     );
+    if c.dropped_edge_props > 0 {
+        println!(
+            "GSTRESS LDBC WARNING: {} edge-property values exceeded 31 bytes \
+             and were DROPPED — the edge path has no text/blob tier. Record \
+             this as an E6-AC4 restriction beside any number from this run.",
+            c.dropped_edge_props
+        );
+    }
     if c.skipped_missing > 0 {
         println!(
             "GSTRESS LDBC WARNING: {} edge rows named an endpoint that did not \
@@ -265,8 +291,14 @@ fn load_edges(g: &mut Graph, stem: &str, from: &str, to: &str, c: &mut Counts) {
                 // Extra columns are edge properties (`knows.creationDate`,
                 // `likes.creationDate`, `studyAt.classYear`).
                 for (i, col) in cols.iter().enumerate().skip(2) {
-                    if i < f.len() && !f[i].is_empty() && f[i].len() <= 31 {
-                        let _ = g.set_edge_prop(e, col, PropValue::str(f[i]));
+                    if i < f.len() && !f[i].is_empty() {
+                        if f[i].len() <= 31 {
+                            let _ = g.set_edge_prop(e, col, PropValue::str(f[i]));
+                        } else {
+                            // No edge text/blob tier exists; count the drop
+                            // loudly instead of losing it silently.
+                            c.dropped_edge_props += 1;
+                        }
                     }
                 }
             }

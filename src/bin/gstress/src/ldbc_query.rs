@@ -1,23 +1,30 @@
-//! Opens the graph `gstress ldbc` built and left on disk, so this runs in its
-//! own boot. That is not merely tidy: it means the numbers are read from a graph
-//! that survived a reboot, so durability at 1.8 M records is exercised by the
-//! benchmark rather than asserted separately.
+//! LDBC-SNB Interactive short reads (IS1–IS7) against the loaded SF0.1 graph,
+//! reporting the benchmark's own metric — per-query latency.
+//!
+//! Opens the graph `gstress ldbc` built and left on disk: load and query run
+//! in separate boots, so the numbers are read from a graph that survived a
+//! reboot and durability is exercised by the benchmark itself.
 //!
 //! # Message is a supertype, and our engine has no supertypes
+//!
+//! LDBC models `Message` as the parent of `Comment` and `Post`. IS4–IS7 take a
+//! message id, which may be either. A vertex here carries exactly one label,
+//! so a message id is resolved by trying `comment` then `post`, and message
+//! traversals name both labels. The engine's identity model is (label, name)
+//! with no hierarchy, so the benchmark's type lattice has to be flattened
+//! somewhere, and doing it in the query is more honest than inventing a
+//! `message` label the data does not have.
 //!
 //! # Parameters
 //!
 //! Person ids come from LDBC's own `interactive_*_param.txt` substitution
-//! parameters. There are deliberately no short-read parameter files: the
-//! spec has IS1–IS7 parameterised from the driver's runtime state — ids seen in
-//! earlier results — so message ids here are taken from *IS2's own output* for
-//! the person under test, which is how the driver chains them.
+//! parameters. There are no short-read parameter files: the spec has IS1–IS7
+//! parameterised from the driver's runtime state — ids seen in earlier results
+//! — so message ids here are taken from IS2's own output for the person under
+//! test, which is how the driver chains them.
 //!
-//! This is much closer to the benchmark's intent than sampling arbitrary
-//! vertices, and it is still not an audited result: the official driver also
-//! controls issue rate, mix, and dependency time. Stated plainly rather than
-//! buried, because a latency number carries the benchmark's name whether or not
-//! it earned it.
+//! Still not an audited result: the official driver also controls issue rate,
+//! mix, and dependency time.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -35,11 +42,13 @@ const MSG: Labels<'static> = Labels::These(&["comment", "post"]);
 struct Lat {
     name: &'static str,
     us: Vec<u128>,
-    /// Samples split by whether this iteration was the first use of its
-    /// person id. The parameter list cycles 87 ids over 1000 iterations, so
-    /// 8.7% of iterations touch data for the first time and the rest find it
-    /// warm — which means first touches land in the top ~9% of the combined
-    /// distribution, i.e. exactly where p95 and p99 are read.
+    /// Samples split by whether this iteration was the first use of its person
+    /// id. The parameter list cycles, so first touches are a small fraction of
+    /// the iterations and land in the top of the combined distribution —
+    /// exactly where p95 and p99 are read.
+    ///
+    /// Splitting them tests whether the reported tail is a property of the
+    /// engine or an artefact of parameter reuse.
     cold: Vec<u128>,
     warm: Vec<u128>,
     results: usize,
@@ -127,7 +136,17 @@ fn find_message(g: &Graph, id: &str) -> Option<VertexId> {
 fn str_prop(g: &Graph, v: VertexId, key: &str) -> String {
     match g.get_vertex_prop(v, key) {
         Some(PropValue::Str(s)) => s.as_str().to_string(),
-        _ => g.get_vertex_text(v, key).unwrap_or_default(),
+        // 32–255 B values live in the text tier, and >255 B in the blob tier;
+        // without the blob fallback, long `content` values read back as "".
+        // Blob bytes here are always flattened CSV text, so a lossy UTF-8 view
+        // is exact in practice and safe otherwise.
+        _ => match g.get_vertex_text(v, key) {
+            Some(t) => t,
+            None => g
+                .get_vertex_blob(v, key)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+        },
     }
 }
 
@@ -160,7 +179,11 @@ fn run_inner(iters: usize, digest: bool) {
     };
     println!("GSTRESS LDBCQ open: {:.2}s, {} arenas", t.elapsed().as_secs_f64(), g.arena_count());
 
-    // Force the index build before timing anything.
+    // Force the index build before timing anything: the first `find_vertex`
+    // triggers the lazy rebuild over the whole graph, and without a warm-up
+    // the first query of the run measures the index, not the query. Only
+    // `find_vertex` forces it — `vertices_by_label` scans records and never
+    // touches the index.
     let t = Instant::now();
     let _ = g.find_vertex("person", "warmup-nonexistent");
     println!(
@@ -178,12 +201,10 @@ fn run_inner(iters: usize, digest: bool) {
     }
     println!("GSTRESS LDBCQ params: {} LDBC person ids", persons.len());
 
-    // Digest mode does exactly one pass over the parameter list.
-    //
-    // The list cycles (87 ids), so iterations beyond it are exact repeats:
-    // no new information for an equivalence check, and 1000 lines killed the
-    // guest's stdout outright ("I/O error: data loss" at ~330 lines). Equiv is
-    // not timed, so there is nothing to average over either.
+    // Digest mode does exactly one pass over the parameter list. The list
+    // cycles, so iterations beyond it are exact repeats: no new information
+    // for an equivalence check, at the cost of stdout lines the guest does not
+    // have. Equiv is not timed, so there is nothing to average over either.
     let iters = if digest { persons.len() } else { iters };
 
     let mut is1 = Lat::new("IS1");
@@ -247,11 +268,11 @@ fn run_inner(iters: usize, digest: bool) {
             // This person authored nothing; IS4-IS7 have no parameter, and
             // timing them against a missing id would measure the miss path.
             //
-            // IS3 is skipped here too, and does not need to be. It reads
-            // `both(knows)` from the person and never touches a message id; it
-            // is excluded only because it sits below this guard. That biases
-            // IS3's sample toward persons who authored something — a
-            // restriction rather than a requirement.
+            // IS3 is skipped here too even though it reads `both(knows)` and
+            // never touches a message id — it is excluded only because it sits
+            // below this guard, which biases its sample toward persons who
+            // authored something. Moving it above the guard changes the sample
+            // set, so do it in both arms together or not at all.
             if digest && i < persons.len() {
                 println!("EQUIV {pid} is1={r1} is2={r2} mid=- NOMSG");
             }
@@ -297,6 +318,8 @@ fn run_inner(iters: usize, digest: bool) {
         is5.results += rows;
         let r5 = rows;
 
+        // IS6 — the forum a message belongs to: walk the replyOf chain to the
+        // root post, then up to its forum.
         let t = Instant::now();
         let mut rows = 0;
         if let Some(m) = find_message(&g, mid) {
@@ -347,8 +370,8 @@ fn run_inner(iters: usize, digest: bool) {
         l.report();
     }
     // First-touch versus repeat. See `Lat::report_split` — this is the test of
-    // whether the reported tail is the engine's cold path or an artefact of the
-    // parameter list cycling 87 ids over 1000 iterations.
+    // whether the reported tail is the engine's cold path or an artefact of
+    // the parameter list cycling.
     println!("GSTRESS LDBCQ SPLIT (first touch of each id vs repeats):");
     for l in [&mut is1, &mut is2, &mut is3, &mut is4, &mut is5, &mut is6, &mut is7] {
         l.report_split();

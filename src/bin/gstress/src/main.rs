@@ -16,14 +16,24 @@ use twizzler_graph::{Graph, Labels, Lookup, VertexId};
 
 const GRAPH: &str = "gstress";
 
-/// Declaring *after* the inserts would also work (the lazy rebuild reconstructs
-/// from records), but doing it at open keeps the reason next to the open.
 pub(crate) fn declare_lookup_labels(g: &mut Graph) {
-    for l in ["n", "d", "d2", "c", "hub", "spoke", "tag"] {
+    for l in ["n", "d", "d2", "c", "hub", "spoke", "tag", "vo"] {
         // Best-effort: a strategy of `None` refuses, and that is a legitimate
         // configuration for arms that never look up.
         let _ = g.set_label_indexed(l, true);
     }
+}
+
+pub(crate) fn a9_text(i: usize, w: usize) -> String {
+    (0..w)
+        .map(|j| char::from(b'a' + ((i + j) % 26) as u8))
+        .collect()
+}
+
+pub(crate) fn a9_blob(i: usize) -> Vec<u8> {
+    (0..(2048 + i % 1024))
+        .map(|j| ((i.wrapping_mul(31) + j) % 251) as u8)
+        .collect()
 }
 
 /// Where id arithmetic survives it is load-bearing on one invariant: a phase
@@ -31,7 +41,7 @@ pub(crate) fn declare_lookup_labels(g: &mut Graph) {
 /// `VertexId(i)` is valid for phase-A vertices and for `seed`'s `v*`. Anything
 /// created after an edge is not addressable that way. If a phase is ever
 /// reordered, those become silent misreads rather than errors.
-pub(crate) const HARNESS_REV: &str = "2026-08-04f";
+pub(crate) const HARNESS_REV: &str = "2026-08-18i";
 
 mod index_probe;
 mod is2_probe;
@@ -523,6 +533,19 @@ fn main() {
         return;
     }
 
+    if matches!(arg1.as_deref(), Some("indradb-seed") | Some("indradb-verify")) {
+        let n = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5000);
+        if arg1.as_deref() == Some("indradb-seed") {
+            indradb_mode::seed_durable(n);
+        } else {
+            indradb_mode::verify_durable(n);
+        }
+        return;
+    }
+
     // The two phases are separate processes in separate boots by construction:
     // there is no way for `verify` to see anything `seed` left in memory.
     if matches!(arg1.as_deref(), Some("seed") | Some("verify")) {
@@ -573,6 +596,18 @@ fn main() {
             for i in (0..n).step_by(7) {
                 g.delete_vertex(ids[i]).expect("delete");
             }
+            for (t, i) in (0..n).step_by(11).enumerate() {
+                if i % 7 == 0 {
+                    continue; // tombstoned above; a dead vertex takes no writes
+                }
+                let w = [0usize, 31, 32, 255][t % 4];
+                g.set_vertex_text(ids[i], "long", &a9_text(i, w))
+                    .expect("set text");
+                if t % 8 == 0 {
+                    g.set_vertex_blob(ids[i], "content", &a9_blob(i))
+                        .expect("set blob");
+                }
+            }
             g.sync().expect("sync");
 
             // Reopen mid-seed, then keep writing. This is the shape that
@@ -595,14 +630,29 @@ fn main() {
                 g.add_edge(ids[base + i], "e2", ids[base + i + 1])
                     .expect("add_edge after reopen");
             }
+            if n >= 4 {
+                g.set_vertex_text(ids[base], "long", &a9_text(base, 255))
+                    .expect("set text after reopen");
+                g.set_vertex_blob(ids[base], "content", &a9_blob(base))
+                    .expect("set blob after reopen");
+            }
             g.sync().expect("sync after reopen");
+
+            let vonly = (n / 8).max(64);
+            for i in 0..vonly {
+                g.add_vertex("vo", &format!("q{i}"), ObjID::new(i as u128))
+                    .expect("vertices-only add");
+            }
+            g.sync().expect("vertices-only sync");
             println!(
                 "GSTRESS SEED: {} vertices ({} arenas), every 5th has a property, \
-                 every 7th deleted, {} more added through a reopened handle. \
-                 Now reboot and run `gstress verify {n}`.",
+                 every 7th deleted, text/blob on every 11th survivor, {} more \
+                 added through a reopened handle, then a vertices-only tranche \
+                 of {}. Now reboot and run `gstress verify {n}`.",
                 ids.len(),
                 g.arena_count(),
-                n / 4
+                n / 4,
+                vonly
             );
             return;
         }
@@ -626,15 +676,103 @@ fn main() {
                 || format!("w{i} (written after a mid-seed reopen) did not survive"),
             );
         }
-        let expect_live = (0..n).filter(|i| i % 7 != 0).count() + post;
+        for i in (0..n).step_by(31) {
+            if i % 7 == 0 {
+                continue;
+            }
+            st.ck(
+                g.find_vertex("d", &format!("v{i}")).found() == Some(VertexId(i as u64)),
+                || format!("v{i} does not resolve by name to its own id"),
+            );
+        }
+        for i in (0..post.saturating_sub(1)).step_by(17) {
+            let a = g.find_vertex("d2", &format!("w{i}")).found();
+            let b = g.find_vertex("d2", &format!("w{}", i + 1)).found();
+            match (a, b) {
+                (Some(a), Some(b)) => st.ck(
+                    g.out_neighbors(a, Labels::these(&["e2"])).contains(&b),
+                    || format!("w{i} lost its e2 edge to w{}", i + 1),
+                ),
+                _ => st.fail(format!("w{i}/w{} unresolvable for the e2 check", i + 1)),
+            }
+        }
+        let vonly = (n / 8).max(64);
+        let expect_live = (0..n).filter(|i| i % 7 != 0).count() + post + vonly;
         let live = g.vertices().len();
         st.ck(live == expect_live, || {
             format!("live vertices: got {live}, expected {expect_live}")
         });
+
+        for i in (0..vonly).step_by(13) {
+            st.ck(
+                g.find_vertex("vo", &format!("q{i}"))
+                    .found()
+                    .and_then(|v| g.vertex_info(v))
+                    .map(|inf| (inf.name, inf.target))
+                    == Some((format!("q{i}"), ObjID::new(i as u128))),
+                || {
+                    format!(
+                        "q{i} (vertices-only tranche) did not survive the reboot — \
+                         its arena was never synced (add_record dirty-marking)"
+                    )
+                },
+            );
+        }
         println!("GSTRESS VERIFY: {} arenas recovered", g.arena_count());
         st.ck(g.arena_count() > 0, || {
             "arena directory came back empty — the store's arenas did not reach disk".into()
         });
+
+        for (t, i) in (0..n).step_by(11).enumerate() {
+            if i % 7 == 0 {
+                continue;
+            }
+            let v = VertexId(i as u64);
+            let w = [0usize, 31, 32, 255][t % 4];
+            let want = a9_text(i, w);
+            st.ck(
+                g.get_vertex_text(v, "long").as_deref() == Some(want.as_str()),
+                || {
+                    format!(
+                        "v{i}: {w}-byte text did not survive the reboot \
+                         (got {:?}...)",
+                        g.get_vertex_text(v, "long").map(|s| {
+                            let mut s = s;
+                            s.truncate(16);
+                            s
+                        })
+                    )
+                },
+            );
+            if t % 8 == 0 {
+                let want = a9_blob(i);
+                st.ck(
+                    g.get_vertex_blob(v, "content").as_deref() == Some(&want[..]),
+                    || {
+                        format!(
+                            "v{i}: {}-byte blob did not survive the reboot — \
+                             blob segments have their own sync path",
+                            want.len()
+                        )
+                    },
+                );
+            }
+        }
+        // The post-reopen text/blob pair, looked up by name like the rest of
+        // the `w*` tranche.
+        if n >= 4 {
+            let w0 = g.find_vertex("d2", "w0").found();
+            st.ck(
+                w0.map(|v| g.get_vertex_text(v, "long"))
+                    == Some(Some(a9_text(n, 255))),
+                || "w0: text written through the reopened handle did not survive".into(),
+            );
+            st.ck(
+                w0.map(|v| g.get_vertex_blob(v, "content"))
+                    == Some(Some(a9_blob(n))),
+                || "w0: blob written through the reopened handle did not survive".into(),
+            );
+        }
 
         for i in (0..n).step_by(97) {
             if i % 7 == 0 {

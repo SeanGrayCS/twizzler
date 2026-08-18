@@ -1,31 +1,28 @@
-//! IS2: which term of the ordering cost dominates.
+//! IS2 probe: which term of the ordering cost dominates.
 //!
-//! That single number is compatible with at least four stories, and the project
-//! has overturned a paper argument three times in one day by acting on one of
-//! them:
+//! IS2 is "a person's 10 most recent messages": one hop to the incoming
+//! `hasCreator` candidates, an ordering by `creationDate`, then `limit(10)`.
+//! A slow IS2 is compatible with at least four stories:
 //!
-//! 1. walk — following ~n incoming `hasCreator` entries and resolving each
-//!    neighbour record is what costs, in which case no index helps, because
-//!    every candidate must be visited to be a candidate at all;
-//! 2. property — the n property reads dominate, which is the case an
+//! 1. walk — following the incoming entries and resolving each neighbour
+//!    record is what costs; no index helps here, because every candidate must
+//!    be visited to be a candidate at all;
+//! 2. property — the per-candidate property reads dominate, the case an
 //!    ordering index would remove;
-//! 3. amplification — the ordering step performs *more* than n reads;
+//! 3. amplification — the ordering step performs more than one read per
+//!    candidate;
 //! 4. sort — the comparison sort itself.
 //!
-//! They are separated here by slope against degree, not by a mean. LDBC's
-//! own substitution-parameter persons span in-degrees from 0 to 2 652 (p50 162,
-//! mean 359 — counted host-side from `*_hasCreator_person.csv`), so a fit of
+//! They are separated here by slope against degree, not by a mean: a fit of
 //! latency against `n`, `n·log₂n`, and a constant tells the four apart in one
-//! run. A mean cannot: every story predicts "slow".
+//! run. A mean cannot — every story predicts "slow".
 //!
 //! # Arms, and why they are separate invocations
 //!
-//! Each arm runs the *whole* person set, and only one arm runs per invocation.
-//! Running them back to back in one boot would let the first arm warm the pages
-//! every later arm reads, which is the difference between the terms being
-//! measured and the terms being ordered by whoever went first. Within-boot
-//! variance on this workload reaches 3.3× and cross-boot ~1.2×, so the cheap
-//! comparison is the wrong one.
+//! Each arm runs the whole person set, and only one arm runs per invocation.
+//! Running them back to back in one boot would let the first arm warm the
+//! pages every later arm reads, which is the difference between the terms
+//! being measured and the terms being ordered by whoever went first.
 //!
 //! ```text
 //! gstress is2 walk  [iters]   hop only: t = find + walk(n)
@@ -34,7 +31,20 @@
 //! gstress is2 sort  [iters]   sort pre-read keys; no graph reads in the timed region
 //! ```
 //!
-//! Clear `target/disk-x86_64-unknown-twizzler.img` and boot fresh per arm.
+//! # Protocol
+//!
+//! Per arm:
+//!
+//! ```text
+//! 1. clear target/disk-x86_64-unknown-twizzler.img
+//! 2. boot:   gstress ldbc          # the load this probe measures
+//! 3. reboot: gstress is2 <arm>
+//! ```
+//!
+//! The arms are read-only against the loaded graph, so one clear+load
+//! followed by a fresh boot per arm also works — a reboot empties the guest
+//! page cache, so no arm warms another — at a quarter of the load cost. If
+//! the cheaper form is used, say so beside the results.
 //!
 //! # What it prints
 //!
@@ -43,11 +53,10 @@
 //! percentiles, plus a per-degree-bucket summary for reading by eye.
 //!
 //! `reads/deg` is the falsifiable number. An ordering step must read each
-//! candidate's property once, so this ratio must be 1.0. If it is ~`2·log₂n`
-//! instead — ~15 at the median person, ~23 at the largest — then story 3 holds
-//! and the fix is a decorate–sort–undecorate in `sort_by_key_opt`, which costs
-//! nothing on the write path and needs no index. Deciding between stories 1 and
-//! 2 only matters *after* that, which is the point of measuring before building.
+//! candidate's property once, so this ratio must be 1.0. A ratio near
+//! `2·log₂n` instead means story 3 holds: the ordering step re-reads its key
+//! inside the comparator, and the fix is a decorate–sort–undecorate, not an
+//! index.
 
 use std::time::Instant;
 
@@ -129,10 +138,24 @@ pub(crate) fn run(arm: &str, iters: usize) {
         t.elapsed().as_secs_f64(),
         g.arena_count()
     );
+    // Refuse an empty graph. `open_or_create` on a cleared image creates
+    // `ldbc` empty rather than failing, and every `find_vertex` below would
+    // then miss — an empty table that looks like a result. The empty graph
+    // this open just created is harmless: `gstress ldbc` begins with
+    // `reset_arena_with_index`.
+    if g.arena_count() == 0 {
+        println!(
+            "GSTRESS IS2 FAILED: `{NAME}` is empty (0 arenas). This probe \
+             measures the graph `gstress ldbc` leaves on disk. Per arm: clear \
+             the disk image, boot and run `gstress ldbc`, reboot, then \
+             `gstress is2 {arm}`."
+        );
+        std::process::exit(1);
+    }
 
     // Force the lazy index build before timing, as `ldbc_query` does: without
-    // it the first query of the run measures a rebuild over 1.8 M records and
-    // supplies most of the arm's mean.
+    // it the first query of the run measures the rebuild and supplies most of
+    // the arm's mean.
     let t = Instant::now();
     let _ = g.find_vertex("person", "warmup-nonexistent");
     println!(
@@ -170,9 +193,8 @@ pub(crate) fn run(arm: &str, iters: usize) {
             continue;
         }
 
-        // The `sort` arm's input is read outside the timed region on purpose —
-        // it exists to price the comparison sort alone, which is the term every
-        // "we need an index" argument implicitly assumes is small.
+        // The `sort` arm's input is read outside the timed region on purpose:
+        // it prices the comparison sort alone.
         let mut keys: Vec<(Option<PropValue>, VertexId)> = if arm == "sort" {
             g.traversal()
                 .v(p)
@@ -235,6 +257,19 @@ pub(crate) fn run(arm: &str, iters: usize) {
         println!("GSTRESS IS2ROW arm={arm} deg={deg} us={us} reads={reads}");
     }
 
+    // A loaded graph on which nothing resolved means the params and the graph
+    // disagree — not a result, and fatal.
+    if rows.is_empty() {
+        println!(
+            "GSTRESS IS2 FAILED: 0 of {} parameter persons resolved with \
+             nonzero degree in `{NAME}` ({} arenas) — the loaded graph and \
+             /initrd's interactive_*_param.txt disagree; was the image seeded \
+             by something other than `gstress ldbc`?",
+            persons.len(),
+            g.arena_count()
+        );
+        std::process::exit(1);
+    }
     lat.report(total_reads, total_cands);
     buckets(arm, &rows);
     println!(
