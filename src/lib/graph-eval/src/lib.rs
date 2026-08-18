@@ -18,21 +18,19 @@
 //! quietly special-case them — the comparison is only meaningful if both are
 //! driven through their public APIs.
 //!
-//! **Where the DSL falls short.** Two of the seven reads cannot be expressed
-//! in the traversal DSL today, and both fallbacks are marked `DSL GAP` in
-//! [`native`] with the missing step named (E3-AC4):
+//! **Where the DSL falls short** (E3-AC4; updated 2026-08-18 — this note
+//! described two gaps for a week after one of them closed):
 //!
 //! - **IS3** orders friends by a property of the *edge* (`knows.since`) and
 //!   returns it alongside the friend. The DSL orders vertices by vertex
 //!   properties only — wanted: `EdgeTraversal::order_by_prop{,_desc}` and an
-//!   edge→endpoint step that keeps the edge's properties.
-//! - **IS6** walks a `replyOf` chain of unbounded depth to reach the root
-//!   post. The DSL is fixed-depth — this is exactly board task **B3**
-//!   (`repeat`/`until`).
-//!
-//! Both are implemented correctly in plain Rust over the engine API, so E3 is
-//! not blocked; the gaps are recorded as evidence for what a Gremlin-subset
-//! DSL actually needs, which is itself an RQ-relevant finding.
+//!   edge→endpoint step that keeps the edge's properties. **Still open**
+//!   (board task B4); the fallback in [`native`] keeps its `DSL GAP` marker.
+//! - **IS6**'s gap (an unbounded `replyOf` walk in a fixed-depth DSL)
+//!   **closed when B3 landed** (2026-08-11): the native IS6 is a
+//!   `repeat_out(replyOf).until_exhausted()` with `hit_depth_cap()` checked,
+//!   and its `DSL GAP` marker is gone. Kept here as evidence of what a
+//!   Gremlin-subset DSL actually needs — the gap list drove B3's design.
 
 pub mod baseline;
 pub mod fixture;

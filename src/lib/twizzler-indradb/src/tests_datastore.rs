@@ -183,8 +183,17 @@ fn delete_edge_keeps_vertices() {
     }
 }
 
-/// D2b-AC1: the datastore is durable — reopen by name and everything is
-/// still there. (Same contract as the engine's `Graph::open_or_create`.)
+/// D2b-AC1: the datastore state survives reopen by name. (Same contract as
+/// the engine's `Graph::open_or_create`.)
+///
+/// **Within-boot only, and post-D2c that distinction is load-bearing**
+/// (2026-08-18 audit, Part 2 item 9): writes are `nosync` now, so without the
+/// `sync` below this test passed purely on same-boot shared object state and
+/// evidenced nothing about durability. The KV layer's flush tests carry the
+/// in-boot durability property; the cross-*reboot* half is
+/// `gstress indradb-seed <N>` → reboot → `gstress indradb-verify <N>`, added
+/// the same day, because a within-boot reopen maps pages that are still
+/// resident and cannot tell durable from merely mapped (F1-AC0).
 #[test]
 fn reopen_by_name_persists() {
     let name = "idb-reopen";
@@ -197,12 +206,23 @@ fn reopen_by_name_persists() {
             &Json::new(json!(42)),
         )
         .unwrap();
+        // Post-D2c the durability point is `sync`, not `put` — a reopen test
+        // that never syncs is testing the page cache.
+        db.sync().expect("sync");
         (a, b, e)
     };
 
     let db = TwizzlerDatastore::open_db(name).expect("reopen by name");
     let out = db.get(SpecificVertexQuery::single(a)).unwrap();
     assert_eq!(vertices_of(&out).len(), 1, "vertex survived reopen");
+    // D1-AC2's missed half (2026-08-18 audit): the second vertex was never
+    // queried by its own id — only through the edge's reverse index.
+    let out = db.get(SpecificVertexQuery::single(b)).unwrap();
+    assert_eq!(
+        vertices_of(&out).len(),
+        1,
+        "the second vertex, addressed by its own id"
+    );
     let out = db.get(SpecificEdgeQuery::single(e)).unwrap();
     assert_eq!(edges_of(&out).len(), 1, "edge survived reopen");
     let out = db.get(SpecificVertexQuery::single(b).inbound().unwrap()).unwrap();
