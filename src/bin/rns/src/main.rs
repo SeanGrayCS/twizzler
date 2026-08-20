@@ -1,9 +1,9 @@
-//! A relational namespace over Twizzler's *own* object structure.
+//! A relational namespace over Twizzler's own object structure.
 //!
 //! # What this is
 //!
-//! Twizzler stores several relations between objects, and stores every one of
-//! them in one direction only:
+//! Twizzler stores several relations between objects, each in one direction
+//! only:
 //!
 //! | relation | where it lives | forward | reverse |
 //! |---|---|---|---|
@@ -12,24 +12,34 @@
 //! | namespace → member | `naming` | `enumerate_names` | — |
 //!
 //! An object's FOT names everything it points into. Nothing names the objects
-//! that point at *it*. The namer maps a name to an id; nothing maps an id back
-//! to its names. So the questions a system actually needs — *what still
-//! references this? is this safe to delete? what is this called?* — are exactly
-//! the ones the platform cannot answer without scanning everything.
+//! that point at it. The namer maps a name to an id; nothing maps an id back
+//! to its names. So the questions a system actually needs — what still
+//! references this? is this safe to delete? what is this called? — are the
+//! ones the platform cannot answer without scanning everything.
 //!
 //! `rns` builds the reverse index. It walks `data/`, maps each object, reads
 //! its FOT, and records `references` and `contains` edges in a
 //! `twizzler-graph` graph. After that, reverse questions are traversals.
+//! Every vertex is a real object and every edge is a relation Twizzler
+//! already maintains.
 //!
-//! Nothing here is invented. Every vertex is a real object and every edge
-//! is a relation Twizzler already maintains. An earlier version of this
-//! demonstrator used made-up `tag`/`tagged` relations; those measured nothing,
-//! because a graph can obviously answer questions about a relation a hierarchy
-//! does not have.
-//!
-//! # Why the index is possible at all
+//! Reading another object's metadata requires mapping it. That works here
+//! because objects on this build are created world-readable; on a build that
+//! enforced protections, the index could only cover objects the caller may
+//! map.
 //!
 //! # Usage
+//!
+//!   rns make           create four real objects that reference each other
+//!   rns corpus <n>     create n objects in a reference tree
+//!   rns index          walk `data/`, read every FOT, build the graph
+//!   rns bench          time every query both ways: graph vs the platform
+//!   rns refs <name>    what does this object reference?      (forward)
+//!   rns rrefs <name>   what references this object?          (reverse)
+//!   rns names <name>   every name this object has            (reverse)
+//!   rns safe           objects nothing references            (reclaim's question)
+//!   rns unname <name>  try to unbind a `data/` name and report what happened
+//!   rns reset          clear the graph
 //!
 //! The graph is registered at `data/rns`, so it re-opens by name after reboot.
 
@@ -63,16 +73,10 @@ const MAX_FOT_SCAN: usize = 4096;
 
 /// Probe: can the naming service unbind a persistent `data/` entry?
 ///
-/// `NamingHandle::remove` exists, so the claim is either an error return, a
-/// silent no-op, or wrong. This distinguishes them: it reads the name, removes
-/// it, then reads again.
-///
-/// - `get` fails after `remove` → unbinding works, and three documents plus
-///   the `MAGIC_DESTROYED` workaround need revisiting.
-/// - `remove` returns an error → the claim holds, and we finally have the error
-///   to quote instead of an assertion.
-/// - `remove` succeeds but `get` still resolves → worse than either: a silent
-///   no-op, which is the shape that hides.
+/// Reads the name, removes it, then reads it again, and prints which case
+/// held: `remove` returns an error (unbinding is unsupported), the name no
+/// longer resolves (unbinding works), or `remove` succeeds while the name
+/// still resolves (a silent no-op callers cannot detect).
 fn unname(name: &str) -> Result<()> {
     let mut namer = static_naming_factory().expect("naming service available");
     let path = format!("{ROOT}/{name}");
@@ -122,8 +126,9 @@ struct Blob {
 unsafe impl Invariant for Blob {}
 impl BaseType for Blob {}
 
-/// A file that *uses* another file. The `InvPtr` is the point: it is what puts
-/// an entry in this object's FOT, and therefore what the index can see.
+/// A file that uses another file. The `InvPtr` is what puts an entry in this
+/// object's FOT, and therefore what the index can see. A raw `ObjID` field
+/// would be just as functional and invisible to the index.
 #[repr(C)]
 struct Derived {
     kind: u32,
@@ -134,8 +139,8 @@ struct Derived {
 unsafe impl Invariant for Derived {}
 impl BaseType for Derived {}
 
-/// Create a small corpus of real objects with real references, and name
-/// them under `data/`.
+/// Create a small corpus of real objects with real references, and name them
+/// under `data/`.
 ///
 /// Shape, chosen so every interesting case appears:
 ///
@@ -149,7 +154,7 @@ impl BaseType for Derived {}
 /// After `rns index`: `sales.csv` has in-degree 2, `chart.png` and `report.txt`
 /// have in-degree 0 but out-degree 1, `scratch.tmp` is isolated. So
 /// `rns rrefs sales.csv` names the two files that would break if it were
-/// deleted, and `rns safe` should list everything *except* `sales.csv`.
+/// deleted, and `rns safe` should list everything except `sales.csv`.
 fn make() -> Result<()> {
     let mut namer = static_naming_factory().expect("naming service available");
 
@@ -202,6 +207,9 @@ fn make() -> Result<()> {
     Ok(())
 }
 
+/// One node of the `corpus` tree. `source` is a real `InvPtr`, so a real FOT
+/// entry. Isolated nodes carry `InvPtr::null()`, which occupies no FOT slot,
+/// keeping the type uniform.
 #[repr(C)]
 struct Node {
     kind: u32,
@@ -211,6 +219,12 @@ struct Node {
 unsafe impl Invariant for Node {}
 impl BaseType for Node {}
 
+/// Build a corpus: `n` objects named `data/f0 … f{n-1}`, wired as a binary
+/// tree — node `i` references node `i/2` — except every 10th node, which
+/// references nothing. So in-degrees vary, the safe-to-delete answer is
+/// non-trivial, and ~90% of nodes are referencing objects.
+///
+/// Every object is persistent, so a large `n` can exhaust physical frames.
 fn corpus(n: usize) -> Result<()> {
     let mut namer = static_naming_factory().expect("naming service available");
     let mut objs: Vec<Object<Node>> = Vec::with_capacity(n);
@@ -258,10 +272,10 @@ fn corpus(n: usize) -> Result<()> {
 
 /// Every object an object's FOT points at.
 ///
-/// `MetaInfo.fotcount` bounds the table and `RawObject::fote_ptr` reads an
-/// entry; `FotEntry.values` is the target id in `ObjID::parts` order, so
-/// `from_parts` inverts it. Resolver entries are skipped: they name a resolver
-/// function rather than an object, so they are not an edge.
+/// `RawObject::fote_ptr` reads an entry; `FotEntry.values` is the target id in
+/// `ObjID::parts` order, so `from_parts` inverts it. Resolver entries are
+/// skipped: they name a resolver function rather than an object, so they are
+/// not an edge.
 fn fot_targets(id: ObjID) -> Vec<ObjID> {
     fot_targets_inner(id, true)
 }
@@ -279,16 +293,13 @@ fn fot_targets_inner(id: ObjID, verbose: bool) -> Vec<ObjID> {
         println!("rns: cannot map {id}, skipping (its references are unknown)");
         return Vec::new();
     };
-    // The FOT has no recorded length; do not use `MetaInfo.fotcount` as one.
-    //
-    // So it is a reserved field rather than a broken one — no behaviour depends
-    // on it — but it cannot bound an enumeration. An earlier version of this
-    // function used it and reported every object as reference-free.
-    //
-    // Enumerate the way the allocator does: from index 1 (index 0 is
-    // `InvPtr::new`'s same-object case and never occupies a slot), stopping at
-    // the first slot that was never allocated. Checked against the vendored
-    // tree at the pinned commit; re-check upstream before relying on it.
+    // The FOT has no recorded length; `MetaInfo.fotcount` cannot bound the
+    // scan. The ABI declares it as the entry count, but this tree writes it
+    // as 0 at every creation site and reads it nowhere; the runtime's
+    // `insert_fot` allocates a slot by scanning `FotFlags`. So enumerate the
+    // way the allocator does: from index 1 (index 0 is `InvPtr::new`'s
+    // same-object case and never occupies a slot), stopping at the first slot
+    // that was never allocated.
     let declared = unsafe { (*obj.meta_ptr()).fotcount } as usize;
     let mut out = Vec::new();
     let mut resolvers = 0usize;
@@ -319,11 +330,10 @@ fn fot_targets_inner(id: ObjID, verbose: bool) -> Vec<ObjID> {
         }
         out.push(target);
     }
-    // Reported per object, not summarised. A zero total is ambiguous
-    // between "this object references nothing" and "the read is wrong", and
-    // that distinction is the whole point of the index. `declared` is printed
-    // beside the scan precisely because it should stay 0 while `scanned` does
-    // not — that gap is the reserved-field note in `rns-filesystem.md`.
+    // Reported per object: a zero total is ambiguous between "this object
+    // references nothing" and "the read is wrong". `declared` is printed
+    // beside the scan so the reserved field's constant 0 shows up next to the
+    // real count.
     if verbose {
         println!(
             "rns:   {id:x} scanned={scanned} refs={} resolver={resolvers} \
@@ -389,13 +399,11 @@ fn index() -> Result<()> {
             continue;
         }
         let v = vertex_for(&mut g, node.id)?;
-        // The human name is a property of the *binding*, not the object — an
+        // The human name is a property of the binding, not the object — an
         // object under three names has three `contains` edges, each carrying
-        // its own name. (An earlier version stored the name on the vertex,
-        // where a second name silently overwrote the first: the one-way
-        // namer's defect, reproduced in our own index.) `PropValue::Str` is a
-        // `NameKey` — 31 bytes, char-boundary truncated; namer entries are
-        // short, and the hex id on the vertex is the authoritative identity.
+        // its own name. `PropValue::Str` is a `NameKey` — 31 bytes,
+        // char-boundary truncated; namer entries are short, and the hex id on
+        // the vertex is the authoritative identity.
         let e = g.add_edge(ns, CONTAINS, v)?;
         g.set_edge_prop(e, "name", PropValue::Str(NameKey::new(name)))?;
         // Display-convenience copy of the first name only.
@@ -492,7 +500,7 @@ fn names(name: &str) -> Result<()> {
         println!("rns: no object named {name}; run `rns index` first");
         return Ok(());
     };
-    // One edge per binding, each carrying its own name — so this lists *all*
+    // One edge per binding, each carrying its own name — so this lists all
     // names, which the platform can only do by enumerating every namespace.
     let edges = g.traversal().v(v).in_e(Labels::these(&[CONTAINS])).to_ids();
     println!("{name} has {} name(s):", edges.len());
@@ -515,6 +523,14 @@ fn time<T>(reps: usize, mut f: impl FnMut() -> T) -> (f64, f64, T) {
     (us, us / reps as f64, last)
 }
 
+/// Every question timed both ways — through the graph, and through what the
+/// platform offers (`naming` calls and raw FOT scans). Run after
+/// `rns corpus <n>` and `rns index`, in the same boot.
+///
+/// Both arms run warm: `index` has already mapped every object once, so this
+/// measures steady-state query cost, not first-touch. Each answer is checked
+/// for equality across arms before its timing is trusted, because a fast
+/// wrong answer is the failure mode that hides.
 fn bench() -> Result<()> {
     let g = Graph::open_or_create_arena(GRAPH, twizzler_graph::DEFAULT_ARENA_CAP)?;
     let mut namer = static_naming_factory().expect("naming service available");
@@ -556,8 +572,8 @@ fn bench() -> Result<()> {
         .find(|v| g.vertex_info(*v).map(|i| i.label == "ns").unwrap_or(false))
         .expect("ns vertex — run `rns index` first");
 
-    // 1. Name lookup. The graph arm is an honest O(N) property scan — `rns`
-    //    has no human-name index — so the platform should win decisively.
+    // 1. Name lookup. The graph arm is an O(N) property scan — `rns` has no
+    //    human-name index — so the platform should win.
     let (_, plat, want) = time(200, || {
         namer.get(&format!("{ROOT}/{probe_name}"), GetFlags::empty()).ok().map(|x| x.id)
     });
@@ -573,7 +589,7 @@ fn bench() -> Result<()> {
     // Platform listing includes the graph's own entry; the index skips it.
     println!("RNS BENCH list        platform={plat:.1}us graph={graph:.1}us sizes={pl}/{gl}");
 
-    // 3. Forward references of f1. The platform CAN do this — one map + scan.
+    // 3. Forward references of f1. The platform can do this — one map + scan.
     let (_, plat, pf) = time(200, || fot_targets_quiet(probe_id));
     let (_, graph, gf) = time(200, || g.out_neighbors(probe_v, Labels::these(&[REFERENCES])));
     let gf_ids: Vec<u128> = gf.iter().filter_map(|v| g.vertex_info(*v).map(|i| i.target.raw())).collect();
@@ -581,8 +597,8 @@ fn bench() -> Result<()> {
         == gf_ids.iter().copied().collect();
     println!("RNS BENCH fwd-refs    platform={plat:.1}us graph={graph:.1}us agree={ok}");
 
-    // 4. REVERSE references of f1 — the headline. The platform has no index:
-    //    map every named object and scan its FOT for the probe id.
+    // 4. Reverse references of f1. The platform has no index: map every named
+    //    object and scan its FOT for the probe id.
     let (tot, plat, pr) = time(3, || {
         let mut hits = Vec::new();
         for (_, id) in &named {
@@ -632,14 +648,12 @@ fn bench() -> Result<()> {
 
 /// Objects nothing references — reclaim's discovery question.
 ///
-/// The kernel needs exactly this to decide what is collectable, and
-/// `reclaim_main` leaves the discovery steps unimplemented. Here it is an
-/// in-degree test.
+/// The kernel needs this to decide what is collectable. Here it is an
+/// in-degree test on `references`.
 fn safe() -> Result<()> {
     let g = Graph::open_or_create_arena(GRAPH, twizzler_graph::DEFAULT_ARENA_CAP)?;
-    // Only real objects. The `ns` vertex is the namespace itself, not something
-    // that could be deleted, and counting it made an earlier run report "4 of 5"
-    // when the answer was 3 of 4.
+    // Only real objects: the `ns` vertex is the namespace itself, not
+    // something that could be deleted.
     let objects: Vec<VertexId> = g
         .vertices()
         .into_iter()

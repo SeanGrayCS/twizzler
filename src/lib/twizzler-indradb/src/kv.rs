@@ -12,7 +12,8 @@
 //! index at all. See [`Kv::build_read_index`].
 //!
 //! IndraDB's `Transaction` trait is written against sorted KV backends (its
-//! upstream ones are RocksDB and sled): it needs ordered iteration
+//! upstream one is RocksDB; "and sled" stood here until 2026-08-19, but
+//! indradb-lib 5.0.0 ships no sled datastore): it needs ordered iteration
 //! (`range_vertices` by UUID, `range_edges` by edge order) and prefix scans.
 //! This module provides that substrate directly on Twizzler persistent
 //! objects, so the RQ2 comparison contrasts our graph-native `InvPtr`-linked
