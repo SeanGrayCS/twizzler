@@ -1,13 +1,19 @@
+//! Shared byte storage for long property values.
+//!
 //! Backs both `PropValue::TextRef` (≤255 B, queryable) and `PropValue::BlobRef`
-//! (arbitrary, not queryable). They share this store because they differ in the
-//! *API* — a length limit and whether a filter exists — not in how bytes are
-//! kept.
+//! (arbitrary length, not queryable). They share this store because they
+//! differ in the API — a length limit and whether a filter exists — not in how
+//! bytes are kept.
 //!
-//! # Why not inside the record
+//! Long values live out-of-line because records sit back-to-back at a stride
+//! derived from `nprops`. Variable-length bytes among them would make that
+//! stride per-record in a way nothing validates — a reader would take a
+//! neighbouring record's bytes as this one's fields. Keeping the bytes here
+//! leaves `record_size(nprops)` untouched.
 //!
-//! # Why not `SegVec`
-//!
-//! # Why one store rather than an object per value
+//! Values are bump-allocated whole into a few large segments. `SegVec` would
+//! cost one synced push per value, and an object per value would spend the
+//! platform's scarce resource: objects, not bytes.
 
 use twizzler::{
     alloc::arena::{ArenaBase, ArenaObject},
@@ -27,6 +33,9 @@ pub(crate) struct BlobEntry {
 unsafe impl Invariant for BlobEntry {}
 
 /// Roll to a fresh object past this many bytes.
+///
+/// Well under the 1 GB object maximum: the point is not to fill an object but
+/// to keep any single one small enough that syncing it is not a long stall.
 const SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Append-only byte store, segmented across persistent objects.
@@ -77,6 +86,7 @@ impl BlobStore {
         self.dir.dir_raw()
     }
 
+    /// Objects this store owns, for teardown and accounting.
     pub(crate) fn object_ids(&self) -> Vec<u128> {
         let mut ids = self.dir.object_ids();
         ids.extend(self.open.iter().map(|a| a.object().id().raw()));
@@ -102,6 +112,9 @@ impl BlobStore {
     }
 
     /// Read back bytes written by [`Self::append`].
+    ///
+    /// Returns `None` rather than partial data if the location is out of range:
+    /// a truncated read here would surface as a mangled property value.
     pub(crate) fn read(&self, seg: u32, off: u64, len: u32) -> Option<Vec<u8>> {
         let obj = self.open.get(seg as usize)?.object();
         let p = obj.lea(off as usize, len as usize)?;
@@ -124,6 +137,8 @@ impl BlobStore {
     fn new_segment(&mut self) -> Result<usize> {
         let seg = ArenaObject::new(ObjectBuilder::default().persist(true))?;
         let raw = seg.object().id().raw();
+        // nosync: drained by `sync_all`'s `dir.flush()`. A plain `push` would
+        // sync the directory object once per segment.
         self.dir.push_nosync(BlobEntry { raw })?;
         self.open.push(seg);
         self.txs.push(None);
