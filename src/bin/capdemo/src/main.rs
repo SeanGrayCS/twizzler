@@ -67,6 +67,16 @@ use twizzler_security::{
     Cap, SecCtx, SecCtxFlags, SecureBuilderExt as _, SigningKey, SigningScheme,
 };
 
+/// Harness revision, stamped into the first line of a run so a transcript can be
+/// tied to the tree that produced it. Mirrors `gstress`'s `HARNESS_REV`
+/// (`gstress/src/main.rs:210`) — same convention, same reason: without it a
+/// recovered console capture cannot be attributed to a build.
+///
+/// `…a` (2026-08-19): first stamped revision. Runs before this one — including
+/// the 2026-08-14 run whose graph model is reported in the write-up — emitted no
+/// stamp, and are attributable only by their date.
+const HARNESS_REV: &str = "2026-08-19a";
+
 /// Child exit codes. See the table above.
 const EXIT_ASSERT: i32 = 2;
 const EXIT_NOT_DENIED: i32 = 3;
@@ -121,7 +131,10 @@ impl Checks {
     }
 
     fn finish(self) -> ! {
-        println!("\ncapdemo: {} passed, {} failed", self.pass, self.fail);
+        println!(
+            "\ncapdemo: harness={} {} passed, {} failed",
+            HARNESS_REV, self.pass, self.fail
+        );
         std::process::exit(if self.fail == 0 { 0 } else { 1 });
     }
 }
@@ -147,6 +160,14 @@ fn main() {
 }
 
 fn parent(bogus: bool, graph: bool) -> ! {
+    // First line of the run, before anything can fail. Names the revision and the
+    // arms that are actually enabled, so a transcript records what was run rather
+    // than what the source happens to say today.
+    println!(
+        "CAPDEMO STAMP harness={} mode=parent graph={} bogus-id={}",
+        HARNESS_REV, graph, bogus
+    );
+
     let mut c = Checks::default();
 
     // --- P1: the "wrong object id" control (opt-in: `--bogus-id`) ---------
@@ -465,7 +486,7 @@ fn parent(bogus: bool, graph: bool) -> ! {
             &deleg,
             public.id(),
             private.id(),
-            v_key.id(),
+            v_key.id(), // the VERIFYING key — see the note at Q(c)
             meta.default_prot,
             pmeta.default_prot,
         );
@@ -738,15 +759,18 @@ fn build_and_query(
     let v_private = g.add_vertex("object", "obj:private", private)?;
     g.set_vertex_prop(v_private, "default_prot", PropValue::U64(private_def_prot.bits() as u64))?;
 
-    let v_key = g.add_vertex("key", "key:private", key)?;
+    // Named for which key this is. The object's `kuid` records the *verifying*
+    // key, not the signing key — see Q(c) for why the distinction decides what
+    // the two-hop query below can and cannot answer.
+    let v_key = g.add_vertex("key", "key:private-verifying", key)?;
 
     // --- edges -------------------------------------------------------------
     //
     // One `grants_*` edge per right on the capability P6 minted, and a
-    // `keyed_by` edge to the object's signing key. The second is what makes
-    // meta access control queryable: a capability for O is signed with O's
-    // key, so "who may grant access to O" is "who has read on O's key object"
-    // — two hops, below.
+    // `keyed_by` edge to the key the object's `kuid` names. That key is the
+    // *verifying* key — the one the kernel loads to check a signature
+    // (`security.rs:123-134`) — not the signing key that mints. Q(c) below
+    // depends on that distinction.
     grant_edges(&mut g, v_deleg, v_private, Protections::READ)?;
     g.add_edge(v_private, "keyed_by", v_key)?;
 
@@ -799,24 +823,40 @@ fn build_and_query(
         Some("grants_r"),
     );
 
-    // --- Q(c): meta access control -----------------------------------------
+    // --- Q(c): rights over the object's key --------------------------------
     //
     // §5.3 of the security paper argues that "who may grant access to O" is
-    // expressible, because issuing a capability for O requires O's signing
-    // key and read access to a key object is ordinary access control. Two
-    // hops make it *queryable*.
+    // expressible, because issuing a capability for O requires O's signing key
+    // and read access to a key object is ordinary access control. Two hops make
+    // that shape *queryable* — but they cannot answer it on this build, and the
+    // reason is worth more than the query.
     //
-    // The answer here is empty, and that is a result rather than a gap: no
-    // capability over the key object has been granted to anyone, so no context
-    // on this machine can issue a further capability for obj:private. Whoever
-    // holds the signing key does so outside the capability system entirely.
+    // **`kuid` names the verifying key, not the signing key.** P5 asserts
+    // exactly that (`pmeta.kuid == v_key.id()`), and the kernel loads it as a
+    // `VerifyingKey` to check signatures. Read access to a verifying key confers
+    // nothing — it is public. The key that can *mint* for obj:private is
+    // `s_key`, and an object's recorded state does not name it anywhere, so it
+    // is not reachable from the object by any traversal.
+    //
+    // So an empty answer here means "no capability has been granted over the
+    // recorded verifying key", NOT "nobody can mint for obj:private". Do not
+    // write it up as the latter. Modelling the issuing half needs a relation the
+    // platform does not record.
+    //
+    // Adding `s_key.id()` as a second key vertex would model minting directly,
+    // at the cost of changing the graph this run reports (five vertices, two
+    // edge kinds). Left alone deliberately; recorded here as the next step.
     let granters = g
         .traversal()
         .v(v_private)
         .out(Labels::these(&["keyed_by"]))
         .in_(Labels::these(&["grants_r"]))
         .to_ids();
-    c.eq("P8 nobody holds a capability over the private object's key", granters.len(), 0);
+    c.eq(
+        "P8 no context holds a capability over the private object's verifying key",
+        granters.len(),
+        0,
+    );
 
     // --- Q(d): ambient authority -------------------------------------------
     //
