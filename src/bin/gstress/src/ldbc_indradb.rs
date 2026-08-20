@@ -1,22 +1,23 @@
-//! # The asymmetry is the result, so it is stated rather than hidden
+//! The seven LDBC short reads (IS1–IS7) against IndraDB, the comparison
+//! baseline, plus the loader that builds its store from the CSVs in `/initrd`.
+//! Both engines run the same seven queries, on the same SF0.1 data, with the
+//! same LDBC person ids, reporting the same percentiles.
 //!
-//! Our engine gives a vertex a built-in `(label, name)` identity, so an LDBC id
-//! *is* the name and `find_vertex` resolves it. IndraDB gives a vertex a UUID
-//! and a type, so the id has to become an ordinary property and every entry
-//! lookup is a property-index query. That is a genuine modelling difference
-//! between a native property graph and a KV-backed one, not an implementation
-//! detail — and it is precisely what index-free adjacency claims to avoid.
+//! The native engine gives a vertex a built-in `(label, name)` identity, so an
+//! LDBC id is the name and `find_vertex` resolves it. IndraDB gives a vertex a
+//! UUID and a type, so the id has to become an ordinary property and every
+//! entry lookup is a property-index query.
 //!
-//! This is deliberately written against IndraDB's public API only, exactly
-//! as `graph-eval/src/baseline.rs` is, so it reads as a fair account of what the
-//! baseline offers a query author rather than a reach-through to internals.
+//! This is written against IndraDB's public API only, so it reads as a fair
+//! account of what the baseline offers a query author rather than a
+//! reach-through to internals.
 //!
-//! # Loading is expected to be slow, and that is data too
-//!
-//! A local `HashMap<(label, id), Uuid>` carries the id mapping during load.
-//! Resolving each edge endpoint through the property index instead would add
-//! ~3 M index queries to a load that is already the slow half, and would measure
-//! the loader rather than the engine.
+//! Loading is slow by construction: every vertex costs a create plus one
+//! `set_properties` per column, and every property write is a transaction. The
+//! heartbeat and projection lines exist so a long load can be judged while it
+//! runs. A local `HashMap<(label, id), Uuid>` carries the id mapping during
+//! load; resolving each edge endpoint through the property index instead would
+//! measure the loader rather than the engine.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,8 +25,8 @@ use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
 use indradb::{
-    Database, Edge, Identifier, Json, QueryExt, QueryOutputValue, SpecificVertexQuery,
-    VertexWithPropertyValueQuery,
+    Database, Edge, Identifier, Json, QueryExt, QueryOutputValue, SpecificEdgeQuery,
+    SpecificVertexQuery, VertexWithPropertyValueQuery,
 };
 use twizzler_indradb::TwizzlerDatastore;
 use uuid::Uuid;
@@ -34,7 +35,11 @@ const DB: &str = "ldbc-idb";
 const DIR: &str = "/initrd";
 const P_ID: &str = "ldbcId";
 
-/// Rows between flushes. Not a tuning knob — a memory bound.
+/// Rows between flushes. A memory bound, not a tuning knob: `nosync` writes
+/// stay dirty in mapped memory until `sync`, so the flush cadence is the
+/// peak-dirty-set size, and flushing too rarely exhausts the frame pool
+/// mid-load. `KvStore` has two monolithic objects, so it cannot flush
+/// incrementally and must instead flush often.
 const SYNC_EVERY: usize = 25_000;
 
 const NODES: &[&str] = &[
@@ -136,7 +141,9 @@ fn vprop(db: &Db, id: Uuid, key: &str) -> String {
     }
 }
 
-/// Time-based heartbeat.
+/// Time-based heartbeat. A row-count interval is a guess about the rate, and
+/// this arm's rate is the thing under measurement; a slow file would mean long
+/// silences indistinguishable from a hang.
 ///
 /// Prints at most every `EVERY`, with a running rate and a projection for the
 /// whole file, so "is this worth waiting for" is answerable in one interval
@@ -174,12 +181,8 @@ impl Beat {
 struct Lat {
     name: &'static str,
     us: Vec<u128>,
-    /// First-touch versus repeat, mirroring `ldbc_query::Lat`. The baseline
-    /// needs this split more than the native arm does, not less: it is the
-    /// control. Its work is uniform keyed lookups, so if the tail is a cold-path
-    /// effect the baseline should show far less separation than the engine, and
-    /// if both split the same way the effect is the measurement rather than
-    /// either design.
+    /// First-touch versus repeat, mirroring `ldbc_query::Lat`, so cold-path
+    /// effects are separable from steady-state behaviour in both arms.
     cold: Vec<u128>,
     warm: Vec<u128>,
     results: usize,
@@ -249,22 +252,61 @@ impl Lat {
     }
 }
 
-pub(crate) fn load() {
+/// `edge_props` on [`load`] stores the extra CSV columns — `knows.creationDate`,
+/// `likes.creationDate`, `hasMember.joinDate`, `workAt.workFrom`,
+/// `studyAt.classYear` — as edge properties. Off by default. The complex reads
+/// IC1, IC5, IC7 and IC11 need them, so their store is built with
+/// `gstress ldbc-indradb-load edgeprops`; a missing edge property is
+/// indistinguishable from an unset one, so that arm probes for them at startup.
+///
+/// `LEAN_DROP` is the vertex columns no LDBC complex read touches, dropped
+/// under `lean`. Chosen by reading every query in `ldbc_complex_indradb.rs`:
+/// what survives is `ldbcId`, `firstName`, `lastName`, `gender`, `birthday`,
+/// `creationDate`, `content`, `imageFile`, `title`, `name` and `type`. These
+/// five are read by nothing, and they are the bulk of the store.
+///
+/// A lean store is not valid for the short reads: IS1 returns `locationIP`,
+/// `browserUsed` and the person's `creationDate`, and against a lean store it
+/// would report them as empty and look healthy doing it. The warning at the
+/// end of `load` says so.
+const LEAN_DROP: &[&str] = &["locationIP", "browserUsed", "length", "language", "url"];
+
+/// The one edge column no complex read touches. `knows.creationDate` is real
+/// LDBC data; it is dropped under `lean` only because nothing reads it.
+const LEAN_DROP_EDGE: &[&str] = &["creationDate"];
+
+pub(crate) fn load(edge_props: bool, lean: bool) {
     println!(
-        "GSTRESS STAMP harness={} mode=ldbc-indradb-load",
-        crate::HARNESS_REV
+        "GSTRESS STAMP harness={} mode=ldbc-indradb-load edgeprops={} lean={}",
+        crate::HARNESS_REV,
+        edge_props,
+        lean
     );
+    if lean {
+        println!(
+            "GSTRESS IDBQ LEAN: dropping vertex columns [{}] and `knows.creationDate` — \
+             ~1.02 M of ~3.3 M values, none of which any complex read touches. **This store \
+             is not valid for `gstress ldbc-indradb` (the short reads): IS1 returns \
+             locationIP, browserUsed and creationDate, and would report them empty.** \
+             An E6-AC4 restriction to record with any number from this store.",
+            LEAN_DROP.join(", ")
+        );
+    }
 
     let db = TwizzlerDatastore::open_db(DB).expect("open datastore");
+    // Clear first: the datastore outlives the run, and a second load on top of
+    // a first would compare different data while looking healthy.
     db.delete(indradb::AllVertexQuery).expect("clear");
     db.index_property(ident(P_ID)).expect("index ldbcId");
 
     let mut ids: HashMap<(String, String), Uuid> = HashMap::new();
 
+    // Insert time and flush time are reported separately.
     let mut sync_s = 0.0f64;
 
     let t = Instant::now();
     let mut nverts = 0usize;
+    let mut ndropped = 0usize;
     for label in NODES {
         let Some((cols, r)) = open_csv(label) else {
             println!("GSTRESS IDBQ: {label}.csv absent");
@@ -294,6 +336,10 @@ pub(crate) fn load() {
             .expect("set id");
             for (i, col) in cols.iter().enumerate().skip(1) {
                 if f[i].is_empty() {
+                    continue;
+                }
+                if lean && LEAN_DROP.contains(&col.as_str()) {
+                    ndropped += 1;
                     continue;
                 }
                 db.set_properties(
@@ -353,12 +399,15 @@ pub(crate) fn load() {
         }
     }
     files.sort();
+    let mut nprops = 0usize;
     for stem in &files {
         let (from, to) = edge_of(stem).expect("checked");
-        let Some((_cols, r)) = open_csv(stem) else {
+        let Some((cols, r)) = open_csv(stem) else {
             continue;
         };
-        let rel = ident(stem.split('_').nth(1).unwrap_or(stem));
+        let rel_name = stem.split('_').nth(1).unwrap_or(stem);
+        let rel_is_knows = rel_name == "knows";
+        let rel = ident(rel_name);
         let mut n = 0;
         let total = std::fs::read_to_string(format!("{DIR}/{stem}.csv"))
             .map(|s| s.lines().count().saturating_sub(1))
@@ -376,7 +425,31 @@ pub(crate) fn load() {
             ) else {
                 continue;
             };
-            db.create_edge(&Edge::new(*a, rel, *b)).expect("create edge");
+            let edge = Edge::new(*a, rel, *b);
+            db.create_edge(&edge).expect("create edge");
+            if edge_props {
+                // Columns beyond the two endpoints are edge properties. Stored
+                // as strings, as every vertex property here is, so the two
+                // arms' values compare without a type-coercion difference
+                // sitting between them.
+                for (i, col) in cols.iter().enumerate().skip(2) {
+                    if i < f.len() && !f[i].is_empty() {
+                        // `knows.creationDate` is the only edge column no
+                        // complex read touches; under `lean` it goes too.
+                        if lean && rel_is_knows && LEAN_DROP_EDGE.contains(&col.as_str()) {
+                            ndropped += 1;
+                            continue;
+                        }
+                        db.set_properties(
+                            SpecificEdgeQuery::single(edge.clone()),
+                            ident(col),
+                            &Json::new(f[i].into()),
+                        )
+                        .expect("set edge prop");
+                        nprops += 1;
+                    }
+                }
+            }
             n += 1;
             if n % SYNC_EVERY == 0 {
                 let ts = Instant::now();
@@ -405,6 +478,24 @@ pub(crate) fn load() {
         total_s - sync_s,
         100.0 * sync_s / total_s.max(1e-9)
     );
+    if lean {
+        println!(
+            "GSTRESS IDBQ LOAD LEAN: {ndropped} values dropped. Complex reads only — see the \
+             LEAN warning at the top of this run."
+        );
+    }
+    if edge_props {
+        println!(
+            "GSTRESS IDBQ LOAD EDGEPROPS: {nprops} edge-property values written. **This load is \
+             not the one RESULTS Table 17 measured** — that arm dropped these columns. Record the \
+             two separately rather than quoting one against the other."
+        );
+    } else {
+        println!(
+            "GSTRESS IDBQ LOAD EDGEPROPS: none (default). IC1, IC5, IC7 and IC11 cannot be \
+             answered from this store; re-run as `gstress ldbc-indradb-load edgeprops` for E10."
+        );
+    }
 
     println!(
         "GSTRESS IDBQ LOAD DONE — now reboot and run `gstress ldbc-indradb` to \
@@ -416,19 +507,20 @@ pub(crate) fn load() {
     );
 }
 
-/// Query pass. Opens the datastore the load left behind, in a fresh boot, so
-/// both arms are measured cold. See the note at the end of `load`.
+/// Query pass. Opens the datastore the load left behind. Run it in its own
+/// boot, so both arms are measured cold; loading and querying in one boot
+/// would leave every page warm from the load.
 pub(crate) fn run(iters: usize) {
     run_inner(iters, false)
 }
 
+/// The same queries with the baseline given a key index at open, symmetric
+/// with the native arm's query-entry index.
+///
 /// The default arm has no index at read time — the store builds its map on the
 /// write path only — so every lookup binary-searches the sorted region. The
-/// native arm builds its index in 11.4 s at open and that cost is excluded from
-/// its latencies. Excluding both setups is only fair if both produce an index,
-/// so this arm builds one and excludes it the same way. The difference between
-/// the two arms is the part of the read gap attributable to that asymmetry
-/// rather than to KV-on-objects.
+/// native arm builds an index at open and that cost is excluded from its
+/// latencies; this arm builds one and excludes it the same way.
 pub(crate) fn run_indexed(iters: usize) {
     run_inner_indexed(iters, false, true)
 }
@@ -452,9 +544,8 @@ fn run_inner_indexed(iters: usize, digest: bool, build_index: bool) {
         iters,
         build_index
     );
-    // Excluded from the latencies below, exactly as the native arm's 11.4 s
-    // query-entry index build is excluded. The cost itself is a result: one
-    // entry per key (5.49 M at SF0.1) against the native index's 327 588 roots.
+    // Open (and the optional index build) is excluded from the latencies
+    // below, as the native arm's query-entry index build is.
     let t = Instant::now();
     let db = if build_index {
         TwizzlerDatastore::open_db_indexed(DB).expect("open datastore")
@@ -488,12 +579,10 @@ fn run_inner_indexed(iters: usize, digest: bool, build_index: bool) {
         return;
     }
 
-    // Digest mode does exactly one pass over the parameter list.
-    //
-    // The list cycles (87 ids), so iterations beyond it are exact repeats: no
-    // new information for an equivalence check, and 1000 lines killed the
-    // guest's stdout outright ("I/O error: data loss" at ~330 lines). Equiv is
-    // not timed, so there is nothing to average over either.
+    // Digest mode does exactly one pass over the parameter list. The list
+    // cycles, so iterations beyond it are exact repeats: no new information
+    // for an equivalence check, and equiv is not timed, so there is nothing to
+    // average over either.
     let iters = if digest { persons.len() } else { iters };
 
     let mut is1 = Lat::new("IS1");
@@ -590,6 +679,10 @@ fn run_inner_indexed(iters: usize, digest: bool, build_index: bool) {
         is5.results += rows;
         let r5 = rows;
 
+        // IS6 — walk `replyOf` up to the root post, then its containing forum.
+        // The hand-rolled loop is deliberate: the native arm uses `repeat_out`,
+        // so the two are independent implementations of the same query and
+        // each checks the other.
         let t = Instant::now();
         let mut rows = 0;
         if let Some(m) = find_message(&db, &mid) {

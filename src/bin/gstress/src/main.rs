@@ -1,10 +1,144 @@
-//! Deliberately NOT part of `cargo start-qemu --tests`, so the default
+//! gstress — stress harness for the twizzler-graph engine.
+//!
+//! Deliberately not part of `cargo start-qemu --tests`, so the default
 //! harness stays fast. Usage, from the Twizzler shell:
+//!
+//!   gstress            # = gstress small
+//!   gstress tiny       # smoke run of every phase
+//!   gstress small      # the default preset
+//!   gstress medium     # larger; adjacency-ceiling probe
+//!   gstress large      # go until something gives
+//!   gstress scale:<N>  # arbitrary size with tiny's proportions, for size
+//!                      # sweeps: `gstress scale:1000`, `gstress scale:2000
+//!                      # indradb`
+//!   gstress <preset> arena[:cap]
+//!                      # explicit arena cap, for cap sweeps. Without it,
+//!                      # DEFAULT_ARENA_CAP. Every native run is the arena
+//!                      # layout; there is no layout argument.
+//!   gstress <preset> indradb
+//!                      # the same workload against the IndraDB baseline
+//!   gstress seed <N>     # write a known graph, then reboot and
+//!   gstress verify <N>   # check it survived. Two boots, by construction —
+//!                        # a same-boot reopen maps resident pages and cannot
+//!                        # tell durable from merely mapped. Records carry
+//!                        # 0–3 inline traversal properties, interleaved, so
+//!                        # variable stride is exercised across a real
+//!                        # write-back and re-read.
+//!   gstress indradb-seed <N>     # the same cross-reboot durability
+//!   gstress indradb-verify <N>   # protocol against the IndraDB datastore
+//!   gstress residency [cycle|hold|volatile|…|del] [N] [R]
+//!                      # does dropping a handle return frames? Not a graph
+//!                      # workload — a platform probe. See residency.rs; run
+//!                      # each arm in its own boot.
+//!   gstress index [N] [noindex|bulk|sync:K|throttle:K|rebuild]
+//!                      # what limits a large load — insertion, the index,
+//!                      # residency, or writeback? `noindex` is the control,
+//!                      # `bulk` batches the index, `sync:K` syncs every K
+//!                      # records (write-behind), `throttle:K` paces insertion
+//!                      # without moving the sync. Own boot each; see
+//!                      # index_probe.rs.
+//!   gstress ldbc       # load LDBC-SNB SF0.1 from /initrd/*.csv and report
+//!                      # vertices, edges, arenas, blob objects, and the
+//!                      # node/edge/sync split. Needs `scripts/flatten_ldbc.py`
+//!                      # run on the host first.
+//!   gstress ldbc-query [N]
+//!                      # LDBC short reads IS1-IS7 against the graph
+//!                      # `gstress ldbc` left on disk. Own boot. Reports
+//!                      # per-query latency percentiles.
+//!   gstress is2 <arm> [N]
+//!                      # which term of the IS2 ordering cost dominates.
+//!                      # arm = walk | props | full | sort, one per boot —
+//!                      # arms share a page cache otherwise. Prints a row per
+//!                      # person so latency can be regressed on in-degree
+//!                      # rather than averaged. See is2_probe.rs.
+//!   gstress ldbc-indradb-load [edgeprops] [lean]
+//!                      # baseline load pass. Slow: every property write is a
+//!                      # transaction.
+//!                      # `edgeprops` additionally stores the extra CSV columns
+//!                      # (joinDate, workFrom, classYear, likes.creationDate)
+//!                      # as edge properties, which the complex reads
+//!                      # IC1/IC5/IC7/IC11 need. Off by default.
+//!                      # `lean` additionally drops the five vertex columns no
+//!                      # complex read touches (locationIP, browserUsed,
+//!                      # length, language, url) plus knows.creationDate, for
+//!                      # when the full load runs out of frames. Try without
+//!                      # it first, and never run the short reads against a
+//!                      # lean store — IS1 returns three of the dropped
+//!                      # columns.
+//!   gstress ldbc-query-equiv [N]
+//!   gstress ldbc-indradb-equiv [N]
+//!                      # same queries, digest output instead of latencies,
+//!                      # to check the two arms agree. Run one per boot, keep
+//!                      # both logs, diff them on the host.
+//!   gstress ldbc-indradb [N]
+//!                      # baseline query pass, in a separate boot so both
+//!                      # engines are measured cold. Same seven queries, same
+//!                      # data, same LDBC person ids as `ldbc-query`.
+//!   gstress ldbc-indradb-indexed [N]
+//!                      # baseline query pass with a key index created at
+//!                      # open, making the two setups symmetric
+//!   gstress ldbc-complex [N] [q:1,5,10] [detail:5] [budget:S] [digest]
+//!   gstress ldbc-complex-indradb [same arguments]
+//!                      # the LDBC interactive complex reads IC1-IC14,
+//!                      # native and baseline. Own boot each, against the graph
+//!                      # / store the matching load left on disk.
+//!                      # `digest`  — one pass over the parameter list, emitting
+//!                      #             result digests instead of a timing claim.
+//!                      #             This is the correctness pass; run it
+//!                      #             before quoting latency.
+//!                      # `q:`      — which queries (default 1-14).
+//!                      # `detail:` — also print per-parameter result rows for
+//!                      #             these queries, for when a hash disagrees.
+//!                      #             Ask for one query at a time: the guest's
+//!                      #             stdout drops long output.
+//!                      # `budget:` — per-query wall-clock seconds, 0 = off. A
+//!                      #             query that cannot finish then costs one
+//!                      #             query rather than the whole run.
+//!                      # A host-side oracle computes the same answers from
+//!                      # the CSVs, for a three-way diff of the results.
+//!   gstress reclaim [N] [C] [keep] [cap:K]
+//!                      # does Delete return frames? `keep` is the control
+//!                      # (build and never destroy) and is not optional —
+//!                      # `destroy` alone proves nothing. Report the pair.
+//!                      # Own boot each; see reclaim_probe.rs.
+//!   gstress destroy [N] [R] [reset]
+//!                      # R cycles of build-then-destroy. The result is the
+//!                      # disk image's size, measured on the host between
+//!                      # boots. `reset` is the control arm.
+//!   gstress props [N] [none]
+//!                      # how many vertices can carry a property before the
+//!                      # pager gives out? Properties are one persistent
+//!                      # object each. `none` is the control arm — not
+//!                      # optional, or a stall cannot be attributed to
+//!                      # properties rather than vertex count. Own boot each.
 //!
 //! Clear `target/disk-<triple>.img` before any recorded measurement. It is
 //! created only if absent and nothing ever deletes an object, so it carries
 //! every graph every previous run made; a dirty image is not comparable to a
 //! clean one.
+//!
+//! Every operation is direct. Batching is internal to the arena store — one
+//! transaction per arena — so there is nothing for the harness to batch on
+//! its behalf.
+//!
+//! Long loops print heartbeat lines so a stall is visible (and attributable)
+//! immediately.
+//!
+//! Phases:
+//!   A  vertex insertion rate, sampled lookups
+//!   B  bulk random edges, sampled out-degree verification
+//!   C  high-degree hub until failure or cap (adjacency ceiling);
+//!      medium/large add a same-target variant (probes FOT dedup)
+//!   D  add/delete churn, then a full verification scan
+//!   E  drop + reopen by name, re-verify by sampling
+//!   F  pathological shapes: deep chain walked end-to-end, dense clique
+//!   H  read workloads (lookup, 1-hop, 2-hop, scan), cold and warm
+//!   G  degradation probe: identical insert windows, first vs last rate
+//!
+//! Every phase reports ops and wall time. Any verification mismatch prints
+//! `GSTRESS FAIL: ...` and the process exits nonzero at the end. Expected
+//! capacity findings (e.g. the adjacency ceiling) print `GSTRESS FINDING:`
+//! and do not fail the run.
 //!
 //! The graph is registered as `data/gstress` and reset at startup, so runs
 //! are idempotent (old registries are orphaned, as with `Graph::reset`).
@@ -16,7 +150,17 @@ use twizzler_graph::{Graph, Labels, Lookup, VertexId};
 
 const GRAPH: &str = "gstress";
 
+/// The default schema indexes nothing until asked, so every label this
+/// harness later resolves by name has to be declared — otherwise `find_vertex`
+/// correctly answers `NotIndexed` and every verification reports a failure that
+/// is really a missing declaration.
+///
+/// Declare before the inserts. `index_on_insert` records a `RootEntry` only
+/// for labels indexed at insert time and `set_label_indexed` does no backfill,
+/// so on a `Roots` graph a declare-after-insert label rebuilds an index that
+/// cannot see the earlier records. Under `Scan` either order works.
 pub(crate) fn declare_lookup_labels(g: &mut Graph) {
+    // "vo" is the seed/verify vertices-only tranche.
     for l in ["n", "d", "d2", "c", "hub", "spoke", "tag", "vo"] {
         // Best-effort: a strategy of `None` refuses, and that is a legitimate
         // configuration for arms that never look up.
@@ -24,27 +168,43 @@ pub(crate) fn declare_lookup_labels(g: &mut Graph) {
     }
 }
 
+/// Deterministic text payload for `seed`/`verify`: `verify` runs in a
+/// fresh boot and cannot capture what `seed` wrote, so both sides derive the
+/// value from `(i, width)` alone. Content varies with `i` so a swapped or
+/// zeroed value cannot match by accident.
 pub(crate) fn a9_text(i: usize, w: usize) -> String {
     (0..w)
         .map(|j| char::from(b'a' + ((i + j) % 26) as u8))
         .collect()
 }
 
+/// Deterministic blob payload, 2–3 KB, byte-varied per `i`.
 pub(crate) fn a9_blob(i: usize) -> Vec<u8> {
     (0..(2048 + i % 1024))
         .map(|j| ((i.wrapping_mul(31) + j) % 251) as u8)
         .collect()
 }
 
-/// Where id arithmetic survives it is load-bearing on one invariant: a phase
-/// that creates vertices *before* any edge still gets contiguous ids from 0, so
-/// `VertexId(i)` is valid for phase-A vertices and for `seed`'s `v*`. Anything
-/// created after an edge is not addressable that way. If a phase is ever
-/// reordered, those become silent misreads rather than errors.
-pub(crate) const HARNESS_REV: &str = "2026-08-18i";
+/// Harness revision, printed with every run, so a pasted result block can be
+/// matched to the harness that produced it. Bump it on every change that can
+/// move a number — workload, timing, or verification.
+///
+/// Edge records live in the vertex id space, so an id derived by arithmetic
+/// is valid only under one invariant: a phase that creates vertices before
+/// any edge gets contiguous ids from 0. `VertexId(i)` therefore works for
+/// phase-A vertices and for `seed`'s `v*`; anything created after an edge is
+/// not addressable that way, and a reordered phase turns such reads into
+/// silent misreads rather than errors.
+pub(crate) const HARNESS_REV: &str = "2026-08-19b";
 
 mod index_probe;
 mod is2_probe;
+// The LDBC interactive complex reads (IC1–IC14), both arms.
+// `ldbc_common` holds what the two must agree on byte for byte: the digest
+// format, per-query parameter loading, latency accumulation and the budget.
+mod ldbc_common;
+mod ldbc_complex;
+mod ldbc_complex_indradb;
 mod ldbc_indradb;
 mod ldbc_load;
 mod ldbc_query;
@@ -63,13 +223,14 @@ pub(crate) fn stamp(mode: &str, preset: &Preset) {
     );
 }
 
+/// Workload sizes. Tunable constants.
 pub(crate) struct Preset {
     pub(crate) name: &'static str,
     /// Phase A vertices.
     ///
-    /// The phase is still the project's headline vertex-insertion rate, and
-    /// that is now its whole job. Renaming it would break comparison with every
-    /// recorded `A:rollover` figure, so the name stays and this note explains it.
+    /// Phase A measures the vertex-insertion rate. No preset reaches the
+    /// 262 144 segment cap, so registry rollover is not exercised here; the
+    /// phase still prints as `A:rollover` so old logs stay comparable.
     pub(crate) vertices: usize,
     /// Phase B random edges.
     pub(crate) bulk_edges: usize,
@@ -85,18 +246,20 @@ pub(crate) struct Preset {
     pub(crate) clique: usize,
     /// Phase G: number of equal windows in the degradation probe.
     pub(crate) degrade_windows: usize,
-    /// Phase G: records per window (kept small and *constant*, so any change
+    /// Phase G: records per window (kept small and constant, so any change
     /// in window rate is the system degrading, not the workload changing).
     pub(crate) degrade_batch: usize,
     /// Phase H: how many times to repeat each read workload. Reads are fast
-    /// enough that a single pass lands at or below timer resolution — the
-    /// first H run reported 0.00 s for lookup and scan, making their rates
-    /// meaningless. Repetition moves the measurement above the noise floor.
+    /// enough that a single pass can land at or below timer resolution;
+    /// repetition moves the measurement above the noise floor.
     pub(crate) read_reps: usize,
 }
 
 /// Build a preset of arbitrary size, with every sub-workload scaled in the
 /// same proportions as `tiny` (which `scaled(200)` reproduces).
+///
+/// Lets a size sweep run without inventing a named preset per point:
+/// `gstress scale:1000`, `gstress scale:2000 indradb`, and so on.
 pub(crate) fn scaled(n: usize) -> Preset {
     let n = n.max(20);
     Preset {
@@ -115,22 +278,24 @@ pub(crate) fn scaled(n: usize) -> Preset {
 }
 
 /// Sampling stride for read phases — shared by both arms so they measure
-/// the same vertices. (They did not in the first H run: 85 samples natively
-/// against 17 in the baseline, because each arm computed its own stride.)
+/// the same vertices.
 pub(crate) fn read_step(n: usize) -> usize {
     (n / 100).max(1)
 }
 
-/// Warm-phase target duration. A *fixed* rep count cannot serve both arms:
-/// the native engine's warm reads are ~24× the baseline's, so a count giving
-/// the baseline a sane runtime leaves the native measurement at 0.02 s — at
-/// timer resolution — while a count that measures the native arm properly
-/// would run the baseline for minutes. Each arm therefore repeats until it
-/// reaches this duration; comparing *rates* stays valid because the rate is
+/// Warm-phase target duration. A fixed rep count cannot serve both arms: a
+/// count that gives the slower arm a sane runtime leaves the faster one at
+/// timer resolution, and vice versa. Each arm therefore repeats until it
+/// reaches this duration; comparing rates stays valid because the rate is
 /// per-op.
 const READ_TARGET_SECS: f64 = 1.0;
 
 /// Measure a read workload in two regimes, reporting both.
+///
+/// Cold is the first pass — it pays for mapping objects and faulting them
+/// in. Warm is steady-state, once the working set is resident. Averaging the
+/// two into one number would hide the residency cost, which is the effect
+/// worth reporting.
 ///
 /// `f` performs one pass and returns the number of logical operations in it.
 pub(crate) fn measure_read(phase: &str, max_reps: usize, mut f: impl FnMut() -> usize) {
@@ -232,13 +397,11 @@ impl Rng {
 
 /// Failure lines printed before suppression starts.
 ///
-/// A *systematic* failure emits one line per checked item, and the checks run
-/// over every vertex. The `scale:20000` churn scan produced 2 858 of them and
-/// the run died inside `println!` itself — "I/O error: data loss", the serial
-/// console dropping writes — which took every phase after D with it. The
-/// failure count is still reported in full; only the per-item lines are
-/// capped, because a dozen of them already show the pattern and the rest costs
-/// the remainder of the run.
+/// A systematic failure emits one line per checked item, and the checks run
+/// over every vertex. Unbounded failure output can overwhelm the serial
+/// console and kill the rest of the run, so the per-item lines are capped —
+/// a dozen already show the pattern. The failure count is still reported in
+/// full.
 const MAX_FAIL_LINES: u64 = 20;
 
 pub(crate) struct Stats {
@@ -272,6 +435,9 @@ impl Stats {
     }
 
     /// The final suppressed failure, printed at exit.
+    ///
+    /// A systematic failure fills the cap with a single shape, so anything
+    /// different failing later would otherwise be invisible.
     pub(crate) fn report_suppressed(&self) {
         if let Some(msg) = &self.last {
             println!("GSTRESS FAIL (last suppressed): {msg}");
@@ -285,13 +451,11 @@ impl Stats {
 }
 
 /// Progress line inside long loops, so a stall is visible and attributable.
-/// Windowed progress: reports the rate for *this window* alongside the
+/// Windowed progress: reports the rate for this window alongside the
 /// cumulative rate.
 ///
-/// Cumulative rates structurally hide decay — a rate that halves partway
-/// through shows up as a gentle droop — which is why the phase heartbeats
-/// could not answer whether throughput degrades *within* a run. Window rates
-/// show it directly.
+/// Cumulative rates hide decay — a rate that halves partway through shows up
+/// as a gentle droop. Window rates show it directly.
 pub(crate) struct Progress {
     phase: &'static str,
     start: Instant,
@@ -342,6 +506,8 @@ impl Progress {
         self.last_done = done;
     }
 
+    /// Print first-vs-last window, the number that answers "does throughput
+    /// decay as the run proceeds?".
     pub(crate) fn summarize(&self) {
         let first = self.first_window_rate.unwrap_or(0.0);
         if first <= 0.0 || self.last_window_rate <= 0.0 {
@@ -356,11 +522,11 @@ impl Progress {
     }
 }
 
-/// Progress line, with a projected time to finish the phase.
+/// Progress line, with a projected time to finish the phase. An ETA that
+/// moves is the difference between "slow" and "stuck".
 ///
-/// It is a projection at the *current cumulative* rate, so a phase whose rate
-/// decays will overshoot it — the baseline's do, badly: `B:bulk` fell 26 → 13
-/// ops/s within one phase. Read it as a floor, not a promise.
+/// It is a projection at the current cumulative rate, so a phase whose rate
+/// decays will overshoot it. Read it as a floor, not a promise.
 pub(crate) fn heartbeat(phase: &str, done: usize, total: usize, t: &Instant) {
     let secs = t.elapsed().as_secs_f64();
     let rate = if secs > 0.0 { done as f64 / secs } else { 0.0 };
@@ -386,15 +552,11 @@ fn survives_churn(i: usize) -> bool {
 
 /// The `i`-th vertex index that survives churn — injective in `i`.
 ///
-/// This must produce *distinct* targets, and the reason is a real semantic
-/// difference between the engines rather than tidiness: our engine is a
-/// multigraph (parallel edges are distinct records — see the engine's
-/// `parallel_edges` test), while IndraDB keys an edge on
-/// `(outbound, type, inbound)` and silently rejects duplicates. The previous
-/// version mapped both `i=0` and `i=1` to vertex 1 (and six more collisions),
-/// so a 50-edge hub phase stored 50 edges natively but only 43 in the
-/// baseline — the arms were doing unequal work and the comparison was biased
-/// against the native engine.
+/// Distinct targets matter because the engines differ: ours is a multigraph
+/// (parallel edges are distinct records — see the engine's `parallel_edges`
+/// test), while IndraDB keys an edge on `(outbound, type, inbound)` and
+/// silently rejects duplicates. Colliding targets would make the arms do
+/// unequal work.
 ///
 /// `i + i/6 + 1` skips every multiple of 7 and is strictly increasing, so
 /// distinct `i` give distinct surviving targets.
@@ -414,6 +576,10 @@ pub(crate) fn max_distinct_degree(n: usize) -> usize {
 fn main() {
     let arg1 = std::env::args().nth(1);
 
+    // Probe subcommands take their own arguments, so they dispatch before the
+    // preset match.
+    // index: is a vertex insert mostly the `(label, name)` index? See
+    // index_probe.rs.
     if arg1.as_deref() == Some("index") {
         let n = std::env::args()
             .nth(2)
@@ -424,11 +590,14 @@ fn main() {
         return;
     }
 
+    // Load LDBC-SNB from /initrd and report load cost.
     if arg1.as_deref() == Some("ldbc") {
         ldbc_load::run();
         return;
     }
 
+    // Run LDBC's short reads against the loaded graph and report per-query
+    // latency percentiles.
     if arg1.as_deref() == Some("ldbc-query") {
         let iters = std::env::args()
             .nth(2)
@@ -438,7 +607,7 @@ fn main() {
         return;
     }
 
-    // IS2: the ordering cost, decomposed. Separate from `ldbc-query` because it
+    // The IS2 ordering cost, decomposed. Separate from `ldbc-query` because it
     // runs one term per boot — see is2_probe.rs.
     if arg1.as_deref() == Some("is2") {
         let arm = std::env::args().nth(2).unwrap_or_else(|| "full".into());
@@ -450,6 +619,9 @@ fn main() {
         return;
     }
 
+    // Do the two arms compute the same thing? Emits a result digest per
+    // person from the same code path the benchmark times, so the check cannot
+    // drift from what is measured. Diff the two arms' logs on the host.
     if arg1.as_deref() == Some("ldbc-query-equiv") {
         let iters = std::env::args()
             .nth(2)
@@ -468,11 +640,38 @@ fn main() {
         return;
     }
 
-    if arg1.as_deref() == Some("ldbc-indradb-load") {
-        ldbc_indradb::load();
+    // The LDBC interactive complex reads, IC1–IC14, native arm.
+    //   gstress ldbc-complex [iters] [q:1,5,10] [detail:5] [budget:600] [digest]
+    // Own boot, against the graph `gstress ldbc` left on disk — same protocol
+    // as `ldbc-query`.
+    if arg1.as_deref() == Some("ldbc-complex") {
+        ldbc_complex::run();
         return;
     }
 
+    // Baseline arm. Identical arguments, so the two runs differ only in
+    // which engine answers.
+    if arg1.as_deref() == Some("ldbc-complex-indradb") {
+        ldbc_complex_indradb::run();
+        return;
+    }
+
+    // Baseline load: same data, IndraDB.
+    // `edgeprops` additionally stores the extra CSV columns as edge properties,
+    // which the complex reads IC1/IC5/IC7/IC11 need. Off by default; see
+    // `ldbc_indradb::load`.
+    if arg1.as_deref() == Some("ldbc-indradb-load") {
+        let edge_props = std::env::args().any(|a| a == "edgeprops");
+        // `lean` drops columns no complex read touches, for when the full
+        // load runs out of frames. Try without it first: a faithful store is
+        // worth more.
+        let lean = std::env::args().any(|a| a == "lean");
+        ldbc_indradb::load(edge_props, lean);
+        return;
+    }
+
+    // Same queries, baseline given a key index at open — the arm that
+    // makes the two setups symmetric. See `ldbc_indradb::run_indexed`.
     if arg1.as_deref() == Some("ldbc-indradb-indexed") {
         let iters = std::env::args()
             .nth(2)
@@ -533,6 +732,8 @@ fn main() {
         return;
     }
 
+    // The datastore's cross-reboot durability pair. Same protocol as the
+    // native pair below: seed, reboot, verify.
     if matches!(arg1.as_deref(), Some("indradb-seed") | Some("indradb-verify")) {
         let n = std::env::args()
             .nth(2)
@@ -546,6 +747,12 @@ fn main() {
         return;
     }
 
+    // `gstress seed <N>` then, in a later boot, `gstress verify <N>`.
+    //
+    // A same-boot reopen maps objects whose pages are still resident — it
+    // never reads the disk image, so it cannot distinguish durable from
+    // merely mapped.
+    //
     // The two phases are separate processes in separate boots by construction:
     // there is no way for `verify` to see anything `seed` left in memory.
     if matches!(arg1.as_deref(), Some("seed") | Some("verify")) {
@@ -570,6 +777,16 @@ fn main() {
             crate::declare_lookup_labels(&mut g);
             let mut ids = Vec::with_capacity(n);
             for i in 0..n {
+                // Deliberately varied inline widths, interleaved.
+                //
+                // A record's extent comes from its own `nprops`, so records of
+                // different widths sit back-to-back at irregular offsets. A
+                // stride error does not fail — it reads the neighbouring
+                // record's bytes as this one's fields. Within-boot tests
+                // cover the arithmetic; only a reboot covers it after the pager
+                // has written back and re-read. Zero-width and widest records
+                // are adjacent (i % 4 cycles 0,1,2,3) so a slip shows up as a
+                // neighbour misread.
                 let w = i % 4;
                 let props: Vec<(&str, twizzler_graph::PropValue)> = (0..w)
                     .map(|j| {
@@ -596,6 +813,13 @@ fn main() {
             for i in (0..n).step_by(7) {
                 g.delete_vertex(ids[i]).expect("delete");
             }
+            // Text and blob values at every tier width, written before the
+            // sync so `verify` reads them from the disk image.
+            // Widths cycle empty/31/32/255 so both sides of the Str/text
+            // boundary and the text ceiling are on disk; every 8th carrier
+            // also gets a multi-KB blob, which exercises the blob store's own
+            // segments and sync path. Payloads are derived from `i` alone
+            // (`a9_text`/`a9_blob`) so the verify boot can reconstruct them.
             for (t, i) in (0..n).step_by(11).enumerate() {
                 if i % 7 == 0 {
                     continue; // tombstoned above; a dead vertex takes no writes
@@ -610,13 +834,12 @@ fn main() {
             }
             g.sync().expect("sync");
 
-            // Reopen mid-seed, then keep writing. This is the shape that
-            // lost the arena directory: a store is dropped and reopened, and
-            // the *reopened* instance grows the graph. Writes made through the
-            // second instance have to be durable even though the first
-            // instance created the structures they live in. Without this, the
-            // check passes on a store whose registries were only ever written
-            // by one instance — which is what let the bug through.
+            // Reopen mid-seed, then keep writing: a store is dropped and
+            // reopened, and the reopened instance grows the graph. Writes
+            // made through the second instance have to be durable even though
+            // the first instance created the structures they live in. Without
+            // this, the check passes on a store whose registries were only
+            // ever written by one instance.
             drop(g);
             let mut g = Graph::open_or_create(DUR).expect("mid-seed reopen");
             let base = ids.len();
@@ -630,6 +853,10 @@ fn main() {
                 g.add_edge(ids[base + i], "e2", ids[base + i + 1])
                     .expect("add_edge after reopen");
             }
+            // Text and blob through the reopened handle too: the blob store
+            // these land in was created by the first handle, so this covers
+            // text/blob writes against reopened directories, the analogue of
+            // the `w*` tranche one line up.
             if n >= 4 {
                 g.set_vertex_text(ids[base], "long", &a9_text(base, 255))
                     .expect("set text after reopen");
@@ -638,6 +865,15 @@ fn main() {
             }
             g.sync().expect("sync after reopen");
 
+            // Vertices-only tranche.
+            // sync → pure `add_vertex` → sync: between the two syncs nothing
+            // touches the arenas except `add_record` itself — no edge,
+            // property, text or tombstone write, each of which marks arenas
+            // dirty through `record_ptr` incidentally. This isolates
+            // `add_record`'s own dirty-marking.
+            // `a_vertex_only_batch_syncs_its_arena` covers the same case
+            // within-boot at the sync-count level; only this tranche proves
+            // the bytes actually reach the disk image.
             let vonly = (n / 8).max(64);
             for i in 0..vonly {
                 g.add_vertex("vo", &format!("q{i}"), ObjID::new(i as u128))
@@ -665,8 +901,18 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // The `w*` vertices were written through a reopened handle; if the
+        // registries created by the first handle did not reach disk, these are
+        // the ones that vanish.
         let post = n / 4;
         for i in (0..post).step_by(23) {
+            // By name, not by computed id: edge records share the vertex id
+            // space, so after `n` vertices come `n-1` edge records and `w0`'s
+            // id is nowhere near `n`. `verify` runs in a fresh boot and
+            // cannot capture ids, so it must look them up the way a user
+            // would.
+            // Label `d2`, not `d` — the post-reopen vertices are written under
+            // their own label, and `find_vertex` keys on (label, name).
             st.ck(
                 g.find_vertex("d2", &format!("w{i}"))
                     .found()
@@ -676,6 +922,8 @@ fn main() {
                 || format!("w{i} (written after a mid-seed reopen) did not survive"),
             );
         }
+        // Resolve a sample of the `v*` tranche by name, and check the `e2`
+        // edges written through the reopened handle.
         for i in (0..n).step_by(31) {
             if i % 7 == 0 {
                 continue;
@@ -703,6 +951,10 @@ fn main() {
             format!("live vertices: got {live}, expected {expect_live}")
         });
 
+        // The vertices-only tranche. These records' arenas were marked dirty
+        // by nothing but `add_record` itself — if that mark is lost, the
+        // names and targets below read back as zeros while the mirror still
+        // counts them live (the count check above alone would pass).
         for i in (0..vonly).step_by(13) {
             st.ck(
                 g.find_vertex("vo", &format!("q{i}"))
@@ -723,6 +975,10 @@ fn main() {
             "arena directory came back empty — the store's arenas did not reach disk".into()
         });
 
+        // Every text/blob tier width, read back after the reboot. Same
+        // iteration as the seed loop, so `t` (and with it the width cycle and
+        // the every-8th blob choice) lines up exactly; payloads are
+        // re-derived from `i`.
         for (t, i) in (0..n).step_by(11).enumerate() {
             if i % 7 == 0 {
                 continue;
@@ -774,6 +1030,8 @@ fn main() {
             );
         }
 
+        // Every inline width, read back after the reboot. Stepping by a
+        // number coprime to 4 so all four widths are sampled rather than one.
         for i in (0..n).step_by(97) {
             if i % 7 == 0 {
                 continue; // tombstoned; checked below
@@ -843,6 +1101,12 @@ fn main() {
         return;
     }
 
+    // `gstress destroy <N> <R> [reset]` — R cycles of "build a graph of
+    // N vertices, then tear it down". The point is what it does to the store,
+    // which is measured on the host between boots (`du` on the disk image), not
+    // from in here. `reset` runs the control arm: reset reclaims the outgoing
+    // graph but leaves a fresh empty one, so it should grow the image where
+    // `destroy` should not.
     if arg1.as_deref() == Some("destroy") {
         let n = std::env::args()
             .nth(2)
@@ -906,6 +1170,8 @@ fn main() {
         Some("tiny") => &TINY,
         Some("medium") => &MEDIUM,
         Some("large") => &LARGE,
+        // `scale:N` — arbitrary size with tiny's proportions, for size
+        // sweeps: `gstress scale:1000`, `gstress scale:2000 indradb`.
         Some(s) if s.starts_with("scale:") => {
             match s["scale:".len()..].parse::<usize>() {
                 Ok(n) => {
@@ -928,8 +1194,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // `arena:<cap>` sets an explicit cap for the sweep; `indradb` runs the
+    // same workload against the IndraDB baseline instead. Anything else is
+    // the native arena layout at the default cap.
     let mode = std::env::args().nth(2);
 
+    // Explicit cap from `arena:<cap>`; anything else — including no mode
+    // argument at all — is the default.
     let arena_cap: usize = mode
         .as_deref()
         .and_then(|m| m.strip_prefix("arena"))
@@ -947,6 +1218,8 @@ fn main() {
         }
         return;
     }
+    // The cap belongs in the stamp: a result that does not say which cap
+    // produced it cannot be compared to anything.
     let mode_label = format!("native-arena:{arena_cap}");
     stamp(&mode_label, preset);
     println!(
@@ -962,8 +1235,16 @@ fn main() {
     );
 
     let mut st = Stats::new();
+    // Two distinct quantities: `vertices` counts vertices created (what the
+    // summary reports), `next_id` tracks the largest id handed out (what the
+    // monotonicity check compares against). Edges share the id space, so the
+    // id high-water runs well ahead of the vertex count.
     let mut counters: (u64, u64) = (0, 0);
 
+    // Setup is timed separately and excluded from the run total, like the
+    // final sync below. `reset` destroys the previous run's graph, so on a
+    // dirty image it pays one object deletion per object that run created —
+    // which at `arena:1` is one per vertex. A cleared image makes this ~0.
     let setup = Instant::now();
     Graph::reset_arena(GRAPH, arena_cap).expect("reset arena graph");
     let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("create arena graph");
@@ -983,10 +1264,13 @@ fn main() {
         let v = g
             .add_vertex(label, name, ObjID::new(0))
             .expect("add_vertex");
-        // What is still true, and still worth asserting: ids strictly increase
-        // and are never handed out twice. That is what callers actually depend
-        // on, and it is what would break if slot reuse ever started recycling
-        // ids as well as space.
+        // Ids are append indices and never reused, but not dense per kind:
+        // edge records share the id space, so a vertex created after `k`
+        // edges gets `k` higher an id.
+        //
+        // What is asserted: ids strictly increase and are never handed out
+        // twice. That is what callers depend on, and it is what would break
+        // if slot reuse ever started recycling ids as well as space.
         if v.0 <= *next_id && *next_id != 0 {
             st.fail(format!(
                 "vertex id did not advance: got {}, previous high-water {}",
@@ -998,7 +1282,7 @@ fn main() {
         v
     };
 
-    // --- Phase A: registry rollover at the real DEFAULT_SEG_CAP -------------
+    // --- Phase A: vertex insertion rate, sampled lookups --------------------
     let n = preset.vertices;
     let t = Instant::now();
     for i in 0..n {
@@ -1007,8 +1291,8 @@ fn main() {
             heartbeat("A:rollover", i + 1, n, &t);
         }
     }
-    // Boundary reads around the default segment capacity (4096) and the tail
-    // (skipped when the preset is smaller than the boundary).
+    // Boundary reads at 0, 4095/4096, and the tail (indices past the preset
+    // are skipped).
     for i in [0usize, 4095, 4096, n - 1] {
         if i >= n {
             continue;
@@ -1083,7 +1367,7 @@ fn main() {
     let mut hub2_deg = 0usize;
     if preset.same_target_variant {
         // Same-target parallel edges: if FOT entries dedup per target object,
-        // this should reach a higher ceiling than the distinct-target hub (I0).
+        // this should reach a higher ceiling than the distinct-target hub.
         let hub2 = add_v(&mut g, &mut st, &mut counters, "hub", "hub2");
         let target = VertexId(1); // index 1 survives churn
         for i in 0..preset.degree_cap {
@@ -1113,8 +1397,8 @@ fn main() {
     let t = Instant::now();
     let mut deleted = vec![false; n];
     let mut ndel = 0usize;
-    // One delete probed in isolation before the loop. Record and mirror should
-    // now agree; a run where they don't is the mapping split returning.
+    // One delete probed in isolation before the loop. Record and mirror
+    // should agree.
     g.delete_vertex(VertexId(0)).expect("delete_vertex");
     if let Some(d) = g.debug_liveness(VertexId(0)) {
         println!("GSTRESS PROBE: immediately after deleting v0: {d}");
@@ -1127,6 +1411,9 @@ fn main() {
             heartbeat("D:churn", ndel, n / 7 + 1, &t);
         }
     }
+    // Liveness probes. Two controls first — v0 is deleted (0 % 7 == 0), v1 is
+    // not — so the record-vs-mirror state is on the console even in a run
+    // where the scan passes.
     for (v, expect) in [(0u64, "deleted"), (1u64, "live")] {
         if let Some(d) = g.debug_liveness(VertexId(v)) {
             println!("GSTRESS PROBE: control ({expect}) {d}");
@@ -1171,13 +1458,15 @@ fn main() {
 
     // --- Phase E: reopen by name, re-verify by sampling ---------------------
     let t = Instant::now();
-    // Sync before dropping. On v4 nothing is durable until `sync()`, so a bare
-    // drop discards the batch — and worse, it used to strand the registries'
-    // dirty flags, which is how the arena directory came back empty on the
-    // next boot. The library no longer depends on that (see `SegVec::flush`),
-    // but dropping an unsynced graph is still throwing writes away.
+    // Sync before dropping. Nothing is durable until `sync()`, so dropping an
+    // unsynced graph throws writes away.
     g.sync().expect("sync before reopen");
     drop(g);
+    // Reopen with the same cap. The cap is a runtime argument, not persisted
+    // in `GraphRoot`, so a plain `open_or_create` would reconstruct the
+    // placement policy as `FillTo { cap: DEFAULT_ARENA_CAP }` and a run
+    // started at another cap would silently roll over at the default from
+    // here on.
     let mut g = Graph::open_or_create_arena(GRAPH, arena_cap).expect("reopen arena graph");
             crate::declare_lookup_labels(&mut g);
     st.ck(g.vertex_info(VertexId(7)).is_none(), || {
@@ -1203,6 +1492,8 @@ fn main() {
     );
     report("E:reopen", 5, t);
 
+    // --- Phase F: pathological shapes ----------------------------------------
+    // Deep chain, walked end-to-end.
     let t = Instant::now();
     let head = add_v(&mut g, &mut st, &mut counters, "ch", "ch0");
     let mut prev = head;
@@ -1265,8 +1556,8 @@ fn main() {
                 g.add_edge(cl[i], "k", cl[j]).expect("clique add_edge");
             }
         }
-        // Reports every 10 rows — this phase used to emit nothing at all,
-        // which is how a 215 s run looked indistinguishable from a hang.
+        // Reports every 10 rows, so a long clique phase is distinguishable
+        // from a hang.
         if (i + 1) % 10 == 0 {
             heartbeat("F:clique", (i + 1) * (k - 1), k * (k - 1), &t);
         }
@@ -1287,9 +1578,14 @@ fn main() {
     }
     report("F:clique", k * (k - 1), t);
 
-    // Read on its own terms: `lookup` uses each engine's native key path
-    // (ours built-in, the baseline's a property index), while `1hop`/`2hop`
-    // start from ids already in hand, isolating traversal from lookup.
+    // --- Phase H: reads -----------------------------------------------------
+    //
+    // Everything above measures writes. This phase runs on the graph built by
+    // A–F, before G adds more vertices.
+    //
+    // `lookup` uses each engine's native key path (ours built-in, the
+    // baseline's a property index), while `1hop`/`2hop` start from ids
+    // already in hand, isolating traversal from lookup.
     let rstep = read_step(n);
     let reps = preset.read_reps;
     let read_idx: Vec<usize> = (0..n).step_by(rstep).filter(|i| !deleted[*i]).collect();
@@ -1331,11 +1627,12 @@ fn main() {
     });
     measure_read("H:scan", max_reps, || g.vertices().len());
 
-    // A deliberately *flat* workload: identical small batches of vertex
+    // --- Phase G: degradation probe -----------------------------------------
+    //
+    // A deliberately flat workload: identical small batches of vertex
     // creations, repeated, reporting the rate for each window. The workload
     // does not change, so any decline across windows is the system degrading
-    // as writes accumulate — the hypothesis that a run pays its own growing
-    // pager-backlog tax. Runs last so it measures the system at its most
+    // as writes accumulate. Runs last so it measures the system at its most
     // loaded, and the first/last ratio is printed as `GSTRESS DEGRADE`.
     let t = Instant::now();
     let mut prog = Progress::new("G:degrade");
@@ -1343,9 +1640,8 @@ fn main() {
     let mut gdone = 0usize;
     for w in 0..preset.degrade_windows {
         let base = gdone;
-        // `bulk` is a v3 construct and now refuses on v4 (see `Graph::bulk`).
-        // The arena layout batches by construction, so the direct path here is
-        // the like-for-like comparison, not a slower one.
+        // The arena layout batches by construction, so the direct path here
+        // is the like-for-like comparison.
         for j in 0..preset.degrade_batch {
             add_v(&mut g, &mut st, &mut counters, "g", &format!("g{}_{}", w, j));
         }
@@ -1355,6 +1651,11 @@ fn main() {
     prog.summarize();
     report("G:degrade", gtotal, t);
 
+    // --- Summary --------------------------------------------------------------
+    // Durability barrier, timed separately. Writes live in mapped memory
+    // until `sync()`, so a run that skipped this would be timing an in-memory
+    // workload and reporting it as a database. Timing it apart from the
+    // workload keeps the deferred cost visible instead of hidden.
     let sync_t = Instant::now();
     if let Err(e) = g.sync() {
         println!("GSTRESS: final sync failed: {e:?}");
@@ -1374,6 +1675,10 @@ fn main() {
         secs,
         sync_secs
     );
+    // Object count is the packing argument, so a result without it cannot be
+    // interpreted. The v3 figure in the line below is a stated baseline, not
+    // a measurement of this run. `records` is what the arena holds — vertices
+    // and edges — so objects-per-record is the honest ratio.
     let records = g.record_count() as u64;
     println!(
         "GSTRESS ARENA: {} arenas for {} records ({} vertices + {} edges), \
@@ -1387,6 +1692,8 @@ fn main() {
         g.arena_sync_count(),
         counters.0 * 3 + records.saturating_sub(counters.0)
     );
+    // `place` decides rollover from the policy view alone, so if the two rows
+    // below disagree, cap is not controlling rollover.
     let (policy, actual) = g.arena_vertex_counts();
     println!("GSTRESS ARENA DIST policy: {policy:?}");
     println!("GSTRESS ARENA DIST locs:   {actual:?}");
